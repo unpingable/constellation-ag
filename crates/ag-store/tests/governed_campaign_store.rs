@@ -770,6 +770,10 @@ fn governed_intervention_evidence_survives_restart_and_conflicting_replay_loses(
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the single commit, duplicate delivery and reopen history visible in one qualification case"
+)]
 fn v2_run_continuation_is_atomic_bounded_and_replays() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
