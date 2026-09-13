@@ -1224,7 +1224,9 @@ fn open_bound_with_digest(
         GOVERNED_RUNTIME_PROFILE_SCHEMA_V1 => {
             let profile: GovernedRuntimeProfileV1 = strict_json_from_slice(&stored.canonical_bytes)
                 .context("decode genesis-bound runtime profile v1")?;
-            profile.verify_genesis()?;
+            if profile.schema != stored.schema {
+                bail!("campaign runtime profile schema binding is inconsistent");
+            }
             profile
         }
         GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 => {
