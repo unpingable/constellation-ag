@@ -13,7 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::governed_campaign_production_v1::*;
+use ag_app::governed_campaign_production_v1::{
+    AntecedentObservationV1, HumanRequiredLawV1, ProductionCampaignLifecycleV1,
+    ProductionLifecycleJournalV1, ProductionStageLawV1, VERIFIED_CAMPAIGN_START_BASIS_TYPE_V1,
+    VerifiedCampaignStartBasisV1,
+};
 use ag_app::governed_campaign_v1::{
     CampaignPacketV1, GitObjectV1, PredecessorBindingV1, RESERVED_APPLICABILITY_BASIS_TYPE_V1,
     executor_plan_identity, materialize_executor_plan_template, materialize_nq_profile_template,
@@ -23,7 +27,17 @@ use ag_app::governed_loop::{
     ExactObservationBasisRequirementV1, ExactWorkCatalogEntryV2, ExactWorkCatalogV2,
 };
 use ag_app::governed_ports::{AgIssuanceSignerV1, CommandDocketCustodyPortV1};
-use ag_campaign::{CampaignId, governed::*};
+use ag_campaign::CampaignId;
+use ag_campaign::governed::{
+    CurrentStandingResolutionV2, ExactWorkProposalV1, ExternalBoundaryErrorV1, KnownOutcomeV1,
+    LoopBudgetV1, MandateRefV1, OBSERVATION_RESOLUTION_SCHEMA_V3, ObservationCurrentnessRefV1,
+    ObservationRefV1, ObservationResolutionRequestV1, ObservationResolutionV3,
+    ObservationResolverV1, OccurrenceId, OccurrenceKeyV1, PreconditionBasisRefV1,
+    ProgramBasisRefV1, ProposalClassV1, ResidualSetV1, STANDING_RESOLUTION_SCHEMA_V2,
+    StandingCurrentnessRefV1, StandingResolutionRefV1, StandingResolutionRequestV1,
+    StandingResolverV1, StandingStatusV1, TypedObservationStatusV1, TypedOpaqueObservationBasisV1,
+    VersionedObservationResolutionV1,
+};
 use ag_primitives::{Digest, JcsDocument};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::Engine as _;

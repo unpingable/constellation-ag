@@ -41,6 +41,10 @@ fn frozen_packet() -> CampaignPacketV1 {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed three-stage fixture is clearer as one literal contract"
+)]
 fn production_contract(packet: &CampaignPacketV1) -> ProductionCampaignLifecycleV1 {
     let subject = packet.stages[0].executor_plan_template["subject"]
         .as_str()
@@ -337,6 +341,10 @@ fn catalog(
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential qualification trace preserves all three stage assertions"
+)]
 fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal() {
     let packet = frozen_packet();
     let contract = production_contract(&packet);
@@ -354,7 +362,9 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
     let (mut predecessor_head, mut predecessor_tree) =
         match &packet.stages[0].reservation.predecessor {
             PredecessorBindingV1::InitialGit { head, tree } => (head.clone(), tree.clone()),
-            _ => panic!("Stage 1 predecessor must be literal"),
+            PredecessorBindingV1::PriorStageRealization { .. } => {
+                panic!("Stage 1 predecessor must be literal")
+            }
         };
     let mut current_plan = materialize_executor_plan_template(
         &packet.stages[0].executor_plan_template,
@@ -715,7 +725,9 @@ fn authority_hostile_ordering_and_root_substitution_refuse() {
     let first = &contract.stages[0];
     let (head, tree) = match &packet.stages[0].reservation.predecessor {
         PredecessorBindingV1::InitialGit { head, tree } => (head.clone(), tree.clone()),
-        _ => panic!("Stage 1 predecessor must be literal"),
+        PredecessorBindingV1::PriorStageRealization { .. } => {
+            panic!("Stage 1 predecessor must be literal")
+        }
     };
     let plan = materialize_executor_plan_template(
         &packet.stages[0].executor_plan_template,

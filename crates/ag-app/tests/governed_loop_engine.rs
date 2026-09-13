@@ -3111,7 +3111,7 @@ fn assert_repository_substitutions_refuse(
                 )));
             }
             "subject" => boundary.substitute_subject = Some(digest("other-subject")),
-            "resolver" => boundary.resolver_id = "controller.self-qualification/v1".to_owned(),
+            "resolver" => "controller.self-qualification/v1".clone_into(&mut boundary.resolver_id),
             "stale" => boundary.status = TypedObservationStatusV1::Stale,
             _ => unreachable!(),
         }

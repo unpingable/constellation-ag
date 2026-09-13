@@ -344,6 +344,10 @@ fn runtime_profile_is_genesis_atomic_and_revalidated_on_reopen() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one atomic evidence trace keeps bypass, idempotency, race, and consequence assertions adjacent"
+)]
 fn protected_store_requires_atomic_admission_review_and_consequence_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("protected.sqlite");
