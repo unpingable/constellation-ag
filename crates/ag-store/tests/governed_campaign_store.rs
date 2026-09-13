@@ -350,63 +350,140 @@ fn protected_store_requires_atomic_admission_review_and_consequence_evidence() {
     let start = initial();
     let profile = br#"{"schema":"ag.governed-loop.runtime-profile/v2"}"#;
     let mut store = CampaignStoreV1::create_with_runtime_profile(
-        &database, &start,
-        Some(("ag.governed-loop.runtime-profile/v2", profile)), NOW,
-    ).unwrap();
+        &database,
+        &start,
+        Some(("ag.governed-loop.runtime-profile/v2", profile)),
+        NOW,
+    )
+    .unwrap();
     let mut observation = Observation::new();
     let proposed = GovernedLoopKernelV1::record_proposal(
-        &start, ObservationRefV1::from_digest(digest("observation")), proposal("work"),
-        ProposalClassV1::Initial, &mut observation, OBSERVATION_RESOLVER_ID, NOW,
-    ).unwrap();
+        &start,
+        ObservationRefV1::from_digest(digest("observation")),
+        proposal("work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
     assert!(matches!(
-        store.commit(&start, &proposed, CampaignTransitionKindV1::ProposalRecorded, NOW),
+        store.commit(
+            &start,
+            &proposed,
+            CampaignTransitionKindV1::ProposalRecorded,
+            NOW
+        ),
         Err(CampaignStoreErrorV1::SharedAdmissionRequired)
     ));
     let binding = digest("binding");
     let requirement = digest("requirement");
-    let binding_jcs = JcsDocument::canonicalize(&serde_json::json!({"binding_id": binding.clone()})).unwrap();
-    let validation_jcs = JcsDocument::canonicalize(&serde_json::json!({"binding_id": binding.clone(), "result": "passed"})).unwrap();
-    store.commit_shared_proposal(
-        &start, &proposed, &binding, &requirement,
-        binding_jcs.as_bytes(), validation_jcs.as_bytes(), NOW,
-    ).unwrap();
+    let binding_jcs =
+        JcsDocument::canonicalize(&serde_json::json!({"binding_id": binding.clone()})).unwrap();
+    let validation_jcs = JcsDocument::canonicalize(
+        &serde_json::json!({"binding_id": binding.clone(), "result": "passed"}),
+    )
+    .unwrap();
+    store
+        .commit_shared_proposal(
+            &start,
+            &proposed,
+            &binding,
+            &requirement,
+            binding_jcs.as_bytes(),
+            validation_jcs.as_bytes(),
+            NOW,
+        )
+        .unwrap();
     let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
-    store.commit(&proposed, &required, CampaignTransitionKindV1::StandingRequired, NOW).unwrap();
+    store
+        .commit(
+            &proposed,
+            &required,
+            CampaignTransitionKindV1::StandingRequired,
+            NOW,
+        )
+        .unwrap();
     let mut observation = Observation::new();
     let mut standing = Standing;
     let mut decider = Decider;
     let admissible = GovernedLoopKernelV1::record_admissible(
-        &required, &mut observation, &mut standing, &mut decider, None,
-        OBSERVATION_RESOLVER_ID, STANDING_RESOLVER_ID, MAX_STANDING_TTL_MS, NOW,
-    ).unwrap();
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut decider,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
     assert!(matches!(
-        store.commit(&required, &admissible, CampaignTransitionKindV1::Admissible, NOW),
+        store.commit(
+            &required,
+            &admissible,
+            CampaignTransitionKindV1::Admissible,
+            NOW
+        ),
         Err(CampaignStoreErrorV1::SharedAdmissionRequired)
     ));
     let dispatch = digest("dispatch");
     let review_jcs = br#"{"review":"accepted"}"#;
-    let review_id = store.record_shared_review(
-        &required, &binding, &dispatch, "accepted", review_jcs,
-        br#"{"artifacts":"exact"}"#, br#"{"verified":true}"#, NOW,
-    ).unwrap();
+    let review_id = store
+        .record_shared_review(
+            &required,
+            &binding,
+            &dispatch,
+            "accepted",
+            review_jcs,
+            br#"{"artifacts":"exact"}"#,
+            br#"{"verified":true}"#,
+            NOW,
+        )
+        .unwrap();
     assert_eq!(
-        store.record_shared_review(
-            &required, &binding, &dispatch, "accepted", review_jcs,
-            br#"{"artifacts":"exact"}"#, br#"{"verified":true}"#, NOW,
-        ).unwrap(),
+        store
+            .record_shared_review(
+                &required,
+                &binding,
+                &dispatch,
+                "accepted",
+                review_jcs,
+                br#"{"artifacts":"exact"}"#,
+                br#"{"verified":true}"#,
+                NOW,
+            )
+            .unwrap(),
         review_id
     );
-    assert!(store.record_shared_review(
-        &required, &binding, &dispatch, "rejected", br#"{"review":"rejected"}"#,
-        br#"{"artifacts":"exact"}"#, br#"{"verified":true}"#, NOW,
-    ).is_err());
+    assert!(
+        store
+            .record_shared_review(
+                &required,
+                &binding,
+                &dispatch,
+                "rejected",
+                br#"{"review":"rejected"}"#,
+                br#"{"artifacts":"exact"}"#,
+                br#"{"verified":true}"#,
+                NOW,
+            )
+            .is_err()
+    );
     let concurrent_dispatch = digest("concurrent-dispatch");
     drop(store);
     let barrier = Arc::new(Barrier::new(3));
     let mut handles = Vec::new();
     for (verdict, bytes) in [
-        ("accepted", br#"{"review":"concurrent-accepted"}"#.as_slice()),
-        ("rejected", br#"{"review":"concurrent-rejected"}"#.as_slice()),
+        (
+            "accepted",
+            br#"{"review":"concurrent-accepted"}"#.as_slice(),
+        ),
+        (
+            "rejected",
+            br#"{"review":"concurrent-rejected"}"#.as_slice(),
+        ),
     ] {
         let database = database.clone();
         let expected = required.clone();
@@ -417,22 +494,41 @@ fn protected_store_requires_atomic_admission_review_and_consequence_evidence() {
             let mut writer = CampaignStoreV1::open(&database).unwrap();
             barrier.wait();
             writer.record_shared_review(
-                &expected, &binding, &dispatch, verdict, bytes,
-                br#"{"artifacts":"concurrent"}"#, br#"{"verified":true}"#, NOW,
+                &expected,
+                &binding,
+                &dispatch,
+                verdict,
+                bytes,
+                br#"{"artifacts":"concurrent"}"#,
+                br#"{"verified":true}"#,
+                NOW,
             )
         }));
     }
     barrier.wait();
-    let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
     let mut store = CampaignStoreV1::open(&database).unwrap();
-    store.commit_shared_consequence(
-        &required, &admissible, CampaignTransitionKindV1::Admissible,
-        &binding, &review_id, br#"{"result":"passed"}"#,
-        br#"{"verified":true}"#, NOW,
-    ).unwrap();
-    assert_eq!(store.replay().unwrap().current_state_digest, *admissible.state_digest());
+    store
+        .commit_shared_consequence(
+            &required,
+            &admissible,
+            CampaignTransitionKindV1::Admissible,
+            &binding,
+            &review_id,
+            br#"{"result":"passed"}"#,
+            br#"{"verified":true}"#,
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(
+        store.replay().unwrap().current_state_digest,
+        *admissible.state_digest()
+    );
 }
 
 #[test]

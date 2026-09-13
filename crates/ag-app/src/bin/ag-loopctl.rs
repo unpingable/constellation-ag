@@ -621,7 +621,10 @@ fn main() -> anyhow::Result<()> {
             let engine = CampaignEngineV1::open(&database)?;
             write_exact(&engine.permission_preflight(input.binding_id, input.evaluated_at_unix_ms)?)
         }
-        Command::Run { database, run_input } => run_finite(&database, &run_input, now),
+        Command::Run {
+            database,
+            run_input,
+        } => run_finite(&database, &run_input, now),
         Command::Replay { database } => {
             let (engine, _) = open_bound(&database)?;
             write_exact(&engine.replay()?)
@@ -671,21 +674,36 @@ fn main() -> anyhow::Result<()> {
             }
             let mut observation =
                 CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
-            let protected = engine.runtime_profile()?.is_some_and(|stored| stored.schema == GOVERNED_RUNTIME_PROFILE_SCHEMA_V2);
+            let protected = engine
+                .runtime_profile()?
+                .is_some_and(|stored| stored.schema == GOVERNED_RUNTIME_PROFILE_SCHEMA_V2);
             let state = if protected {
                 let binding = read_exact_input(
-                    plan_binding.as_deref().context("protected campaign requires --plan-binding")?,
+                    plan_binding
+                        .as_deref()
+                        .context("protected campaign requires --plan-binding")?,
                     16 * 1024 * 1024,
                 )?;
                 engine.record_proposal_with_shared_admission(
-                    input.observation, input.proposal, input.class, &mut observation,
-                    &profile.observation_resolver_id, &binding, now()?,
+                    input.observation,
+                    input.proposal,
+                    input.class,
+                    &mut observation,
+                    &profile.observation_resolver_id,
+                    &binding,
+                    now()?,
                 )?
             } else {
-                if plan_binding.is_some() { bail!("V1 campaign does not accept shared plan binding"); }
+                if plan_binding.is_some() {
+                    bail!("V1 campaign does not accept shared plan binding");
+                }
                 engine.record_proposal(
-                    input.observation, input.proposal, input.class, &mut observation,
-                    &profile.observation_resolver_id, now()?,
+                    input.observation,
+                    input.proposal,
+                    input.class,
+                    &mut observation,
+                    &profile.observation_resolver_id,
+                    now()?,
                 )?
             };
             write_exact(&state)
@@ -896,22 +914,31 @@ fn run_finite(
         || !input.review_input.is_absolute()
         || !input.nightshift_cycle_request.is_absolute()
         || !input.executor_config.is_absolute()
-        || input.continuation_input.as_ref().is_some_and(|path| !path.is_absolute())
+        || input
+            .continuation_input
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
     {
         bail!("invalid finite run input");
     }
     let (mut engine, profile, profile_digest) = open_bound_with_digest(database)?;
     if engine.current()?.key().campaign != input.campaign
         || profile_digest != input.runtime_profile_digest
-        || engine.runtime_profile()?.is_none_or(|stored| stored.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2)
+        || engine
+            .runtime_profile()?
+            .is_none_or(|stored| stored.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2)
     {
         bail!("run input differs from protected campaign genesis");
     }
     let run_id = engine.begin_run(canonical.as_bytes(), clock()?)?;
     let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
-    let controlling_review = profile.controlling_review.as_ref()
-        .map(|pinned| read_exact_record(&pinned.path)).transpose()?;
-    let mut observation = CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
+    let controlling_review = profile
+        .controlling_review
+        .as_ref()
+        .map(|pinned| read_exact_record(&pinned.path))
+        .transpose()?;
+    let mut observation =
+        CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
     let mut standing = CommandStandingResolverV1::new(profile.standing_resolver.path.clone());
     let mut steps = 0_u64;
     let mut polls = 0_u64;
@@ -919,8 +946,13 @@ fn run_finite(
         let now_unix_ms = clock()?;
         let current = engine.current()?;
         let terminal = |status, reason, steps, polls| RunStatusV1 {
-            schema: "ag.governed-loop.run-status/v1", run_id: run_id.clone(), status, reason,
-            program_counter: current.program_counter(), steps, polls,
+            schema: "ag.governed-loop.run-status/v1",
+            run_id: run_id.clone(),
+            status,
+            reason,
+            program_counter: current.program_counter(),
+            steps,
+            polls,
         };
         if now_unix_ms >= input.deadline_unix_ms {
             let status = terminal("waiting", "deadline_exhausted", steps, polls);
@@ -934,32 +966,58 @@ fn run_finite(
         }
         match current.program_counter() {
             ProgramCounterV1::ObservationRequired => {
-                let recover_cycle = engine.last_run_observation(&run_id)?
+                let recover_cycle = engine
+                    .last_run_observation(&run_id)?
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|value| value.get("reason").and_then(serde_json::Value::as_str).map(str::to_owned))
-                    .as_deref() == Some("cycle_request_started");
+                    .and_then(|value| {
+                        value
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("cycle_request_started");
                 if !recover_cycle {
                     let started = terminal("active", "cycle_request_started", steps, polls);
                     engine.record_run_observation(&run_id, &started, "active", now_unix_ms)?;
                 }
                 let stored: GovernedRuntimeProfileV2 = {
-                    let stored = engine.runtime_profile()?.context("protected profile missing")?;
+                    let stored = engine
+                        .runtime_profile()?
+                        .context("protected profile missing")?;
                     strict_json_from_slice(&stored.canonical_bytes)?
                 };
-                let response = stored.nightshift_cycle.run_cycle(
-                    &input.nightshift_cycle_request, recover_cycle,
-                );
+                let response = stored
+                    .nightshift_cycle
+                    .run_cycle(&input.nightshift_cycle_request, recover_cycle);
                 match response {
                     Ok(response) => {
                         engine.record_run_observation(&run_id, &response, "active", now_unix_ms)?;
-                        if engine.current()?.program_counter() == ProgramCounterV1::ObservationRequired {
-                            let status = terminal("waiting", "independent_observation_unavailable", steps, polls);
-                            engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        if engine.current()?.program_counter()
+                            == ProgramCounterV1::ObservationRequired
+                        {
+                            let status = terminal(
+                                "waiting",
+                                "independent_observation_unavailable",
+                                steps,
+                                polls,
+                            );
+                            engine.record_run_observation(
+                                &run_id,
+                                &status,
+                                "waiting",
+                                now_unix_ms,
+                            )?;
                             return write_exact(&status);
                         }
                     }
                     Err(error) => {
-                        let status = terminal("waiting", "independent_observation_unavailable", steps, polls);
+                        let status = terminal(
+                            "waiting",
+                            "independent_observation_unavailable",
+                            steps,
+                            polls,
+                        );
                         engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                         let _ = error;
                         return write_exact(&status);
@@ -979,9 +1037,14 @@ fn run_finite(
                     let _ = engine.record_review(&review, now_unix_ms)?;
                 }
                 match engine.decide_versioned(
-                    &mut observation, &mut standing, &catalog, controlling_review.as_ref(),
-                    &profile.observation_resolver_id, &profile.standing_resolver_id,
-                    profile.max_standing_ttl_ms, now_unix_ms,
+                    &mut observation,
+                    &mut standing,
+                    &catalog,
+                    controlling_review.as_ref(),
+                    &profile.observation_resolver_id,
+                    &profile.standing_resolver_id,
+                    profile.max_standing_ttl_ms,
+                    now_unix_ms,
                 ) {
                     Ok(_) => {}
                     Err(CampaignEngineErrorV1::SharedAdmissionRequired) => {
@@ -994,9 +1057,14 @@ fn run_finite(
             }
             ProgramCounterV1::AdmissiblePendingAuthorization => {
                 engine.authorize_versioned(
-                    &mut observation, &mut standing, &catalog, controlling_review.as_ref(),
-                    &profile.observation_resolver_id, &profile.standing_resolver_id,
-                    profile.max_standing_ttl_ms, now_unix_ms,
+                    &mut observation,
+                    &mut standing,
+                    &catalog,
+                    controlling_review.as_ref(),
+                    &profile.observation_resolver_id,
+                    &profile.standing_resolver_id,
+                    profile.max_standing_ttl_ms,
+                    now_unix_ms,
                 )?;
             }
             ProgramCounterV1::AuthorizationConsumed => {
@@ -1030,7 +1098,11 @@ fn run_finite(
                     return write_exact(&status);
                 };
                 let continuation: ContinuationInputV1 = read_exact_record(path)?;
-                engine.open_continuation(continuation.occurrence, continuation.expected_ag_work, now_unix_ms)?;
+                engine.open_continuation(
+                    continuation.occurrence,
+                    continuation.expected_ag_work,
+                    now_unix_ms,
+                )?;
             }
             ProgramCounterV1::Halted => {
                 let status = terminal("terminal", "halted", steps, polls);
@@ -1054,13 +1126,18 @@ fn docket_custody_from_profile(
     let pinned = &profile.docket;
     pinned.verify_all()?;
     let signer = AgIssuanceSignerV1::from_pkcs8(
-        pinned.issuer_principal.clone(), pinned.issuer_key_id.clone(),
+        pinned.issuer_principal.clone(),
+        pinned.issuer_key_id.clone(),
         &pinned.issuer_key.verify(false)?,
     )?;
     Ok(CommandDocketCustodyPortV1::new(
-        pinned.docket_program.path.clone(), pinned.state_directory.clone(),
-        pinned.trust_config.path.clone(), pinned.standing_resolver.path.clone(),
-        pinned.executor_adapter.path.clone(), executor_config.to_owned(), signer,
+        pinned.docket_program.path.clone(),
+        pinned.state_directory.clone(),
+        pinned.trust_config.path.clone(),
+        pinned.standing_resolver.path.clone(),
+        pinned.executor_adapter.path.clone(),
+        executor_config.to_owned(),
+        signer,
     ))
 }
 

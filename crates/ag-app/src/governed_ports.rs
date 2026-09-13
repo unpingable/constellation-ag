@@ -58,17 +58,14 @@ pub const GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V1: &str =
 pub const GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V2: &str =
     "ag.governed-loop.runtime-profile-enrollment/v2";
 /// Closed shared-admission profile member.
-pub const GOVERNED_SHARED_ADMISSION_SCHEMA_V1: &str =
-    "ag.governed-loop.shared-admission/v1";
+pub const GOVERNED_SHARED_ADMISSION_SCHEMA_V1: &str = "ag.governed-loop.shared-admission/v1";
 /// Exact Maude governed-plan binding schema.
-pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str =
-    "maude.governed-plan-binding/v1";
+pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str = "maude.governed-plan-binding/v1";
 /// V2 top-level canonical Nightshift cycle port.
 pub const GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1: &str =
     "ag.governed-loop.nightshift-cycle-port/v1";
 /// Closed nonsecret configuration consumed by the Nightshift cycle adapter.
-pub const NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1: &str =
-    "nightshift.ag-cycle-port-config/v1";
+pub const NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1: &str = "nightshift.ag-cycle-port-config/v1";
 /// Schema for the deployment-owned Docket adapter root.
 pub const GOVERNED_DOCKET_ROOT_SCHEMA_V1: &str = "ag.governed-loop.docket-root/v1";
 /// Schema for the Docket portion of runtime-profile enrollment.
@@ -298,7 +295,8 @@ impl GovernedSharedAdmissionV1 {
         let _ = crate::shared_admission::canonical_file_identity(&config)?;
         let _ = self.review_verifier.verify(true)?;
         let requirement = self.review_requirement.verify(false)?;
-        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
+        let requirement =
+            crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
         if requirement.compiler_contract != self.compiler_contract {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "review requirement compiler contract differs from shared admission",
@@ -363,10 +361,17 @@ impl NightshiftCyclePortConfigV1 {
             || self.nq_source_id.is_empty()
             || self.ag_observation_resolver_id.is_empty()
             || [
-                &self.store, &self.present_evidence_resolver, &self.nq_program,
-                &self.nq_config, &self.ag_loopctl, &self.ag_database,
-                &self.ag_observation_resolver, &self.ag_runtime_profile,
-            ].into_iter().any(|path| !path.is_absolute())
+                &self.store,
+                &self.present_evidence_resolver,
+                &self.nq_program,
+                &self.nq_config,
+                &self.ag_loopctl,
+                &self.ag_database,
+                &self.ag_observation_resolver,
+                &self.ag_runtime_profile,
+            ]
+            .into_iter()
+            .any(|path| !path.is_absolute())
         {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "invalid Nightshift cycle adapter config",
@@ -379,7 +384,9 @@ impl NightshiftCyclePortConfigV1 {
 impl GovernedNightshiftCyclePortV1 {
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1 {
-            return Err(GovernedPortErrorV1::InvalidConfiguration("invalid Nightshift cycle port"));
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid Nightshift cycle port",
+            ));
         }
         let _ = self.program.verify(true)?;
         let config = self.config.verify(false)?;
@@ -401,13 +408,22 @@ impl GovernedNightshiftCyclePortV1 {
     ) -> Result<serde_json::Value, GovernedPortErrorV1> {
         self.verify_all()?;
         if !request.is_absolute() {
-            return Err(GovernedPortErrorV1::InvalidConfiguration("cycle request is not absolute"));
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "cycle request is not absolute",
+            ));
         }
         let arguments = vec![
             "cycle".to_owned(),
-            if recover { "recover-config" } else { "run-config" }.to_owned(),
-            "--config".to_owned(), self.config.path.display().to_string(),
-            "--request".to_owned(), request.display().to_string(),
+            if recover {
+                "recover-config"
+            } else {
+                "run-config"
+            }
+            .to_owned(),
+            "--config".to_owned(),
+            self.config.path.display().to_string(),
+            "--request".to_owned(),
+            request.display().to_string(),
         ];
         run_json_program(&self.program.path, &arguments, &serde_json::json!({}))
     }
@@ -631,8 +647,7 @@ impl GovernedRuntimeProfileEnrollmentV2 {
     pub fn seal(self) -> Result<GovernedRuntimeProfileV2, GovernedPortErrorV1> {
         if self.schema != GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V2
             || self.shared_admission.schema != GOVERNED_SHARED_ADMISSION_SCHEMA_V1
-            || self.shared_admission.plan_binding_schema
-                != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
+            || self.shared_admission.plan_binding_schema != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
             || self.nightshift_cycle.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1
         {
             return Err(GovernedPortErrorV1::InvalidConfiguration(

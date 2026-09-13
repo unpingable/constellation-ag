@@ -6,27 +6,21 @@
 use ag_campaign::CampaignId;
 use ag_campaign::governed::OccurrenceKeyV1;
 use ag_primitives::{Digest, JcsDocument};
-use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 
-use crate::governed_ports::{
-    GovernedPortErrorV1, GovernedSharedAdmissionV1, run_json_program,
-};
+use crate::governed_ports::{GovernedPortErrorV1, GovernedSharedAdmissionV1, run_json_program};
 
-pub const REVIEW_REQUIREMENT_SCHEMA_V1: &str =
-    "ag.governed-loop.review-requirement/v1";
+pub const REVIEW_REQUIREMENT_SCHEMA_V1: &str = "ag.governed-loop.review-requirement/v1";
 pub const PLAN_REVIEW_SCHEMA_V1: &str = "maude.governed-plan-review/v1";
-pub const REVIEW_RECORD_INPUT_SCHEMA_V1: &str =
-    "ag.governed-loop.review-record-input/v1";
-pub const PLAN_VALIDATION_REQUEST_SCHEMA_V1: &str =
-    "ag.governed-loop.plan-validation-request/v1";
+pub const REVIEW_RECORD_INPUT_SCHEMA_V1: &str = "ag.governed-loop.review-record-input/v1";
+pub const PLAN_VALIDATION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.plan-validation-request/v1";
 pub const REVIEW_VERIFICATION_REQUEST_SCHEMA_V1: &str =
     "ag.governed-loop.review-verification-request/v1";
 pub const OWNER_VERIFICATION_RESPONSE_SCHEMA_V1: &str =
     "ag.governed-loop.owner-verification-response/v1";
 pub const MAUDE_PLAN_VALIDATION_SCHEMA_V1: &str = "maude.governed-plan-validation/v1";
-pub const PERMISSION_PREFLIGHT_SCHEMA_V1: &str =
-    "ag.governed-loop.permission-preflight/v1";
+pub const PERMISSION_PREFLIGHT_SCHEMA_V1: &str = "ag.governed-loop.permission-preflight/v1";
 
 pub fn canonical_file_identity(bytes: &[u8]) -> Result<Digest, GovernedPortErrorV1> {
     let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
@@ -145,7 +139,8 @@ impl RecordReviewInputV1 {
         let custody = STANDARD
             .decode(&self.artifacts.custody_receipt_bytes_base64)
             .map_err(|_| GovernedPortErrorV1::Canonical("invalid custody base64".to_owned()))?;
-        if result.len() > 16 * 1024 * 1024 || custody.len() > 16 * 1024 * 1024
+        if result.len() > 16 * 1024 * 1024
+            || custody.len() > 16 * 1024 * 1024
             || STANDARD.encode(&result) != self.artifacts.result_bytes_base64
             || STANDARD.encode(&custody) != self.artifacts.custody_receipt_bytes_base64
             || Digest::hash_bytes(&result) != self.review.result_digest
@@ -192,10 +187,8 @@ pub fn validate_plan_binding(
     let _: serde_json::Value = document
         .decode()
         .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-    let mut binding_file = tempfile::NamedTempFile::new()
-        .map_err(GovernedPortErrorV1::Io)?;
-    std::io::Write::write_all(&mut binding_file, binding_bytes)
-        .map_err(GovernedPortErrorV1::Io)?;
+    let mut binding_file = tempfile::NamedTempFile::new().map_err(GovernedPortErrorV1::Io)?;
+    std::io::Write::write_all(&mut binding_file, binding_bytes).map_err(GovernedPortErrorV1::Io)?;
     let response: MaudePlanValidationV1 = run_json_program(
         &profile.plan_validator.path,
         &[
@@ -363,9 +356,21 @@ mod tests {
 
     #[test]
     fn permission_preflight_has_all_three_outcomes_and_denial_dominates_unknown() {
-        assert_eq!(permission_decision(true, false, false), PermissionPreflightDecisionV1::Allowed);
-        assert_eq!(permission_decision(false, true, false), PermissionPreflightDecisionV1::Denied);
-        assert_eq!(permission_decision(false, false, true), PermissionPreflightDecisionV1::Indeterminate);
-        assert_eq!(permission_decision(false, true, true), PermissionPreflightDecisionV1::Denied);
+        assert_eq!(
+            permission_decision(true, false, false),
+            PermissionPreflightDecisionV1::Allowed
+        );
+        assert_eq!(
+            permission_decision(false, true, false),
+            PermissionPreflightDecisionV1::Denied
+        );
+        assert_eq!(
+            permission_decision(false, false, true),
+            PermissionPreflightDecisionV1::Indeterminate
+        );
+        assert_eq!(
+            permission_decision(false, true, true),
+            PermissionPreflightDecisionV1::Denied
+        );
     }
 }

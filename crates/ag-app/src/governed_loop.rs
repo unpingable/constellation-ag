@@ -486,13 +486,9 @@ struct FreshSharedGateV1 {
 
 impl CampaignEngineV1 {
     fn is_protected(&self) -> Result<bool, CampaignEngineErrorV1> {
-        Ok(self
-            .store
-            .runtime_profile()?
-            .is_some_and(|profile| {
-                profile.schema
-                    == crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2
-            }))
+        Ok(self.store.runtime_profile()?.is_some_and(|profile| {
+            profile.schema == crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2
+        }))
     }
 
     fn fresh_shared_gate(
@@ -500,7 +496,9 @@ impl CampaignEngineV1 {
         current: &OccurrenceSnapshotV1,
         now_unix_ms: u64,
     ) -> Result<FreshSharedGateV1, CampaignEngineErrorV1> {
-        let stored_profile = self.store.runtime_profile()?
+        let stored_profile = self
+            .store
+            .runtime_profile()?
             .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
         if stored_profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
@@ -510,7 +508,9 @@ impl CampaignEngineV1 {
                 .and_then(|document| document.decode())
                 .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         profile.verify_genesis()?;
-        let evidence = self.store.shared_admission(current.key())?
+        let evidence = self
+            .store
+            .shared_admission(current.key())?
             .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
         let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(
             &profile.shared_admission.review_requirement.verify(false)?,
@@ -519,7 +519,8 @@ impl CampaignEngineV1 {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
         let validation = crate::shared_admission::validate_plan_binding(
-            &profile.shared_admission, &evidence.binding_jcs,
+            &profile.shared_admission,
+            &evidence.binding_jcs,
         )?;
         if validation.binding_id != evidence.binding_id {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
@@ -550,17 +551,21 @@ impl CampaignEngineV1 {
                 artifacts,
             };
             let review_verification = crate::shared_admission::verify_review(
-                &profile.shared_admission, &requirement, &input,
+                &profile.shared_admission,
+                &requirement,
+                &input,
             )?;
             return Ok(FreshSharedGateV1 {
                 binding_id: evidence.binding_id.clone(),
                 review_id: stored.review_id.clone(),
                 plan_validation_jcs: JcsDocument::canonicalize(&validation)
                     .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?
-                    .as_bytes().to_vec(),
+                    .as_bytes()
+                    .to_vec(),
                 review_verification_jcs: JcsDocument::canonicalize(&review_verification)
                     .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?
-                    .as_bytes().to_vec(),
+                    .as_bytes()
+                    .to_vec(),
                 expires_at_unix_ms: input.review.expires_at_unix_ms,
             });
         }
@@ -726,9 +731,8 @@ impl CampaignEngineV1 {
                 .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         profile.verify_genesis()?;
         let requirement_bytes = profile.shared_admission.review_requirement.verify(false)?;
-        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(
-            &requirement_bytes,
-        )?;
+        let requirement =
+            crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement_bytes)?;
         if requirement.compiler_contract != profile.shared_admission.compiler_contract {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
@@ -747,7 +751,7 @@ impl CampaignEngineV1 {
         let current = self.store.current()?;
         let binding_text = |field: &str| binding.get(field).and_then(serde_json::Value::as_str);
         if binding_text("schema")
-                != Some(crate::governed_ports::MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1)
+            != Some(crate::governed_ports::MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1)
             || binding_text("campaign") != Some(current.key().campaign.as_str())
             || binding_text("occurrence") != Some(current.key().occurrence.to_string().as_str())
             || binding_text("subject") != Some(proposal.subject().as_str())
@@ -759,11 +763,12 @@ impl CampaignEngineV1 {
         {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        let response = crate::shared_admission::validate_plan_binding(
-            &profile.shared_admission,
-            binding_jcs,
-        )?;
-        let config_bytes = profile.shared_admission.plan_validator_config.verify(false)?;
+        let response =
+            crate::shared_admission::validate_plan_binding(&profile.shared_admission, binding_jcs)?;
+        let config_bytes = profile
+            .shared_admission
+            .plan_validator_config
+            .verify(false)?;
         if response.binding_id != binding_id
             || response.config_digest
                 != crate::shared_admission::canonical_file_identity(&config_bytes)?
@@ -826,9 +831,13 @@ impl CampaignEngineV1 {
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         let artifacts_jcs = JcsDocument::canonicalize(&input.artifacts)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
-        let admitted = self.store.shared_admission(current.key())?
+        let admitted = self
+            .store
+            .shared_admission(current.key())?
             .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
-        if let Some(existing) = admitted.reviews.iter()
+        if let Some(existing) = admitted
+            .reviews
+            .iter()
             .find(|review| review.dispatch_id == input.review.dispatch_id)
         {
             if existing.review_jcs == review_jcs.as_bytes()
@@ -838,11 +847,8 @@ impl CampaignEngineV1 {
             }
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        let verification = crate::shared_admission::verify_review(
-            &profile.shared_admission,
-            &requirement,
-            input,
-        )?;
+        let verification =
+            crate::shared_admission::verify_review(&profile.shared_admission, &requirement, input)?;
         let verification_jcs = JcsDocument::canonicalize(&verification)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         self.store
@@ -869,9 +875,13 @@ impl CampaignEngineV1 {
         expected_binding: Digest,
         now_unix_ms: u64,
     ) -> Result<crate::shared_admission::PermissionPreflightV1, CampaignEngineErrorV1> {
-        use crate::shared_admission::{PermissionPreflightDecisionV1 as Decision, PermissionPreflightV1};
+        use crate::shared_admission::{
+            PermissionPreflightDecisionV1 as Decision, PermissionPreflightV1,
+        };
         let current = self.store.current()?;
-        let profile = self.store.runtime_profile()?
+        let profile = self
+            .store
+            .runtime_profile()?
             .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
         if profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
@@ -879,14 +889,21 @@ impl CampaignEngineV1 {
         let evidence = self.store.shared_admission(current.key())?;
         let mut result = PermissionPreflightV1 {
             schema: crate::shared_admission::PERMISSION_PREFLIGHT_SCHEMA_V1.to_owned(),
-            key: current.key().clone(), profile_digest: profile.digest,
-            binding_id: expected_binding.clone(), review_id: None,
+            key: current.key().clone(),
+            profile_digest: profile.digest,
+            binding_id: expected_binding.clone(),
+            review_id: None,
             sampled_state_digest: current.state_digest().clone(),
-            evaluated_at_unix_ms: now_unix_ms, expires_at_unix_ms: now_unix_ms,
-            decision: Decision::Indeterminate, evidence: Vec::new(),
-            reasons: vec!["plan_evidence_missing".to_owned()], grants_authority: false,
+            evaluated_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms: now_unix_ms,
+            decision: Decision::Indeterminate,
+            evidence: Vec::new(),
+            reasons: vec!["plan_evidence_missing".to_owned()],
+            grants_authority: false,
         };
-        let Some(admission) = evidence else { return Ok(result) };
+        let Some(admission) = evidence else {
+            return Ok(result);
+        };
         if admission.binding_id != expected_binding {
             result.decision = Decision::Denied;
             result.reasons = vec!["binding_mismatch".to_owned()];
@@ -914,7 +931,9 @@ impl CampaignEngineV1 {
                 result.expires_at_unix_ms = gate.expires_at_unix_ms;
                 result.reasons = vec!["all_owner_checks_current".to_owned()];
             }
-            Err(CampaignEngineErrorV1::SharedPort(crate::governed_ports::GovernedPortErrorV1::Refused(reason))) => {
+            Err(CampaignEngineErrorV1::SharedPort(
+                crate::governed_ports::GovernedPortErrorV1::Refused(reason),
+            )) => {
                 result.decision = Decision::Denied;
                 result.reasons = vec![format!("owner_refused:{reason}")];
             }
@@ -943,12 +962,16 @@ impl CampaignEngineV1 {
         input_jcs: &[u8],
         now_unix_ms: u64,
     ) -> Result<Digest, CampaignEngineErrorV1> {
-        let profile = self.store.runtime_profile()?
+        let profile = self
+            .store
+            .runtime_profile()?
             .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
         if profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        self.store.begin_shared_run(&profile.digest, input_jcs, now_unix_ms).map_err(Into::into)
+        self.store
+            .begin_shared_run(&profile.digest, input_jcs, now_unix_ms)
+            .map_err(Into::into)
     }
 
     /// Retains a run observation without changing campaign state.
@@ -962,9 +985,15 @@ impl CampaignEngineV1 {
         let current = self.store.current()?;
         let jcs = JcsDocument::canonicalize(observation)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
-        self.store.record_shared_run_observation(
-            run_id, current.state_digest(), jcs.as_bytes(), status, now_unix_ms,
-        ).map_err(Into::into)
+        self.store
+            .record_shared_run_observation(
+                run_id,
+                current.state_digest(),
+                jcs.as_bytes(),
+                status,
+                now_unix_ms,
+            )
+            .map_err(Into::into)
     }
 
     /// Returns the exact last run observation, if any.
@@ -972,7 +1001,9 @@ impl CampaignEngineV1 {
         &self,
         run_id: &Digest,
     ) -> Result<Option<Vec<u8>>, CampaignEngineErrorV1> {
-        self.store.last_shared_run_observation(run_id).map_err(Into::into)
+        self.store
+            .last_shared_run_observation(run_id)
+            .map_err(Into::into)
     }
 
     /// Enters the explicit standing-required state.
@@ -1024,11 +1055,23 @@ impl CampaignEngineV1 {
         )?;
         if protected {
             let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
-            self.store.commit_shared_consequence(&current, &successor,
-                CampaignTransitionKindV1::Admissible, &gate.binding_id, &gate.review_id,
-                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+            self.store.commit_shared_consequence(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::Admissible,
+                &gate.binding_id,
+                &gate.review_id,
+                &gate.plan_validation_jcs,
+                &gate.review_verification_jcs,
+                now_unix_ms,
+            )?;
         } else {
-            self.store.commit(&current, &successor, CampaignTransitionKindV1::Admissible, now_unix_ms)?;
+            self.store.commit(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::Admissible,
+                now_unix_ms,
+            )?;
         }
         Ok(successor)
     }
@@ -1067,11 +1110,23 @@ impl CampaignEngineV1 {
         )?;
         if protected {
             let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
-            self.store.commit_shared_consequence(&current, &successor,
-                CampaignTransitionKindV1::Admissible, &gate.binding_id, &gate.review_id,
-                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+            self.store.commit_shared_consequence(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::Admissible,
+                &gate.binding_id,
+                &gate.review_id,
+                &gate.plan_validation_jcs,
+                &gate.review_verification_jcs,
+                now_unix_ms,
+            )?;
         } else {
-            self.store.commit(&current, &successor, CampaignTransitionKindV1::Admissible, now_unix_ms)?;
+            self.store.commit(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::Admissible,
+                now_unix_ms,
+            )?;
         }
         Ok(successor)
     }
@@ -1151,11 +1206,23 @@ impl CampaignEngineV1 {
         )?;
         if protected {
             let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
-            self.store.commit_shared_consequence(&current, &successor,
-                CampaignTransitionKindV1::AuthorizationConsumed, &gate.binding_id, &gate.review_id,
-                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+            self.store.commit_shared_consequence(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed,
+                &gate.binding_id,
+                &gate.review_id,
+                &gate.plan_validation_jcs,
+                &gate.review_verification_jcs,
+                now_unix_ms,
+            )?;
         } else {
-            self.store.commit(&current, &successor, CampaignTransitionKindV1::AuthorizationConsumed, now_unix_ms)?;
+            self.store.commit(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed,
+                now_unix_ms,
+            )?;
         }
         Ok(successor)
     }
@@ -1193,11 +1260,23 @@ impl CampaignEngineV1 {
         )?;
         if protected {
             let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
-            self.store.commit_shared_consequence(&current, &successor,
-                CampaignTransitionKindV1::AuthorizationConsumed, &gate.binding_id, &gate.review_id,
-                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+            self.store.commit_shared_consequence(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed,
+                &gate.binding_id,
+                &gate.review_id,
+                &gate.plan_validation_jcs,
+                &gate.review_verification_jcs,
+                now_unix_ms,
+            )?;
         } else {
-            self.store.commit(&current, &successor, CampaignTransitionKindV1::AuthorizationConsumed, now_unix_ms)?;
+            self.store.commit(
+                &current,
+                &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed,
+                now_unix_ms,
+            )?;
         }
         Ok(successor)
     }

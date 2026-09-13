@@ -818,9 +818,10 @@ impl CampaignStoreV1 {
             CampaignTransitionKindV1::ProposalRecorded
                 | CampaignTransitionKindV1::Admissible
                 | CampaignTransitionKindV1::AuthorizationConsumed
-        ) && self.runtime_profile()?.is_some_and(|profile| {
-            profile.schema == "ag.governed-loop.runtime-profile/v2"
-        }) {
+        ) && self
+            .runtime_profile()?
+            .is_some_and(|profile| profile.schema == "ag.governed-loop.runtime-profile/v2")
+        {
             return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
         }
         if kind == CampaignTransitionKindV1::HumanDisposition
@@ -919,8 +920,13 @@ impl CampaignStoreV1 {
         }
         let review_id = Digest::hash_bytes(review_jcs);
         let event_digest = shared_review_event_digest(
-            binding_id, dispatch_id, &review_id, verdict,
-            review_jcs, artifacts_jcs, verification_jcs,
+            binding_id,
+            dispatch_id,
+            &review_id,
+            verdict,
+            review_jcs,
+            artifacts_jcs,
+            verification_jcs,
         );
         let transaction = self
             .connection
@@ -999,14 +1005,19 @@ impl CampaignStoreV1 {
         review_verification_jcs: &[u8],
         checked_at_unix_ms: u64,
     ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
-        if !matches!(kind, CampaignTransitionKindV1::Admissible | CampaignTransitionKindV1::AuthorizationConsumed) {
+        if !matches!(
+            kind,
+            CampaignTransitionKindV1::Admissible | CampaignTransitionKindV1::AuthorizationConsumed
+        ) {
             return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
         }
         for bytes in [plan_validation_jcs, review_verification_jcs] {
             JcsDocument::from_canonical_bytes(bytes)
                 .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let accepted: bool = transaction.query_row(
             "SELECT EXISTS(
                SELECT 1 FROM shared_plan_admissions a JOIN shared_review_events r
@@ -1014,24 +1025,40 @@ impl CampaignStoreV1 {
                 AND r.binding_id=a.binding_id
                WHERE a.campaign_id=?1 AND a.occurrence_id=?2 AND a.binding_id=?3
                  AND r.review_id=?4 AND r.verdict='accepted')",
-            params![expected.key().campaign.as_str(), expected.key().occurrence.to_string(), binding_id.as_str(), review_id.as_str()],
+            params![
+                expected.key().campaign.as_str(),
+                expected.key().occurrence.to_string(),
+                binding_id.as_str(),
+                review_id.as_str()
+            ],
             |row| row.get(0),
         )?;
         if !accepted {
             return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
         }
         let receipt = write_transition(
-            &transaction, expected, successor, kind,
-            &CampaignTransitionEvidenceV1::None, checked_at_unix_ms,
+            &transaction,
+            expected,
+            successor,
+            kind,
+            &CampaignTransitionEvidenceV1::None,
+            checked_at_unix_ms,
         )?;
         transaction.execute(
             "INSERT INTO shared_consequence_gates
              (transition_state_digest, campaign_id, occurrence_id, binding_id,
               review_id, plan_validation_jcs, review_verification_jcs, checked_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![receipt.successor_state_digest.as_str(), expected.key().campaign.as_str(),
-                expected.key().occurrence.to_string(), binding_id.as_str(), review_id.as_str(),
-                plan_validation_jcs, review_verification_jcs, to_i64(checked_at_unix_ms)?],
+            params![
+                receipt.successor_state_digest.as_str(),
+                expected.key().campaign.as_str(),
+                expected.key().occurrence.to_string(),
+                binding_id.as_str(),
+                review_id.as_str(),
+                plan_validation_jcs,
+                review_verification_jcs,
+                to_i64(checked_at_unix_ms)?
+            ],
         )?;
         transaction.commit()?;
         Ok(receipt)
@@ -1047,24 +1074,37 @@ impl CampaignStoreV1 {
         JcsDocument::from_canonical_bytes(input_jcs)
             .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
         let run_id = Digest::hash_domain("ag.governed-loop.run-input/v1", input_jcs);
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let campaign = campaign_head(&transaction)?.campaign;
-        let same: Option<Vec<u8>> = transaction.query_row(
-            "SELECT input_jcs FROM shared_runs WHERE run_id=?1",
-            params![run_id.as_str()], |row| row.get(0),
-        ).optional()?;
+        let same: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT input_jcs FROM shared_runs WHERE run_id=?1",
+                params![run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(same) = same {
-            if same == input_jcs { return Ok(run_id); }
+            if same == input_jcs {
+                return Ok(run_id);
+            }
             return Err(CampaignStoreErrorV1::SharedRunConflict);
         }
-        let existing: Option<(String, Vec<u8>)> = transaction.query_row(
-            "SELECT run_id, input_jcs FROM shared_runs
+        let existing: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT run_id, input_jcs FROM shared_runs
              WHERE campaign_id=?1 AND status!='terminal'",
-            params![campaign], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+                params![campaign],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         if let Some((existing_id, existing_input)) = existing {
             if existing_id == run_id.as_str() && existing_input == input_jcs {
-                transaction.execute("UPDATE shared_runs SET status='active' WHERE run_id=?1", params![existing_id])?;
+                transaction.execute(
+                    "UPDATE shared_runs SET status='active' WHERE run_id=?1",
+                    params![existing_id],
+                )?;
                 transaction.commit()?;
                 return Ok(run_id);
             }
@@ -1074,7 +1114,13 @@ impl CampaignStoreV1 {
             "INSERT INTO shared_runs
              (run_id, campaign_id, profile_digest, input_jcs, status, created_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
-            params![run_id.as_str(), campaign, profile_digest.as_str(), input_jcs, to_i64(recorded_at_unix_ms)?],
+            params![
+                run_id.as_str(),
+                campaign,
+                profile_digest.as_str(),
+                input_jcs,
+                to_i64(recorded_at_unix_ms)?
+            ],
         )?;
         transaction.commit()?;
         Ok(run_id)
@@ -1090,34 +1136,52 @@ impl CampaignStoreV1 {
         recorded_at_unix_ms: u64,
     ) -> Result<(), CampaignStoreErrorV1> {
         if !matches!(status, "active" | "waiting" | "terminal") {
-            return Err(CampaignStoreErrorV1::Canonical("invalid shared run status".to_owned()));
+            return Err(CampaignStoreErrorV1::Canonical(
+                "invalid shared run status".to_owned(),
+            ));
         }
         JcsDocument::from_canonical_bytes(observation_jcs)
             .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing_status: Option<String> = transaction.query_row(
-            "SELECT status FROM shared_runs WHERE run_id=?1", params![run_id.as_str()], |row| row.get(0),
-        ).optional()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM shared_runs WHERE run_id=?1",
+                params![run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
         if existing_status.as_deref() == Some("terminal") {
             let same: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM shared_run_observations
                  WHERE sequence=(SELECT MAX(sequence) FROM shared_run_observations WHERE run_id=?1)
                    AND state_digest=?2 AND observation_jcs=?3)",
-                params![run_id.as_str(), state_digest.as_str(), observation_jcs], |row| row.get(0),
+                params![run_id.as_str(), state_digest.as_str(), observation_jcs],
+                |row| row.get(0),
             )?;
-            if same && status == "terminal" { return Ok(()); }
+            if same && status == "terminal" {
+                return Ok(());
+            }
             return Err(CampaignStoreErrorV1::SharedRunConflict);
         }
         let changed = transaction.execute(
             "UPDATE shared_runs SET status=?1 WHERE run_id=?2 AND status!='terminal'",
             params![status, run_id.as_str()],
         )?;
-        if changed != 1 { return Err(CampaignStoreErrorV1::SharedRunConflict); }
+        if changed != 1 {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
         transaction.execute(
             "INSERT INTO shared_run_observations
              (run_id, state_digest, observation_jcs, recorded_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4)",
-            params![run_id.as_str(), state_digest.as_str(), observation_jcs, to_i64(recorded_at_unix_ms)?],
+            params![
+                run_id.as_str(),
+                state_digest.as_str(),
+                observation_jcs,
+                to_i64(recorded_at_unix_ms)?
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1128,11 +1192,15 @@ impl CampaignStoreV1 {
         &self,
         run_id: &Digest,
     ) -> Result<Option<Vec<u8>>, CampaignStoreErrorV1> {
-        self.connection.query_row(
-            "SELECT observation_jcs FROM shared_run_observations
+        self.connection
+            .query_row(
+                "SELECT observation_jcs FROM shared_run_observations
              WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
-            params![run_id.as_str()], |row| row.get(0),
-        ).optional().map_err(Into::into)
+                params![run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Atomically consumes one exact human disposition and applies its closed effect.
@@ -1321,7 +1389,8 @@ impl CampaignStoreV1 {
         if !table_exists(&self.connection, "shared_plan_admissions")? {
             return Ok(None);
         }
-        let row: Option<(String, String, Vec<u8>, Vec<u8>)> = self.connection
+        let row: Option<(String, String, Vec<u8>, Vec<u8>)> = self
+            .connection
             .query_row(
                 "SELECT predecessor_state_digest, binding_id, binding_jcs, validation_jcs
                  FROM shared_plan_admissions
@@ -1347,7 +1416,17 @@ impl CampaignStoreV1 {
         )?;
         let rows = statement.query_map(
             params![key.campaign.as_str(), key.occurrence.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, i64>(6)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
         )?;
         let mut reviews = Vec::new();
         for row in rows {
@@ -1363,10 +1442,14 @@ impl CampaignStoreV1 {
             });
         }
         Ok(Some(StoredSharedAdmissionV1 {
-            campaign: key.campaign.clone(), occurrence: key.occurrence.to_string(),
+            campaign: key.campaign.clone(),
+            occurrence: key.occurrence.to_string(),
             predecessor_state_digest: parse_digest(&predecessor)?,
-            binding_id: parse_digest(&binding)?, requirement_digest: parse_digest(&requirement)?,
-            binding_jcs, validation_jcs, reviews,
+            binding_id: parse_digest(&binding)?,
+            requirement_digest: parse_digest(&requirement)?,
+            binding_jcs,
+            validation_jcs,
+            reviews,
         }))
     }
 
@@ -1572,8 +1655,15 @@ fn shared_review_event_digest(
         verification_jcs: &'a [u8],
     }
     let bytes = JcsDocument::canonicalize(&Input {
-        binding, dispatch, review, verdict, review_jcs, artifacts_jcs, verification_jcs,
-    }).expect("shared review event is strict JCS-compatible");
+        binding,
+        dispatch,
+        review,
+        verdict,
+        review_jcs,
+        artifacts_jcs,
+        verification_jcs,
+    })
+    .expect("shared review event is strict JCS-compatible");
     Digest::hash_domain("ag.governed-loop.shared-review-event/v1", bytes.as_bytes())
 }
 
@@ -2495,7 +2585,12 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     verify_human_artifacts(connection, &human_artifacts)?;
     verify_refusals(connection, &campaign, &transitions)?;
     verify_shared_admission(connection, &campaign, &transitions)?;
-    verify_shared_runs(connection, &campaign, &transitions, stored_profile_digest.as_ref())?;
+    verify_shared_runs(
+        connection,
+        &campaign,
+        &transitions,
+        stored_profile_digest.as_ref(),
+    )?;
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
         return Err(CampaignStoreErrorV1::Corrupt(format!(
@@ -2537,12 +2632,18 @@ fn verify_shared_admission(
 ) -> Result<(), CampaignStoreErrorV1> {
     let protected: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM runtime_profile
-         WHERE schema='ag.governed-loop.runtime-profile/v2')", [], |row| row.get(0),
+         WHERE schema='ag.governed-loop.runtime-profile/v2')",
+        [],
+        |row| row.get(0),
     )?;
     if !table_exists(connection, "shared_plan_admissions")? {
         return if protected {
-            Err(CampaignStoreErrorV1::Corrupt("protected store lacks shared evidence tables".to_owned()))
-        } else { Ok(()) };
+            Err(CampaignStoreErrorV1::Corrupt(
+                "protected store lacks shared evidence tables".to_owned(),
+            ))
+        } else {
+            Ok(())
+        };
     }
     let mut proposals = BTreeMap::new();
     for transition in transitions {
@@ -2560,7 +2661,14 @@ fn verify_shared_admission(
          FROM shared_plan_admissions WHERE campaign_id=?1",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+        ))
     })?;
     for row in rows {
         let row = row?;
@@ -2573,16 +2681,22 @@ fn verify_shared_admission(
             .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
         let binding_value: serde_json::Value = decode(&row.4)?;
         let validation_value: serde_json::Value = decode(&row.5)?;
-        if binding_value.get("binding_id").and_then(serde_json::Value::as_str)
-                != Some(binding.as_str())
-            || validation_value.get("binding_id").and_then(serde_json::Value::as_str)
+        if binding_value
+            .get("binding_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(binding.as_str())
+            || validation_value
+                .get("binding_id")
+                .and_then(serde_json::Value::as_str)
                 != Some(binding.as_str())
         {
             return Err(CampaignStoreErrorV1::Corrupt(
                 "shared admission artifacts differ from binding identity".to_owned(),
             ));
         }
-        if proposals.get(&row.0) != Some(&predecessor) || admissions.insert(row.0, binding).is_some() {
+        if proposals.get(&row.0) != Some(&predecessor)
+            || admissions.insert(row.0, binding).is_some()
+        {
             return Err(CampaignStoreErrorV1::Corrupt(
                 "shared plan admission differs from proposal transition".to_owned(),
             ));
@@ -2601,7 +2715,17 @@ fn verify_shared_admission(
          FROM shared_review_events WHERE campaign_id=?1 ORDER BY sequence",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, Vec<u8>>(7)?, row.get::<_, String>(8)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, String>(8)?,
+        ))
     })?;
     for row in rows {
         let row = row?;
@@ -2617,7 +2741,10 @@ fn verify_shared_admission(
             || !dispatches.insert(dispatch)
             || !review_ids.insert(review.clone())
             || review != Digest::hash_bytes(&row.5)
-            || event != shared_review_event_digest(&binding, &dispatch, &review, &row.4, &row.5, &row.6, &row.7)
+            || event
+                != shared_review_event_digest(
+                    &binding, &dispatch, &review, &row.4, &row.5, &row.6, &row.7,
+                )
             || !matches!(row.4.as_str(), "accepted" | "rejected")
         {
             return Err(CampaignStoreErrorV1::Corrupt(
@@ -2627,7 +2754,13 @@ fn verify_shared_admission(
     }
     let protected_consequences: BTreeSet<String> = transitions
         .iter()
-        .filter(|row| matches!(row.kind, CampaignTransitionKindV1::Admissible | CampaignTransitionKindV1::AuthorizationConsumed))
+        .filter(|row| {
+            matches!(
+                row.kind,
+                CampaignTransitionKindV1::Admissible
+                    | CampaignTransitionKindV1::AuthorizationConsumed
+            )
+        })
         .map(|row| row.successor.as_str().to_owned())
         .collect();
     let mut gates = BTreeSet::new();
@@ -2641,7 +2774,15 @@ fn verify_shared_admission(
          WHERE g.campaign_id=?1",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, String>(6)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
     })?;
     for row in rows {
         let row = row?;
@@ -2672,15 +2813,25 @@ fn verify_shared_runs(
     transitions: &[StoredTransitionRow],
     profile_digest: Option<&Digest>,
 ) -> Result<(), CampaignStoreErrorV1> {
-    if !table_exists(connection, "shared_runs")? { return Ok(()); }
-    let states: BTreeSet<&str> = transitions.iter().map(|row| row.successor.as_str()).collect();
+    if !table_exists(connection, "shared_runs")? {
+        return Ok(());
+    }
+    let states: BTreeSet<&str> = transitions
+        .iter()
+        .map(|row| row.successor.as_str())
+        .collect();
     let mut runs = BTreeSet::new();
     let mut live = 0_u64;
     let mut statement = connection.prepare(
         "SELECT run_id, profile_digest, input_jcs, status FROM shared_runs WHERE campaign_id=?1",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })?;
     for row in rows {
         let row = row?;
@@ -2692,18 +2843,35 @@ fn verify_shared_runs(
             || Some(&profile) != profile_digest
             || !runs.insert(row.0)
             || !matches!(row.3.as_str(), "active" | "waiting" | "terminal")
-        { return Err(CampaignStoreErrorV1::Corrupt("shared run identity failed replay".to_owned())); }
-        if row.3 != "terminal" { live = live.saturating_add(1); }
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared run identity failed replay".to_owned(),
+            ));
+        }
+        if row.3 != "terminal" {
+            live = live.saturating_add(1);
+        }
     }
-    if live > 1 { return Err(CampaignStoreErrorV1::Corrupt("multiple live shared runs".to_owned())); }
-    let mut statement = connection.prepare(
-        "SELECT run_id, state_digest, observation_jcs FROM shared_run_observations",
-    )?;
-    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
+    if live > 1 {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "multiple live shared runs".to_owned(),
+        ));
+    }
+    let mut statement = connection
+        .prepare("SELECT run_id, state_digest, observation_jcs FROM shared_run_observations")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
     for row in rows {
         let row = row?;
         if !runs.contains(&row.0) || !states.contains(row.1.as_str()) {
-            return Err(CampaignStoreErrorV1::Corrupt("shared run observation binding mismatch".to_owned()));
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared run observation binding mismatch".to_owned(),
+            ));
         }
         JcsDocument::from_canonical_bytes(&row.2)
             .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
