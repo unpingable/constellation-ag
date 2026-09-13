@@ -403,13 +403,12 @@ impl GovernedNightshiftCyclePortV1 {
         if !request.is_absolute() {
             return Err(GovernedPortErrorV1::InvalidConfiguration("cycle request is not absolute"));
         }
-        let mut arguments = vec![
+        let arguments = vec![
+            "cycle".to_owned(),
             if recover { "recover-config" } else { "run-config" }.to_owned(),
             "--config".to_owned(), self.config.path.display().to_string(),
+            "--request".to_owned(), request.display().to_string(),
         ];
-        if !recover {
-            arguments.extend(["--request".to_owned(), request.display().to_string()]);
-        }
         run_json_program(&self.program.path, &arguments, &serde_json::json!({}))
     }
 }
