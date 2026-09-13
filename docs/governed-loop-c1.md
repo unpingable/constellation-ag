@@ -99,7 +99,7 @@ basis at every consequence boundary.
 
 Neither observation generation grants standing. Proposal/work, subject,
 scope, occurrence, current standing, current catalog, and one-use spend remain
-independent gates. A typed basis has no atoms, and AG does not import civild
+independent gates. A typed basis has no atoms, and AG does not import consumer
 claims, platform semantics, or policy evaluation.
 
 Campaign genesis atomically persists a canonical
@@ -224,6 +224,6 @@ integrity, or successful execution absent a receipt. NQ admission,
 observation currentness/support, catalog admissibility, standing, AG authorization,
 Docket custody, execution, and later observation remain distinct predicates.
 An opaque typed basis identity is not host truth, authorization, standing, a
-civild claim, or proof that its resolver is honest. Later civild observation is
+consumer claim, or proof that its resolver is honest. Later consumer observation is
 independent evidence and does not establish that an AG issuance or writer
 caused the observed state.
