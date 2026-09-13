@@ -63,6 +63,9 @@ pub const GOVERNED_SHARED_ADMISSION_SCHEMA_V1: &str =
 /// Exact Maude governed-plan binding schema.
 pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str =
     "maude.governed-plan-binding/v1";
+/// V2 top-level canonical Nightshift cycle port.
+pub const GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1: &str =
+    "ag.governed-loop.nightshift-cycle-port/v1";
 /// Schema for the deployment-owned Docket adapter root.
 pub const GOVERNED_DOCKET_ROOT_SCHEMA_V1: &str = "ag.governed-loop.docket-root/v1";
 /// Schema for the Docket portion of runtime-profile enrollment.
@@ -292,7 +295,12 @@ impl GovernedSharedAdmissionV1 {
         let _ = crate::shared_admission::canonical_file_identity(&config)?;
         let _ = self.review_verifier.verify(true)?;
         let requirement = self.review_requirement.verify(false)?;
-        crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
+        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
+        if requirement.compiler_contract != self.compiler_contract {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "review requirement compiler contract differs from shared admission",
+            ));
+        }
         Ok(())
     }
 }
@@ -303,17 +311,6 @@ impl GovernedSharedAdmissionV1 {
 pub struct GovernedRuntimeProfileV2 {
     /// Exact V2 schema.
     pub schema: String,
-    /// Unchanged V1 profile fields, flattened into the canonical object.
-    #[serde(flatten)]
-    pub base: GovernedRuntimeProfileV1Fields,
-    /// Required shared-admission boundary.
-    pub shared_admission: GovernedSharedAdmissionV1,
-}
-
-/// Fields common to V1 and V2 profiles; serialization remains flat.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GovernedRuntimeProfileV1Fields {
     pub profile_label: String,
     pub observation_resolver: PinnedDeploymentFileV1,
     pub observation_resolver_id: String,
@@ -326,6 +323,64 @@ pub struct GovernedRuntimeProfileV1Fields {
     pub human_verifier: Option<PinnedDeploymentFileV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_ingress: Option<GovernedInterventionIngressV1>,
+    pub nightshift_cycle: GovernedNightshiftCyclePortV1,
+    /// Required shared-admission boundary.
+    pub shared_admission: GovernedSharedAdmissionV1,
+}
+
+/// Fixed AG-to-Nightshift cycle invocation boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedNightshiftCyclePortV1 {
+    pub schema: String,
+    pub program: PinnedDeploymentFileV1,
+    pub config: PinnedDeploymentFileV1,
+}
+
+impl GovernedNightshiftCyclePortV1 {
+    pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1 {
+            return Err(GovernedPortErrorV1::InvalidConfiguration("invalid Nightshift cycle port"));
+        }
+        let _ = self.program.verify(true)?;
+        let config = self.config.verify(false)?;
+        let _ = crate::shared_admission::canonical_file_identity(&config)?;
+        Ok(())
+    }
+
+    /// Invokes the fixed finite cycle operation. The request is mechanism
+    /// data; neither it nor the caller selects a program, config, or store.
+    pub fn run_cycle(
+        &self,
+        request: &Path,
+        recover: bool,
+    ) -> Result<serde_json::Value, GovernedPortErrorV1> {
+        self.verify_all()?;
+        if !request.is_absolute() {
+            return Err(GovernedPortErrorV1::InvalidConfiguration("cycle request is not absolute"));
+        }
+        let config_bytes = self.config.verify(false)?;
+        let config = JcsDocument::from_canonical_bytes(config_bytes.strip_suffix(b"\n").unwrap_or(&config_bytes))
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        let config: serde_json::Value = config.decode()
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        let store = config.get("store").and_then(serde_json::Value::as_str)
+            .ok_or(GovernedPortErrorV1::InvalidConfiguration("cycle config lacks store"))?;
+        if !Path::new(store).is_absolute() {
+            return Err(GovernedPortErrorV1::InvalidConfiguration("cycle store is not absolute"));
+        }
+        run_json_program(
+            &self.program.path,
+            &[
+                "cycle".to_owned(),
+                if recover { "recover" } else { "run-config" }.to_owned(),
+                "--config".to_owned(), self.config.path.display().to_string(),
+                "--request".to_owned(), request.display().to_string(),
+                "--store".to_owned(), store.to_owned(),
+            ],
+            &serde_json::json!({}),
+        )
+    }
 }
 
 impl GovernedRuntimeProfileV2 {
@@ -336,24 +391,27 @@ impl GovernedRuntimeProfileV2 {
                 "invalid governed runtime profile v2",
             ));
         }
-        self.as_v1_for_common_validation().verify_genesis()?;
+        self.common_profile().verify_genesis()?;
+        self.nightshift_cycle.verify_all()?;
         self.shared_admission.verify_all()
     }
 
-    fn as_v1_for_common_validation(&self) -> GovernedRuntimeProfileV1 {
+    /// Returns the unchanged common coordinates consumed by existing ports.
+    #[must_use]
+    pub fn common_profile(&self) -> GovernedRuntimeProfileV1 {
         GovernedRuntimeProfileV1 {
             schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V1.to_owned(),
-            profile_label: self.base.profile_label.clone(),
-            observation_resolver: self.base.observation_resolver.clone(),
-            observation_resolver_id: self.base.observation_resolver_id.clone(),
-            standing_resolver: self.base.standing_resolver.clone(),
-            standing_resolver_id: self.base.standing_resolver_id.clone(),
-            max_standing_ttl_ms: self.base.max_standing_ttl_ms,
-            exact_work_catalog: self.base.exact_work_catalog.clone(),
-            controlling_review: self.base.controlling_review.clone(),
-            docket: self.base.docket.clone(),
-            human_verifier: self.base.human_verifier.clone(),
-            intervention_ingress: self.base.intervention_ingress.clone(),
+            profile_label: self.profile_label.clone(),
+            observation_resolver: self.observation_resolver.clone(),
+            observation_resolver_id: self.observation_resolver_id.clone(),
+            standing_resolver: self.standing_resolver.clone(),
+            standing_resolver_id: self.standing_resolver_id.clone(),
+            max_standing_ttl_ms: self.max_standing_ttl_ms,
+            exact_work_catalog: self.exact_work_catalog.clone(),
+            controlling_review: self.controlling_review.clone(),
+            docket: self.docket.clone(),
+            human_verifier: self.human_verifier.clone(),
+            intervention_ingress: self.intervention_ingress.clone(),
         }
     }
 }
@@ -514,15 +572,6 @@ pub struct GovernedSharedAdmissionEnrollmentV1 {
 #[serde(deny_unknown_fields)]
 pub struct GovernedRuntimeProfileEnrollmentV2 {
     pub schema: String,
-    #[serde(flatten)]
-    pub base: GovernedRuntimeProfileEnrollmentV1Fields,
-    pub shared_admission: GovernedSharedAdmissionEnrollmentV1,
-}
-
-/// Common enrollment fields serialized flat in V2.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GovernedRuntimeProfileEnrollmentV1Fields {
     pub profile_label: String,
     pub observation_resolver: PathBuf,
     pub observation_resolver_id: String,
@@ -535,6 +584,16 @@ pub struct GovernedRuntimeProfileEnrollmentV1Fields {
     pub human_verifier: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_ingress: Option<GovernedInterventionIngressEnrollmentV1>,
+    pub nightshift_cycle: GovernedNightshiftCyclePortEnrollmentV1,
+    pub shared_admission: GovernedSharedAdmissionEnrollmentV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedNightshiftCyclePortEnrollmentV1 {
+    pub schema: String,
+    pub program: PathBuf,
+    pub config: PathBuf,
 }
 
 impl GovernedRuntimeProfileEnrollmentV2 {
@@ -544,6 +603,7 @@ impl GovernedRuntimeProfileEnrollmentV2 {
             || self.shared_admission.schema != GOVERNED_SHARED_ADMISSION_SCHEMA_V1
             || self.shared_admission.plan_binding_schema
                 != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
+            || self.nightshift_cycle.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1
         {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "invalid governed runtime profile enrollment v2",
@@ -570,36 +630,40 @@ impl GovernedRuntimeProfileEnrollmentV2 {
                 false,
             )?,
         };
+        let nightshift_cycle = GovernedNightshiftCyclePortV1 {
+            schema: self.nightshift_cycle.schema,
+            program: PinnedDeploymentFileV1::measure(self.nightshift_cycle.program, true)?,
+            config: PinnedDeploymentFileV1::measure(self.nightshift_cycle.config, false)?,
+        };
         let legacy = GovernedRuntimeProfileEnrollmentV1 {
             schema: GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V1.to_owned(),
-            profile_label: self.base.profile_label,
-            observation_resolver: self.base.observation_resolver,
-            observation_resolver_id: self.base.observation_resolver_id,
-            standing_resolver: self.base.standing_resolver,
-            standing_resolver_id: self.base.standing_resolver_id,
-            max_standing_ttl_ms: self.base.max_standing_ttl_ms,
-            exact_work_catalog: self.base.exact_work_catalog,
-            controlling_review: self.base.controlling_review,
-            docket: self.base.docket,
-            human_verifier: self.base.human_verifier,
-            intervention_ingress: self.base.intervention_ingress,
+            profile_label: self.profile_label,
+            observation_resolver: self.observation_resolver,
+            observation_resolver_id: self.observation_resolver_id,
+            standing_resolver: self.standing_resolver,
+            standing_resolver_id: self.standing_resolver_id,
+            max_standing_ttl_ms: self.max_standing_ttl_ms,
+            exact_work_catalog: self.exact_work_catalog,
+            controlling_review: self.controlling_review,
+            docket: self.docket,
+            human_verifier: self.human_verifier,
+            intervention_ingress: self.intervention_ingress,
         }
         .seal()?;
         let profile = GovernedRuntimeProfileV2 {
             schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V2.to_owned(),
-            base: GovernedRuntimeProfileV1Fields {
-                profile_label: legacy.profile_label,
-                observation_resolver: legacy.observation_resolver,
-                observation_resolver_id: legacy.observation_resolver_id,
-                standing_resolver: legacy.standing_resolver,
-                standing_resolver_id: legacy.standing_resolver_id,
-                max_standing_ttl_ms: legacy.max_standing_ttl_ms,
-                exact_work_catalog: legacy.exact_work_catalog,
-                controlling_review: legacy.controlling_review,
-                docket: legacy.docket,
-                human_verifier: legacy.human_verifier,
-                intervention_ingress: legacy.intervention_ingress,
-            },
+            profile_label: legacy.profile_label,
+            observation_resolver: legacy.observation_resolver,
+            observation_resolver_id: legacy.observation_resolver_id,
+            standing_resolver: legacy.standing_resolver,
+            standing_resolver_id: legacy.standing_resolver_id,
+            max_standing_ttl_ms: legacy.max_standing_ttl_ms,
+            exact_work_catalog: legacy.exact_work_catalog,
+            controlling_review: legacy.controlling_review,
+            docket: legacy.docket,
+            human_verifier: legacy.human_verifier,
+            intervention_ingress: legacy.intervention_ingress,
+            nightshift_cycle,
             shared_admission: shared,
         };
         profile.verify_genesis()?;
@@ -1326,5 +1390,20 @@ mod tests {
             pinned.verify_presented(&pinned_path, true),
             Err(GovernedPortErrorV1::Deployment(_))
         ));
+    }
+
+    #[test]
+    fn profile_versions_do_not_silently_upgrade_or_accept_missing_shared_policy() {
+        let v1 = serde_json::json!({
+            "schema": GOVERNED_RUNTIME_PROFILE_SCHEMA_V1,
+            "profile_label": "fixture"
+        });
+        assert!(serde_json::from_value::<GovernedRuntimeProfileV2>(v1).is_err());
+        let v2 = serde_json::json!({
+            "schema": GOVERNED_RUNTIME_PROFILE_SCHEMA_V2,
+            "profile_label": "fixture"
+        });
+        assert!(serde_json::from_value::<GovernedRuntimeProfileV1>(v2.clone()).is_err());
+        assert!(serde_json::from_value::<GovernedRuntimeProfileV2>(v2).is_err());
     }
 }

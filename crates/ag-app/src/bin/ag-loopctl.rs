@@ -152,6 +152,20 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Evaluate protected permission without granting or spending authority.
+    PermissionPreflight {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Advance one existing campaign through a finite, sealed foreground run.
+    Run {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        run_input: PathBuf,
+    },
     /// Emit one machine-readable state/replay/profile projection for operators.
     Inspect {
         #[arg(long)]
@@ -167,6 +181,9 @@ enum Command {
         observation_resolver: PathBuf,
         #[arg(long)]
         expected_observation_resolver_id: String,
+        /// Required exact Maude binding for a protected V2 campaign.
+        #[arg(long)]
+        plan_binding: Option<PathBuf>,
     },
     /// Enter the explicit current-standing-required state.
     RequireStanding {
@@ -424,6 +441,42 @@ struct OperationalSnapshotV1 {
     runtime_profile: RuntimeProfileBindingV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionPreflightInputV1 {
+    schema: String,
+    binding_id: Digest,
+    evaluated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunInputV1 {
+    schema: String,
+    campaign: CampaignId,
+    runtime_profile_digest: Digest,
+    plan_binding: PathBuf,
+    review_input: PathBuf,
+    nightshift_cycle_request: PathBuf,
+    executor_config: PathBuf,
+    continuation_input: Option<PathBuf>,
+    max_steps: u64,
+    max_polls: u64,
+    deadline_unix_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunStatusV1 {
+    schema: &'static str,
+    run_id: Digest,
+    status: &'static str,
+    reason: &'static str,
+    program_counter: ProgramCounterV1,
+    steps: u64,
+    polls: u64,
+}
+
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     let now = now_unix_ms;
@@ -560,6 +613,15 @@ fn main() -> anyhow::Result<()> {
             let mut engine = CampaignEngineV1::open(&database)?;
             write_exact(&engine.record_review(&input, now()?)?)
         }
+        Command::PermissionPreflight { database, input } => {
+            let input: PermissionPreflightInputV1 = read_exact_record(&input)?;
+            if input.schema != "ag.governed-loop.permission-preflight-input/v1" {
+                bail!("unsupported permission-preflight input schema");
+            }
+            let engine = CampaignEngineV1::open(&database)?;
+            write_exact(&engine.permission_preflight(input.binding_id, input.evaluated_at_unix_ms)?)
+        }
+        Command::Run { database, run_input } => run_finite(&database, &run_input, now),
         Command::Replay { database } => {
             let (engine, _) = open_bound(&database)?;
             write_exact(&engine.replay()?)
@@ -597,6 +659,7 @@ fn main() -> anyhow::Result<()> {
             input,
             observation_resolver,
             expected_observation_resolver_id,
+            plan_binding,
         } => {
             let input: ProposalInputV1 = read_exact_record(&input)?;
             let (mut engine, profile) = open_bound(&database)?;
@@ -608,14 +671,23 @@ fn main() -> anyhow::Result<()> {
             }
             let mut observation =
                 CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
-            let state = engine.record_proposal(
-                input.observation,
-                input.proposal,
-                input.class,
-                &mut observation,
-                &profile.observation_resolver_id,
-                now()?,
-            )?;
+            let protected = engine.runtime_profile()?.is_some_and(|stored| stored.schema == GOVERNED_RUNTIME_PROFILE_SCHEMA_V2);
+            let state = if protected {
+                let binding = read_exact_input(
+                    plan_binding.as_deref().context("protected campaign requires --plan-binding")?,
+                    16 * 1024 * 1024,
+                )?;
+                engine.record_proposal_with_shared_admission(
+                    input.observation, input.proposal, input.class, &mut observation,
+                    &profile.observation_resolver_id, &binding, now()?,
+                )?
+            } else {
+                if plan_binding.is_some() { bail!("V1 campaign does not accept shared plan binding"); }
+                engine.record_proposal(
+                    input.observation, input.proposal, input.class, &mut observation,
+                    &profile.observation_resolver_id, now()?,
+                )?
+            };
             write_exact(&state)
         }
         Command::RequireStanding { database } => {
@@ -808,6 +880,190 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn run_finite(
+    database: &Path,
+    run_input_path: &Path,
+    clock: fn() -> anyhow::Result<u64>,
+) -> anyhow::Result<()> {
+    let input_bytes = read_exact_input(run_input_path, 1024 * 1024)?;
+    let input: RunInputV1 = strict_json_from_slice(&input_bytes)?;
+    let canonical = JcsDocument::canonicalize(&input)?;
+    if canonical.as_bytes() != input_bytes.as_slice()
+        || input.schema != "ag.governed-loop.run-input/v1"
+        || input.max_steps == 0
+        || input.max_polls == 0
+        || !input.plan_binding.is_absolute()
+        || !input.review_input.is_absolute()
+        || !input.nightshift_cycle_request.is_absolute()
+        || !input.executor_config.is_absolute()
+        || input.continuation_input.as_ref().is_some_and(|path| !path.is_absolute())
+    {
+        bail!("invalid finite run input");
+    }
+    let (mut engine, profile, profile_digest) = open_bound_with_digest(database)?;
+    if engine.current()?.key().campaign != input.campaign
+        || profile_digest != input.runtime_profile_digest
+        || engine.runtime_profile()?.is_none_or(|stored| stored.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2)
+    {
+        bail!("run input differs from protected campaign genesis");
+    }
+    let run_id = engine.begin_run(canonical.as_bytes(), clock()?)?;
+    let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
+    let controlling_review = profile.controlling_review.as_ref()
+        .map(|pinned| read_exact_record(&pinned.path)).transpose()?;
+    let mut observation = CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
+    let mut standing = CommandStandingResolverV1::new(profile.standing_resolver.path.clone());
+    let mut steps = 0_u64;
+    let mut polls = 0_u64;
+    loop {
+        let now_unix_ms = clock()?;
+        let current = engine.current()?;
+        let terminal = |status, reason, steps, polls| RunStatusV1 {
+            schema: "ag.governed-loop.run-status/v1", run_id: run_id.clone(), status, reason,
+            program_counter: current.program_counter(), steps, polls,
+        };
+        if now_unix_ms >= input.deadline_unix_ms {
+            let status = terminal("waiting", "deadline_exhausted", steps, polls);
+            engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+            return write_exact(&status);
+        }
+        if steps >= input.max_steps {
+            let status = terminal("waiting", "step_bound_exhausted", steps, polls);
+            engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+            return write_exact(&status);
+        }
+        match current.program_counter() {
+            ProgramCounterV1::ObservationRequired => {
+                let recover_cycle = engine.last_run_observation(&run_id)?
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|value| value.get("reason").and_then(serde_json::Value::as_str).map(str::to_owned))
+                    .as_deref() == Some("cycle_request_started");
+                if !recover_cycle {
+                    let started = terminal("active", "cycle_request_started", steps, polls);
+                    engine.record_run_observation(&run_id, &started, "active", now_unix_ms)?;
+                }
+                let stored: GovernedRuntimeProfileV2 = {
+                    let stored = engine.runtime_profile()?.context("protected profile missing")?;
+                    strict_json_from_slice(&stored.canonical_bytes)?
+                };
+                let response = stored.nightshift_cycle.run_cycle(
+                    &input.nightshift_cycle_request, recover_cycle,
+                );
+                match response {
+                    Ok(response) => {
+                        engine.record_run_observation(&run_id, &response, "active", now_unix_ms)?;
+                        if engine.current()?.program_counter() == ProgramCounterV1::ObservationRequired {
+                            let status = terminal("waiting", "independent_observation_unavailable", steps, polls);
+                            engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                            return write_exact(&status);
+                        }
+                    }
+                    Err(error) => {
+                        let status = terminal("waiting", "independent_observation_unavailable", steps, polls);
+                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        let _ = error;
+                        return write_exact(&status);
+                    }
+                }
+            }
+            ProgramCounterV1::ProposalRecorded => {
+                if input.review_input.try_exists()? {
+                    let review: RecordReviewInputV1 = read_exact_record(&input.review_input)?;
+                    let _ = engine.record_review(&review, now_unix_ms)?;
+                }
+                engine.require_standing(now_unix_ms)?;
+            }
+            ProgramCounterV1::StandingRequired => {
+                if input.review_input.try_exists()? {
+                    let review: RecordReviewInputV1 = read_exact_record(&input.review_input)?;
+                    let _ = engine.record_review(&review, now_unix_ms)?;
+                }
+                match engine.decide_versioned(
+                    &mut observation, &mut standing, &catalog, controlling_review.as_ref(),
+                    &profile.observation_resolver_id, &profile.standing_resolver_id,
+                    profile.max_standing_ttl_ms, now_unix_ms,
+                ) {
+                    Ok(_) => {}
+                    Err(CampaignEngineErrorV1::SharedAdmissionRequired) => {
+                        let status = terminal("waiting", "review_missing_or_stale", steps, polls);
+                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        return write_exact(&status);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            ProgramCounterV1::AdmissiblePendingAuthorization => {
+                engine.authorize_versioned(
+                    &mut observation, &mut standing, &catalog, controlling_review.as_ref(),
+                    &profile.observation_resolver_id, &profile.standing_resolver_id,
+                    profile.max_standing_ttl_ms, now_unix_ms,
+                )?;
+            }
+            ProgramCounterV1::AuthorizationConsumed => {
+                let mut docket = docket_custody_from_profile(&profile, &input.executor_config)?;
+                engine.dispatch(&mut docket, now_unix_ms)?;
+            }
+            ProgramCounterV1::Dispatched => {
+                if polls >= input.max_polls {
+                    let status = terminal("waiting", "poll_bound_exhausted", steps, polls);
+                    engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                    return write_exact(&status);
+                }
+                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?;
+                let _ = engine.recover(&mut docket, now_unix_ms)?;
+                polls = polls.saturating_add(1);
+            }
+            ProgramCounterV1::ReconciliationRequired => {
+                if polls >= input.max_polls {
+                    let status = terminal("waiting", "reconciliation_indeterminate", steps, polls);
+                    engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                    return write_exact(&status);
+                }
+                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?;
+                let _ = engine.recover(&mut docket, now_unix_ms)?;
+                polls = polls.saturating_add(1);
+            }
+            ProgramCounterV1::SettledObservationRequired => {
+                let Some(path) = input.continuation_input.as_ref() else {
+                    let status = terminal("waiting", "continuation_input_required", steps, polls);
+                    engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                    return write_exact(&status);
+                };
+                let continuation: ContinuationInputV1 = read_exact_record(path)?;
+                engine.open_continuation(continuation.occurrence, continuation.expected_ag_work, now_unix_ms)?;
+            }
+            ProgramCounterV1::Halted => {
+                let status = terminal("terminal", "halted", steps, polls);
+                engine.record_run_observation(&run_id, &status, "terminal", now_unix_ms)?;
+                return write_exact(&status);
+            }
+            ProgramCounterV1::Completed => {
+                let status = terminal("terminal", "completed", steps, polls);
+                engine.record_run_observation(&run_id, &status, "terminal", now_unix_ms)?;
+                return write_exact(&status);
+            }
+        }
+        steps = steps.saturating_add(1);
+    }
+}
+
+fn docket_custody_from_profile(
+    profile: &GovernedRuntimeProfileV1,
+    executor_config: &Path,
+) -> anyhow::Result<CommandDocketCustodyPortV1> {
+    let pinned = &profile.docket;
+    pinned.verify_all()?;
+    let signer = AgIssuanceSignerV1::from_pkcs8(
+        pinned.issuer_principal.clone(), pinned.issuer_key_id.clone(),
+        &pinned.issuer_key.verify(false)?,
+    )?;
+    Ok(CommandDocketCustodyPortV1::new(
+        pinned.docket_program.path.clone(), pinned.state_directory.clone(),
+        pinned.trust_config.path.clone(), pinned.standing_resolver.path.clone(),
+        pinned.executor_adapter.path.clone(), executor_config.to_owned(), signer,
+    ))
+}
+
 fn open_bound(database: &Path) -> anyhow::Result<(CampaignEngineV1, GovernedRuntimeProfileV1)> {
     let (engine, profile, _) = open_bound_with_digest(database)?;
     Ok((engine, profile))
@@ -820,14 +1076,21 @@ fn open_bound_with_digest(
     let stored = engine
         .runtime_profile()?
         .context("campaign was not created through the genesis-bound production surface")?;
-    if stored.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V1 {
-        bail!("campaign runtime profile schema is not supported");
-    }
-    let profile: GovernedRuntimeProfileV1 = strict_json_from_slice(&stored.canonical_bytes)
-        .context("decode genesis-bound runtime profile")?;
-    if profile.schema != stored.schema {
-        bail!("campaign runtime profile schema binding is inconsistent");
-    }
+    let profile = match stored.schema.as_str() {
+        GOVERNED_RUNTIME_PROFILE_SCHEMA_V1 => {
+            let profile: GovernedRuntimeProfileV1 = strict_json_from_slice(&stored.canonical_bytes)
+                .context("decode genesis-bound runtime profile v1")?;
+            profile.verify_genesis()?;
+            profile
+        }
+        GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 => {
+            let profile: GovernedRuntimeProfileV2 = strict_json_from_slice(&stored.canonical_bytes)
+                .context("decode genesis-bound runtime profile v2")?;
+            profile.verify_genesis()?;
+            profile.common_profile()
+        }
+        _ => bail!("campaign runtime profile schema is not supported"),
+    };
     Ok((engine, profile, stored.digest))
 }
 
@@ -1129,17 +1392,15 @@ fn runtime_profile_receipt_v2(
         schema: RUNTIME_PROFILE_SEAL_RECEIPT_SCHEMA_V1,
         profile_schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V2,
         profile_digest: Digest::hash_domain(GOVERNED_RUNTIME_PROFILE_SCHEMA_V2, canonical_bytes),
-        observation_resolver_id: profile.base.observation_resolver_id.clone(),
-        standing_resolver_id: profile.base.standing_resolver_id.clone(),
-        issuer_principal: profile.base.docket.issuer_principal.clone(),
-        issuer_key_id: profile.base.docket.issuer_key_id.clone(),
+        observation_resolver_id: profile.observation_resolver_id.clone(),
+        standing_resolver_id: profile.standing_resolver_id.clone(),
+        issuer_principal: profile.docket.issuer_principal.clone(),
+        issuer_key_id: profile.docket.issuer_key_id.clone(),
         intervention_submitter_principal: profile
-            .base
             .intervention_ingress
             .as_ref()
             .map(|ingress| ingress.submitter_principal.clone()),
         intervention_submitter_key_id: profile
-            .base
             .intervention_ingress
             .as_ref()
             .map(|ingress| ingress.submitter_key_id.clone()),

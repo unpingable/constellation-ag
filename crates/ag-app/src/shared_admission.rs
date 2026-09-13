@@ -145,7 +145,8 @@ impl RecordReviewInputV1 {
         let custody = STANDARD
             .decode(&self.artifacts.custody_receipt_bytes_base64)
             .map_err(|_| GovernedPortErrorV1::Canonical("invalid custody base64".to_owned()))?;
-        if STANDARD.encode(&result) != self.artifacts.result_bytes_base64
+        if result.len() > 16 * 1024 * 1024 || custody.len() > 16 * 1024 * 1024
+            || STANDARD.encode(&result) != self.artifacts.result_bytes_base64
             || STANDARD.encode(&custody) != self.artifacts.custody_receipt_bytes_base64
             || Digest::hash_bytes(&result) != self.review.result_digest
             || Digest::hash_bytes(&custody) != self.review.custody_receipt_digest
@@ -261,6 +262,23 @@ pub enum PermissionPreflightDecisionV1 {
     Indeterminate,
 }
 
+/// Closed tri-state aggregation. Determinate refusal dominates unavailable
+/// evidence; authority is allowed only when every required check is positive.
+#[must_use]
+pub const fn permission_decision(
+    all_positive: bool,
+    determinate_refusal: bool,
+    unavailable: bool,
+) -> PermissionPreflightDecisionV1 {
+    if determinate_refusal {
+        PermissionPreflightDecisionV1::Denied
+    } else if all_positive && !unavailable {
+        PermissionPreflightDecisionV1::Allowed
+    } else {
+        PermissionPreflightDecisionV1::Indeterminate
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionPreflightV1 {
@@ -341,5 +359,13 @@ mod tests {
             },
         };
         assert!(input.validate_artifacts().is_err());
+    }
+
+    #[test]
+    fn permission_preflight_has_all_three_outcomes_and_denial_dominates_unknown() {
+        assert_eq!(permission_decision(true, false, false), PermissionPreflightDecisionV1::Allowed);
+        assert_eq!(permission_decision(false, true, false), PermissionPreflightDecisionV1::Denied);
+        assert_eq!(permission_decision(false, false, true), PermissionPreflightDecisionV1::Indeterminate);
+        assert_eq!(permission_decision(false, true, true), PermissionPreflightDecisionV1::Denied);
     }
 }

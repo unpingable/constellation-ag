@@ -476,19 +476,95 @@ pub struct CampaignEngineV1 {
     store: CampaignStoreV1,
 }
 
+struct FreshSharedGateV1 {
+    binding_id: Digest,
+    review_id: Digest,
+    plan_validation_jcs: Vec<u8>,
+    review_verification_jcs: Vec<u8>,
+    expires_at_unix_ms: u64,
+}
+
 impl CampaignEngineV1 {
-    fn refuse_protected_legacy_entrypoint(&self) -> Result<(), CampaignEngineErrorV1> {
-        if self
+    fn is_protected(&self) -> Result<bool, CampaignEngineErrorV1> {
+        Ok(self
             .store
             .runtime_profile()?
             .is_some_and(|profile| {
                 profile.schema
                     == crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2
-            })
-        {
+            }))
+    }
+
+    fn fresh_shared_gate(
+        &self,
+        current: &OccurrenceSnapshotV1,
+        now_unix_ms: u64,
+    ) -> Result<FreshSharedGateV1, CampaignEngineErrorV1> {
+        let stored_profile = self.store.runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if stored_profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        Ok(())
+        let profile: crate::governed_ports::GovernedRuntimeProfileV2 =
+            JcsDocument::from_canonical_bytes(&stored_profile.canonical_bytes)
+                .and_then(|document| document.decode())
+                .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        profile.verify_genesis()?;
+        let evidence = self.store.shared_admission(current.key())?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(
+            &profile.shared_admission.review_requirement.verify(false)?,
+        )?;
+        if evidence.requirement_digest != requirement.identity()? {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let validation = crate::shared_admission::validate_plan_binding(
+            &profile.shared_admission, &evidence.binding_jcs,
+        )?;
+        if validation.binding_id != evidence.binding_id {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        for stored in evidence.reviews.iter().rev() {
+            let review: crate::shared_admission::PlanReviewV1 =
+                JcsDocument::from_canonical_bytes(&stored.review_jcs)
+                    .and_then(|document| document.decode())
+                    .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+            if review.verdict != crate::shared_admission::ReviewVerdictV1::Accepted
+                || review.reviewed_at_unix_ms > now_unix_ms
+                || now_unix_ms >= review.expires_at_unix_ms
+                || now_unix_ms - review.reviewed_at_unix_ms > requirement.max_age_ms
+            {
+                continue;
+            }
+            let artifacts: crate::shared_admission::ReviewArtifactBundleV1 =
+                JcsDocument::from_canonical_bytes(&stored.artifacts_jcs)
+                    .and_then(|document| document.decode())
+                    .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+            let input = crate::shared_admission::RecordReviewInputV1 {
+                schema: crate::shared_admission::REVIEW_RECORD_INPUT_SCHEMA_V1.to_owned(),
+                campaign: current.key().campaign.clone(),
+                occurrence: current.key().occurrence.to_string(),
+                binding_id: evidence.binding_id.clone(),
+                requirement_digest: evidence.requirement_digest.clone(),
+                review,
+                artifacts,
+            };
+            let review_verification = crate::shared_admission::verify_review(
+                &profile.shared_admission, &requirement, &input,
+            )?;
+            return Ok(FreshSharedGateV1 {
+                binding_id: evidence.binding_id.clone(),
+                review_id: stored.review_id.clone(),
+                plan_validation_jcs: JcsDocument::canonicalize(&validation)
+                    .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?
+                    .as_bytes().to_vec(),
+                review_verification_jcs: JcsDocument::canonicalize(&review_verification)
+                    .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?
+                    .as_bytes().to_vec(),
+                expires_at_unix_ms: input.review.expires_at_unix_ms,
+            });
+        }
+        Err(CampaignEngineErrorV1::SharedAdmissionRequired)
     }
     /// Creates one campaign with one authority-empty occurrence bound to one
     /// exact expected executable-work identity.
@@ -593,7 +669,9 @@ impl CampaignEngineV1 {
         expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        self.refuse_protected_legacy_entrypoint()?;
+        if self.is_protected()? {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
         let current = self.store.current()?;
         let successor = match GovernedLoopKernelV1::record_proposal(
             &current,
@@ -631,6 +709,10 @@ impl CampaignEngineV1 {
         binding_jcs: &[u8],
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        if binding_jcs.len() > 16 * 1024 * 1024 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let binding_jcs = binding_jcs.strip_suffix(b"\n").unwrap_or(binding_jcs);
         let stored = self
             .store
             .runtime_profile()?
@@ -662,6 +744,21 @@ impl CampaignEngineV1 {
                 .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?,
         )
         .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let current = self.store.current()?;
+        let binding_text = |field: &str| binding.get(field).and_then(serde_json::Value::as_str);
+        if binding_text("schema")
+                != Some(crate::governed_ports::MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1)
+            || binding_text("campaign") != Some(current.key().campaign.as_str())
+            || binding_text("occurrence") != Some(current.key().occurrence.to_string().as_str())
+            || binding_text("subject") != Some(proposal.subject().as_str())
+            || binding_text("scope") != Some(proposal.scope().as_str())
+            || binding_text("work_schema") != Some(proposal.work_schema())
+            || binding_text("work") != Some(proposal.work().as_str())
+            || binding_text("compiler_contract")
+                != Some(profile.shared_admission.compiler_contract.as_str())
+        {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
         let response = crate::shared_admission::validate_plan_binding(
             &profile.shared_admission,
             binding_jcs,
@@ -673,7 +770,6 @@ impl CampaignEngineV1 {
         {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        let current = self.store.current()?;
         let successor = GovernedLoopKernelV1::record_proposal(
             &current,
             observation,
@@ -726,15 +822,27 @@ impl CampaignEngineV1 {
         {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
+        let review_jcs = JcsDocument::canonicalize(&input.review)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let artifacts_jcs = JcsDocument::canonicalize(&input.artifacts)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let admitted = self.store.shared_admission(current.key())?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if let Some(existing) = admitted.reviews.iter()
+            .find(|review| review.dispatch_id == input.review.dispatch_id)
+        {
+            if existing.review_jcs == review_jcs.as_bytes()
+                && existing.artifacts_jcs == artifacts_jcs.as_bytes()
+            {
+                return Ok(existing.review_id.clone());
+            }
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
         let verification = crate::shared_admission::verify_review(
             &profile.shared_admission,
             &requirement,
             input,
         )?;
-        let review_jcs = JcsDocument::canonicalize(&input.review)
-            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
-        let artifacts_jcs = JcsDocument::canonicalize(&input.artifacts)
-            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         let verification_jcs = JcsDocument::canonicalize(&verification)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         self.store
@@ -752,6 +860,119 @@ impl CampaignEngineV1 {
                 now_unix_ms,
             )
             .map_err(Into::into)
+    }
+
+    /// Evaluates the protected permission boundary without spending standing,
+    /// claiming an attempt, advancing state, or invoking executor mechanics.
+    pub fn permission_preflight(
+        &self,
+        expected_binding: Digest,
+        now_unix_ms: u64,
+    ) -> Result<crate::shared_admission::PermissionPreflightV1, CampaignEngineErrorV1> {
+        use crate::shared_admission::{PermissionPreflightDecisionV1 as Decision, PermissionPreflightV1};
+        let current = self.store.current()?;
+        let profile = self.store.runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let evidence = self.store.shared_admission(current.key())?;
+        let mut result = PermissionPreflightV1 {
+            schema: crate::shared_admission::PERMISSION_PREFLIGHT_SCHEMA_V1.to_owned(),
+            key: current.key().clone(), profile_digest: profile.digest,
+            binding_id: expected_binding.clone(), review_id: None,
+            sampled_state_digest: current.state_digest().clone(),
+            evaluated_at_unix_ms: now_unix_ms, expires_at_unix_ms: now_unix_ms,
+            decision: Decision::Indeterminate, evidence: Vec::new(),
+            reasons: vec!["plan_evidence_missing".to_owned()], grants_authority: false,
+        };
+        let Some(admission) = evidence else { return Ok(result) };
+        if admission.binding_id != expected_binding {
+            result.decision = Decision::Denied;
+            result.reasons = vec!["binding_mismatch".to_owned()];
+            return Ok(result);
+        }
+        result.evidence.push(admission.binding_id.clone());
+        let mut has_rejection = false;
+        let mut has_review = false;
+        for stored in &admission.reviews {
+            let review: crate::shared_admission::PlanReviewV1 =
+                JcsDocument::from_canonical_bytes(&stored.review_jcs)
+                    .and_then(|document| document.decode())
+                    .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+            has_review = true;
+            if review.verdict == crate::shared_admission::ReviewVerdictV1::Rejected {
+                has_rejection = true;
+                result.evidence.push(stored.review_id.clone());
+            }
+        }
+        match self.fresh_shared_gate(&current, now_unix_ms) {
+            Ok(gate) => {
+                result.decision = Decision::Allowed;
+                result.review_id = Some(gate.review_id.clone());
+                result.evidence.push(gate.review_id);
+                result.expires_at_unix_ms = gate.expires_at_unix_ms;
+                result.reasons = vec!["all_owner_checks_current".to_owned()];
+            }
+            Err(CampaignEngineErrorV1::SharedPort(crate::governed_ports::GovernedPortErrorV1::Refused(reason))) => {
+                result.decision = Decision::Denied;
+                result.reasons = vec![format!("owner_refused:{reason}")];
+            }
+            Err(CampaignEngineErrorV1::SharedAdmissionRequired) if has_rejection => {
+                result.decision = Decision::Denied;
+                result.reasons = vec!["review_rejected".to_owned()];
+            }
+            Err(CampaignEngineErrorV1::SharedAdmissionRequired) if !has_review => {
+                result.reasons = vec!["review_pending".to_owned()];
+            }
+            Err(CampaignEngineErrorV1::SharedAdmissionRequired) => {
+                result.reasons = vec!["review_stale_or_unusable".to_owned()];
+            }
+            Err(_) if has_rejection => {
+                result.decision = Decision::Denied;
+                result.reasons = vec!["review_rejected".to_owned()];
+            }
+            Err(_) => result.reasons = vec!["owner_check_unavailable".to_owned()],
+        }
+        Ok(result)
+    }
+
+    /// Claims or resumes the sole finite run identity for this campaign.
+    pub fn begin_run(
+        &mut self,
+        input_jcs: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<Digest, CampaignEngineErrorV1> {
+        let profile = self.store.runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        self.store.begin_shared_run(&profile.digest, input_jcs, now_unix_ms).map_err(Into::into)
+    }
+
+    /// Retains a run observation without changing campaign state.
+    pub fn record_run_observation<T: Serialize>(
+        &mut self,
+        run_id: &Digest,
+        observation: &T,
+        status: &str,
+        now_unix_ms: u64,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let jcs = JcsDocument::canonicalize(observation)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        self.store.record_shared_run_observation(
+            run_id, current.state_digest(), jcs.as_bytes(), status, now_unix_ms,
+        ).map_err(Into::into)
+    }
+
+    /// Returns the exact last run observation, if any.
+    pub fn last_run_observation(
+        &self,
+        run_id: &Digest,
+    ) -> Result<Option<Vec<u8>>, CampaignEngineErrorV1> {
+        self.store.last_shared_run_observation(run_id).map_err(Into::into)
     }
 
     /// Enters the explicit standing-required state.
@@ -787,7 +1008,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        self.refuse_protected_legacy_entrypoint()?;
+        let protected = self.is_protected()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::record_admissible(
@@ -801,12 +1022,14 @@ impl CampaignEngineV1 {
             max_standing_ttl_ms,
             now_unix_ms,
         )?;
-        self.store.commit(
-            &current,
-            &successor,
-            CampaignTransitionKindV1::Admissible,
-            now_unix_ms,
-        )?;
+        if protected {
+            let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
+            self.store.commit_shared_consequence(&current, &successor,
+                CampaignTransitionKindV1::Admissible, &gate.binding_id, &gate.review_id,
+                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+        } else {
+            self.store.commit(&current, &successor, CampaignTransitionKindV1::Admissible, now_unix_ms)?;
+        }
         Ok(successor)
     }
 
@@ -828,7 +1051,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        self.refuse_protected_legacy_entrypoint()?;
+        let protected = self.is_protected()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
         let successor = GovernedLoopKernelV1::record_admissible(
@@ -842,12 +1065,14 @@ impl CampaignEngineV1 {
             max_standing_ttl_ms,
             now_unix_ms,
         )?;
-        self.store.commit(
-            &current,
-            &successor,
-            CampaignTransitionKindV1::Admissible,
-            now_unix_ms,
-        )?;
+        if protected {
+            let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
+            self.store.commit_shared_consequence(&current, &successor,
+                CampaignTransitionKindV1::Admissible, &gate.binding_id, &gate.review_id,
+                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+        } else {
+            self.store.commit(&current, &successor, CampaignTransitionKindV1::Admissible, now_unix_ms)?;
+        }
         Ok(successor)
     }
 
@@ -910,7 +1135,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        self.refuse_protected_legacy_entrypoint()?;
+        let protected = self.is_protected()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::consume_authorization(
@@ -924,12 +1149,14 @@ impl CampaignEngineV1 {
             max_standing_ttl_ms,
             now_unix_ms,
         )?;
-        self.store.commit(
-            &current,
-            &successor,
-            CampaignTransitionKindV1::AuthorizationConsumed,
-            now_unix_ms,
-        )?;
+        if protected {
+            let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
+            self.store.commit_shared_consequence(&current, &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed, &gate.binding_id, &gate.review_id,
+                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+        } else {
+            self.store.commit(&current, &successor, CampaignTransitionKindV1::AuthorizationConsumed, now_unix_ms)?;
+        }
         Ok(successor)
     }
 
@@ -950,7 +1177,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        self.refuse_protected_legacy_entrypoint()?;
+        let protected = self.is_protected()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
         let successor = GovernedLoopKernelV1::consume_authorization(
@@ -964,12 +1191,14 @@ impl CampaignEngineV1 {
             max_standing_ttl_ms,
             now_unix_ms,
         )?;
-        self.store.commit(
-            &current,
-            &successor,
-            CampaignTransitionKindV1::AuthorizationConsumed,
-            now_unix_ms,
-        )?;
+        if protected {
+            let gate = self.fresh_shared_gate(&current, now_unix_ms)?;
+            self.store.commit_shared_consequence(&current, &successor,
+                CampaignTransitionKindV1::AuthorizationConsumed, &gate.binding_id, &gate.review_id,
+                &gate.plan_validation_jcs, &gate.review_verification_jcs, now_unix_ms)?;
+        } else {
+            self.store.commit(&current, &successor, CampaignTransitionKindV1::AuthorizationConsumed, now_unix_ms)?;
+        }
         Ok(successor)
     }
 

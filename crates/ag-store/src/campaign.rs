@@ -218,9 +218,42 @@ CREATE TABLE shared_review_events (
     review_jcs BLOB NOT NULL,
     artifacts_jcs BLOB NOT NULL,
     verification_jcs BLOB NOT NULL,
+    event_digest TEXT NOT NULL UNIQUE,
     recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
     FOREIGN KEY (campaign_id, occurrence_id)
         REFERENCES shared_plan_admissions(campaign_id, occurrence_id)
+) STRICT;
+
+CREATE TABLE shared_consequence_gates (
+    transition_state_digest TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    review_id TEXT NOT NULL,
+    plan_validation_jcs BLOB NOT NULL,
+    review_verification_jcs BLOB NOT NULL,
+    checked_at_unix_ms INTEGER NOT NULL CHECK (checked_at_unix_ms >= 0),
+    FOREIGN KEY (review_id) REFERENCES shared_review_events(review_id)
+) STRICT;
+
+CREATE TABLE shared_runs (
+    run_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    profile_digest TEXT NOT NULL,
+    input_jcs BLOB NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'terminal')),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
+) STRICT;
+CREATE UNIQUE INDEX one_live_shared_run_per_campaign
+    ON shared_runs(campaign_id) WHERE status != 'terminal';
+
+CREATE TABLE shared_run_observations (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    state_digest TEXT NOT NULL,
+    observation_jcs BLOB NOT NULL,
+    recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+    FOREIGN KEY (run_id) REFERENCES shared_runs(run_id)
 ) STRICT;
 ";
 
@@ -461,6 +494,31 @@ pub struct StoredRuntimeProfileV1 {
     pub canonical_bytes: Vec<u8>,
 }
 
+/// Exact authoritative shared evidence for one admitted occurrence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSharedAdmissionV1 {
+    pub campaign: CampaignId,
+    pub occurrence: String,
+    pub predecessor_state_digest: Digest,
+    pub binding_id: Digest,
+    pub requirement_digest: Digest,
+    pub binding_jcs: Vec<u8>,
+    pub validation_jcs: Vec<u8>,
+    pub reviews: Vec<StoredSharedReviewV1>,
+}
+
+/// One append-only authenticated review event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSharedReviewV1 {
+    pub dispatch_id: Digest,
+    pub review_id: Digest,
+    pub verdict: String,
+    pub review_jcs: Vec<u8>,
+    pub artifacts_jcs: Vec<u8>,
+    pub verification_jcs: Vec<u8>,
+    pub recorded_at_unix_ms: u64,
+}
+
 /// Transactional campaign-store failures.
 #[derive(Debug, Error)]
 pub enum CampaignStoreErrorV1 {
@@ -505,6 +563,9 @@ pub enum CampaignStoreErrorV1 {
     /// A protected transition used an evidence-free store operation.
     #[error("protected shared-admission transition requires its fenced store operation")]
     SharedAdmissionRequired,
+    /// Another run identity owns the campaign's finite producer slot.
+    #[error("another shared run identity is active")]
+    SharedRunConflict,
 }
 
 /// One authoritative `SQLite` campaign store.
@@ -857,6 +918,10 @@ impl CampaignStoreV1 {
             ));
         }
         let review_id = Digest::hash_bytes(review_jcs);
+        let event_digest = shared_review_event_digest(
+            binding_id, dispatch_id, &review_id, verdict,
+            review_jcs, artifacts_jcs, verification_jcs,
+        );
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -899,8 +964,9 @@ impl CampaignStoreV1 {
         transaction.execute(
             "INSERT INTO shared_review_events
              (campaign_id, occurrence_id, binding_id, dispatch_id, review_id,
-              verdict, review_jcs, artifacts_jcs, verification_jcs, recorded_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              verdict, review_jcs, artifacts_jcs, verification_jcs, event_digest,
+              recorded_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 expected.key().campaign.as_str(),
                 expected.key().occurrence.to_string(),
@@ -911,11 +977,162 @@ impl CampaignStoreV1 {
                 review_jcs,
                 artifacts_jcs,
                 verification_jcs,
+                event_digest.as_str(),
                 to_i64(recorded_at_unix_ms)?,
             ],
         )?;
         transaction.commit()?;
         Ok(review_id)
+    }
+
+    /// Atomically commits a protected decision/spend and its freshly checked
+    /// owner evidence under the same predecessor and occurrence fence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_shared_consequence(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        kind: CampaignTransitionKindV1,
+        binding_id: &Digest,
+        review_id: &Digest,
+        plan_validation_jcs: &[u8],
+        review_verification_jcs: &[u8],
+        checked_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        if !matches!(kind, CampaignTransitionKindV1::Admissible | CampaignTransitionKindV1::AuthorizationConsumed) {
+            return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
+        }
+        for bytes in [plan_validation_jcs, review_verification_jcs] {
+            JcsDocument::from_canonical_bytes(bytes)
+                .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        }
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let accepted: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM shared_plan_admissions a JOIN shared_review_events r
+                 ON r.campaign_id=a.campaign_id AND r.occurrence_id=a.occurrence_id
+                AND r.binding_id=a.binding_id
+               WHERE a.campaign_id=?1 AND a.occurrence_id=?2 AND a.binding_id=?3
+                 AND r.review_id=?4 AND r.verdict='accepted')",
+            params![expected.key().campaign.as_str(), expected.key().occurrence.to_string(), binding_id.as_str(), review_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !accepted {
+            return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
+        }
+        let receipt = write_transition(
+            &transaction, expected, successor, kind,
+            &CampaignTransitionEvidenceV1::None, checked_at_unix_ms,
+        )?;
+        transaction.execute(
+            "INSERT INTO shared_consequence_gates
+             (transition_state_digest, campaign_id, occurrence_id, binding_id,
+              review_id, plan_validation_jcs, review_verification_jcs, checked_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![receipt.successor_state_digest.as_str(), expected.key().campaign.as_str(),
+                expected.key().occurrence.to_string(), binding_id.as_str(), review_id.as_str(),
+                plan_validation_jcs, review_verification_jcs, to_i64(checked_at_unix_ms)?],
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Begins or resumes one exact finite run identity without changing the PC.
+    pub fn begin_shared_run(
+        &mut self,
+        profile_digest: &Digest,
+        input_jcs: &[u8],
+        recorded_at_unix_ms: u64,
+    ) -> Result<Digest, CampaignStoreErrorV1> {
+        JcsDocument::from_canonical_bytes(input_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let run_id = Digest::hash_domain("ag.governed-loop.run-input/v1", input_jcs);
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let campaign = campaign_head(&transaction)?.campaign;
+        let same: Option<Vec<u8>> = transaction.query_row(
+            "SELECT input_jcs FROM shared_runs WHERE run_id=?1",
+            params![run_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if let Some(same) = same {
+            if same == input_jcs { return Ok(run_id); }
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        let existing: Option<(String, Vec<u8>)> = transaction.query_row(
+            "SELECT run_id, input_jcs FROM shared_runs
+             WHERE campaign_id=?1 AND status!='terminal'",
+            params![campaign], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((existing_id, existing_input)) = existing {
+            if existing_id == run_id.as_str() && existing_input == input_jcs {
+                transaction.execute("UPDATE shared_runs SET status='active' WHERE run_id=?1", params![existing_id])?;
+                transaction.commit()?;
+                return Ok(run_id);
+            }
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        transaction.execute(
+            "INSERT INTO shared_runs
+             (run_id, campaign_id, profile_digest, input_jcs, status, created_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            params![run_id.as_str(), campaign, profile_digest.as_str(), input_jcs, to_i64(recorded_at_unix_ms)?],
+        )?;
+        transaction.commit()?;
+        Ok(run_id)
+    }
+
+    /// Appends one machine-readable run observation and updates run status.
+    pub fn record_shared_run_observation(
+        &mut self,
+        run_id: &Digest,
+        state_digest: &Digest,
+        observation_jcs: &[u8],
+        status: &str,
+        recorded_at_unix_ms: u64,
+    ) -> Result<(), CampaignStoreErrorV1> {
+        if !matches!(status, "active" | "waiting" | "terminal") {
+            return Err(CampaignStoreErrorV1::Canonical("invalid shared run status".to_owned()));
+        }
+        JcsDocument::from_canonical_bytes(observation_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_status: Option<String> = transaction.query_row(
+            "SELECT status FROM shared_runs WHERE run_id=?1", params![run_id.as_str()], |row| row.get(0),
+        ).optional()?;
+        if existing_status.as_deref() == Some("terminal") {
+            let same: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM shared_run_observations
+                 WHERE sequence=(SELECT MAX(sequence) FROM shared_run_observations WHERE run_id=?1)
+                   AND state_digest=?2 AND observation_jcs=?3)",
+                params![run_id.as_str(), state_digest.as_str(), observation_jcs], |row| row.get(0),
+            )?;
+            if same && status == "terminal" { return Ok(()); }
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE shared_runs SET status=?1 WHERE run_id=?2 AND status!='terminal'",
+            params![status, run_id.as_str()],
+        )?;
+        if changed != 1 { return Err(CampaignStoreErrorV1::SharedRunConflict); }
+        transaction.execute(
+            "INSERT INTO shared_run_observations
+             (run_id, state_digest, observation_jcs, recorded_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![run_id.as_str(), state_digest.as_str(), observation_jcs, to_i64(recorded_at_unix_ms)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns the last exact observation for restart reconciliation.
+    pub fn last_shared_run_observation(
+        &self,
+        run_id: &Digest,
+    ) -> Result<Option<Vec<u8>>, CampaignStoreErrorV1> {
+        self.connection.query_row(
+            "SELECT observation_jcs FROM shared_run_observations
+             WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
+            params![run_id.as_str()], |row| row.get(0),
+        ).optional().map_err(Into::into)
     }
 
     /// Atomically consumes one exact human disposition and applies its closed effect.
@@ -1093,6 +1310,64 @@ impl CampaignStoreV1 {
             })
         })
         .transpose()
+    }
+
+    /// Returns replay-verified shared evidence for one occurrence.
+    pub fn shared_admission(
+        &self,
+        key: &OccurrenceKeyV1,
+    ) -> Result<Option<StoredSharedAdmissionV1>, CampaignStoreErrorV1> {
+        let _ = self.replay()?;
+        if !table_exists(&self.connection, "shared_plan_admissions")? {
+            return Ok(None);
+        }
+        let row: Option<(String, String, Vec<u8>, Vec<u8>)> = self.connection
+            .query_row(
+                "SELECT predecessor_state_digest, binding_id, binding_jcs, validation_jcs
+                 FROM shared_plan_admissions
+                 WHERE campaign_id=?1 AND occurrence_id=?2",
+                params![key.campaign.as_str(), key.occurrence.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((predecessor, binding, binding_jcs, validation_jcs)) = row else {
+            return Ok(None);
+        };
+        let requirement: String = self.connection.query_row(
+            "SELECT requirement_digest FROM shared_plan_admissions
+             WHERE campaign_id=?1 AND occurrence_id=?2",
+            params![key.campaign.as_str(), key.occurrence.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT dispatch_id, review_id, verdict, review_jcs, artifacts_jcs,
+                    verification_jcs, recorded_at_unix_ms
+             FROM shared_review_events
+             WHERE campaign_id=?1 AND occurrence_id=?2 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(
+            params![key.campaign.as_str(), key.occurrence.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, i64>(6)?)),
+        )?;
+        let mut reviews = Vec::new();
+        for row in rows {
+            let row = row?;
+            reviews.push(StoredSharedReviewV1 {
+                dispatch_id: parse_digest(&row.0)?,
+                review_id: parse_digest(&row.1)?,
+                verdict: row.2,
+                review_jcs: row.3,
+                artifacts_jcs: row.4,
+                verification_jcs: row.5,
+                recorded_at_unix_ms: to_u64(row.6)?,
+            });
+        }
+        Ok(Some(StoredSharedAdmissionV1 {
+            campaign: key.campaign.clone(), occurrence: key.occurrence.to_string(),
+            predecessor_state_digest: parse_digest(&predecessor)?,
+            binding_id: parse_digest(&binding)?, requirement_digest: parse_digest(&requirement)?,
+            binding_jcs, validation_jcs, reviews,
+        }))
     }
 
     /// Performs deterministic transition replay and exact journal accounting.
@@ -1275,6 +1550,31 @@ fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CampaignStoreErro
     JcsDocument::canonicalize(value)
         .map(|document| document.as_bytes().to_vec())
         .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
+}
+
+fn shared_review_event_digest(
+    binding: &Digest,
+    dispatch: &Digest,
+    review: &Digest,
+    verdict: &str,
+    review_jcs: &[u8],
+    artifacts_jcs: &[u8],
+    verification_jcs: &[u8],
+) -> Digest {
+    #[derive(Serialize)]
+    struct Input<'a> {
+        binding: &'a Digest,
+        dispatch: &'a Digest,
+        review: &'a Digest,
+        verdict: &'a str,
+        review_jcs: &'a [u8],
+        artifacts_jcs: &'a [u8],
+        verification_jcs: &'a [u8],
+    }
+    let bytes = JcsDocument::canonicalize(&Input {
+        binding, dispatch, review, verdict, review_jcs, artifacts_jcs, verification_jcs,
+    }).expect("shared review event is strict JCS-compatible");
+    Digest::hash_domain("ag.governed-loop.shared-review-event/v1", bytes.as_bytes())
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CampaignStoreErrorV1> {
@@ -2194,6 +2494,8 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     }
     verify_human_artifacts(connection, &human_artifacts)?;
     verify_refusals(connection, &campaign, &transitions)?;
+    verify_shared_admission(connection, &campaign, &transitions)?;
+    verify_shared_runs(connection, &campaign, &transitions, stored_profile_digest.as_ref())?;
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
         return Err(CampaignStoreErrorV1::Corrupt(format!(
@@ -2216,6 +2518,197 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
         })?,
         current_state_digest: current_digest,
     })
+}
+
+fn table_exists(connection: &Connection, name: &str) -> Result<bool, CampaignStoreErrorV1> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            params![name],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn verify_shared_admission(
+    connection: &Connection,
+    campaign: &CampaignId,
+    transitions: &[StoredTransitionRow],
+) -> Result<(), CampaignStoreErrorV1> {
+    let protected: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runtime_profile
+         WHERE schema='ag.governed-loop.runtime-profile/v2')", [], |row| row.get(0),
+    )?;
+    if !table_exists(connection, "shared_plan_admissions")? {
+        return if protected {
+            Err(CampaignStoreErrorV1::Corrupt("protected store lacks shared evidence tables".to_owned()))
+        } else { Ok(()) };
+    }
+    let mut proposals = BTreeMap::new();
+    for transition in transitions {
+        if transition.kind == CampaignTransitionKindV1::ProposalRecorded {
+            proposals.insert(
+                transition.successor_occurrence.clone(),
+                transition.predecessor.clone(),
+            );
+        }
+    }
+    let mut admissions = BTreeMap::new();
+    let mut statement = connection.prepare(
+        "SELECT occurrence_id, predecessor_state_digest, binding_id,
+                requirement_digest, binding_jcs, validation_jcs
+         FROM shared_plan_admissions WHERE campaign_id=?1",
+    )?;
+    let rows = statement.query_map(params![campaign.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?))
+    })?;
+    for row in rows {
+        let row = row?;
+        let predecessor = parse_digest(&row.1)?;
+        let binding = parse_digest(&row.2)?;
+        let _ = parse_digest(&row.3)?;
+        JcsDocument::from_canonical_bytes(&row.4)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        JcsDocument::from_canonical_bytes(&row.5)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        let binding_value: serde_json::Value = decode(&row.4)?;
+        let validation_value: serde_json::Value = decode(&row.5)?;
+        if binding_value.get("binding_id").and_then(serde_json::Value::as_str)
+                != Some(binding.as_str())
+            || validation_value.get("binding_id").and_then(serde_json::Value::as_str)
+                != Some(binding.as_str())
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared admission artifacts differ from binding identity".to_owned(),
+            ));
+        }
+        if proposals.get(&row.0) != Some(&predecessor) || admissions.insert(row.0, binding).is_some() {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared plan admission differs from proposal transition".to_owned(),
+            ));
+        }
+    }
+    if protected && admissions.keys().collect::<BTreeSet<_>>() != proposals.keys().collect() {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "protected proposal lacks shared plan admission".to_owned(),
+        ));
+    }
+    let mut dispatches = BTreeSet::new();
+    let mut review_ids = BTreeSet::new();
+    let mut statement = connection.prepare(
+        "SELECT occurrence_id, binding_id, dispatch_id, review_id, verdict,
+                review_jcs, artifacts_jcs, verification_jcs, event_digest
+         FROM shared_review_events WHERE campaign_id=?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(params![campaign.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, Vec<u8>>(7)?, row.get::<_, String>(8)?))
+    })?;
+    for row in rows {
+        let row = row?;
+        let binding = parse_digest(&row.1)?;
+        let dispatch = parse_digest(&row.2)?;
+        let review = parse_digest(&row.3)?;
+        let event = parse_digest(&row.8)?;
+        for bytes in [&row.5, &row.6, &row.7] {
+            JcsDocument::from_canonical_bytes(bytes)
+                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        }
+        if admissions.get(&row.0) != Some(&binding)
+            || !dispatches.insert(dispatch)
+            || !review_ids.insert(review.clone())
+            || review != Digest::hash_bytes(&row.5)
+            || event != shared_review_event_digest(&binding, &dispatch, &review, &row.4, &row.5, &row.6, &row.7)
+            || !matches!(row.4.as_str(), "accepted" | "rejected")
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared review event failed replay binding".to_owned(),
+            ));
+        }
+    }
+    let protected_consequences: BTreeSet<String> = transitions
+        .iter()
+        .filter(|row| matches!(row.kind, CampaignTransitionKindV1::Admissible | CampaignTransitionKindV1::AuthorizationConsumed))
+        .map(|row| row.successor.as_str().to_owned())
+        .collect();
+    let mut gates = BTreeSet::new();
+    let mut statement = connection.prepare(
+        "SELECT g.transition_state_digest, g.occurrence_id, g.binding_id,
+                g.review_id, g.plan_validation_jcs, g.review_verification_jcs,
+                r.verdict
+         FROM shared_consequence_gates g JOIN shared_review_events r
+           ON r.review_id=g.review_id AND r.campaign_id=g.campaign_id
+          AND r.occurrence_id=g.occurrence_id AND r.binding_id=g.binding_id
+         WHERE g.campaign_id=?1",
+    )?;
+    let rows = statement.query_map(params![campaign.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, Vec<u8>>(5)?, row.get::<_, String>(6)?))
+    })?;
+    for row in rows {
+        let row = row?;
+        let _ = parse_digest(&row.0)?;
+        let binding = parse_digest(&row.2)?;
+        let _ = parse_digest(&row.3)?;
+        for bytes in [&row.4, &row.5] {
+            JcsDocument::from_canonical_bytes(bytes)
+                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        }
+        if row.6 != "accepted" || admissions.get(&row.1) != Some(&binding) || !gates.insert(row.0) {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "shared consequence gate failed replay binding".to_owned(),
+            ));
+        }
+    }
+    if protected && gates != protected_consequences {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "protected consequence lacks atomic gate evidence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_shared_runs(
+    connection: &Connection,
+    campaign: &CampaignId,
+    transitions: &[StoredTransitionRow],
+    profile_digest: Option<&Digest>,
+) -> Result<(), CampaignStoreErrorV1> {
+    if !table_exists(connection, "shared_runs")? { return Ok(()); }
+    let states: BTreeSet<&str> = transitions.iter().map(|row| row.successor.as_str()).collect();
+    let mut runs = BTreeSet::new();
+    let mut live = 0_u64;
+    let mut statement = connection.prepare(
+        "SELECT run_id, profile_digest, input_jcs, status FROM shared_runs WHERE campaign_id=?1",
+    )?;
+    let rows = statement.query_map(params![campaign.as_str()], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?))
+    })?;
+    for row in rows {
+        let row = row?;
+        let run = parse_digest(&row.0)?;
+        let profile = parse_digest(&row.1)?;
+        JcsDocument::from_canonical_bytes(&row.2)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        if run != Digest::hash_domain("ag.governed-loop.run-input/v1", &row.2)
+            || Some(&profile) != profile_digest
+            || !runs.insert(row.0)
+            || !matches!(row.3.as_str(), "active" | "waiting" | "terminal")
+        { return Err(CampaignStoreErrorV1::Corrupt("shared run identity failed replay".to_owned())); }
+        if row.3 != "terminal" { live = live.saturating_add(1); }
+    }
+    if live > 1 { return Err(CampaignStoreErrorV1::Corrupt("multiple live shared runs".to_owned())); }
+    let mut statement = connection.prepare(
+        "SELECT run_id, state_digest, observation_jcs FROM shared_run_observations",
+    )?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
+    for row in rows {
+        let row = row?;
+        if !runs.contains(&row.0) || !states.contains(row.1.as_str()) {
+            return Err(CampaignStoreErrorV1::Corrupt("shared run observation binding mismatch".to_owned()));
+        }
+        JcsDocument::from_canonical_bytes(&row.2)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn validate_replayed_evidence(
