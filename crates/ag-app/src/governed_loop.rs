@@ -1077,6 +1077,42 @@ impl CampaignEngineV1 {
             .map_err(Into::into)
     }
 
+    /// Claims or resumes the sole finite V2 run identity for this campaign.
+    pub fn begin_run_v2(
+        &mut self,
+        input_jcs: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<Digest, CampaignEngineErrorV1> {
+        let profile = self
+            .store
+            .runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if profile.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        self.store
+            .begin_shared_run_v2(&profile.digest, input_jcs, now_unix_ms)
+            .map_err(Into::into)
+    }
+
+    /// Returns an exact retained continuation for this run and occurrence.
+    pub fn retained_run_continuation(
+        &self,
+        run_id: &Digest,
+        occurrence: &OccurrenceId,
+    ) -> Result<Option<(u8, Vec<u8>)>, CampaignEngineErrorV1> {
+        self.store
+            .shared_run_continuation(run_id, &occurrence.to_string())
+            .map_err(Into::into)
+    }
+
+    /// Returns how many bounded continuations this run has durably opened.
+    pub fn run_continuation_count(&self, run_id: &Digest) -> Result<u8, CampaignEngineErrorV1> {
+        self.store
+            .shared_run_continuation_count(run_id)
+            .map_err(Into::into)
+    }
+
     /// Retains a run observation without changing campaign state.
     pub fn record_run_observation<T: Serialize>(
         &mut self,
@@ -1508,6 +1544,32 @@ impl CampaignEngineV1 {
             &current,
             &successor,
             CampaignTransitionKindV1::ContinuationOpened,
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Opens a continuation and retains its exact V2 envelope in one commit.
+    pub fn open_run_continuation(
+        &mut self,
+        run_id: &Digest,
+        ordinal: u8,
+        locator: &Path,
+        envelope_jcs: &[u8],
+        occurrence: OccurrenceId,
+        expected_work: Digest,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let successor =
+            GovernedLoopKernelV1::open_continuation(&current, occurrence, expected_work)?;
+        self.store.commit_shared_run_continuation(
+            run_id,
+            ordinal,
+            locator,
+            envelope_jcs,
+            &current,
+            &successor,
             now_unix_ms,
         )?;
         Ok(successor)

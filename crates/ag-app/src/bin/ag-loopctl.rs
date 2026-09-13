@@ -37,8 +37,10 @@ use ag_primitives::{Digest, JcsDocument};
 use ag_protocol::strict_json_from_slice;
 use ag_store::campaign::{CampaignReplayReportV1, CampaignTransitionEvidenceV1};
 use anyhow::{Context as _, bail};
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -464,6 +466,62 @@ struct RunInputV1 {
     max_steps: u64,
     max_polls: u64,
     deadline_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunOccurrenceMaterialV1 {
+    occurrence: Option<OccurrenceId>,
+    plan_binding: PathBuf,
+    plan_binding_sha256: Option<String>,
+    review_input: PathBuf,
+    nightshift_cycle_request: PathBuf,
+    nightshift_cycle_request_sha256: Option<String>,
+    executor_config: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunInputV2 {
+    schema: String,
+    campaign: CampaignId,
+    runtime_profile_digest: Digest,
+    initial: RunOccurrenceMaterialV1,
+    continuations: Vec<PathBuf>,
+    max_steps: u64,
+    max_polls: u64,
+    deadline_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RunContinuationV1 {
+    schema: String,
+    campaign: CampaignId,
+    predecessor_occurrence: OccurrenceId,
+    predecessor_expected_ag_work: Digest,
+    occurrence: OccurrenceId,
+    expected_ag_work: Digest,
+    plan_binding: PathBuf,
+    plan_binding_sha256: String,
+    review_input: PathBuf,
+    nightshift_cycle_request: PathBuf,
+    nightshift_cycle_request_sha256: String,
+    executor_config: PathBuf,
+}
+
+impl RunContinuationV1 {
+    fn material(&self) -> RunOccurrenceMaterialV1 {
+        RunOccurrenceMaterialV1 {
+            occurrence: Some(self.occurrence),
+            plan_binding: self.plan_binding.clone(),
+            plan_binding_sha256: Some(self.plan_binding_sha256.clone()),
+            review_input: self.review_input.clone(),
+            nightshift_cycle_request: self.nightshift_cycle_request.clone(),
+            nightshift_cycle_request_sha256: Some(self.nightshift_cycle_request_sha256.clone()),
+            executor_config: self.executor_config.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -926,34 +984,93 @@ fn run_finite(
     clock: fn() -> anyhow::Result<u64>,
 ) -> anyhow::Result<()> {
     let input_bytes = read_exact_input(run_input_path, 1024 * 1024)?;
-    let input: RunInputV1 = strict_json_from_slice(&input_bytes)?;
-    let canonical = JcsDocument::canonicalize(&input)?;
-    if canonical.as_bytes() != input_bytes.as_slice()
-        || input.schema != "ag.governed-loop.run-input/v1"
-        || input.max_steps == 0
-        || input.max_polls == 0
-        || !input.plan_binding.is_absolute()
-        || !input.review_input.is_absolute()
-        || !input.nightshift_cycle_request.is_absolute()
-        || !input.executor_config.is_absolute()
-        || input
-            .continuation_input
+    let value: serde_json::Value = strict_json_from_slice(&input_bytes)?;
+    let schema = value.get("schema").and_then(|value| value.as_str());
+    let (
+        campaign,
+        profile_input_digest,
+        initial,
+        v1_continuation,
+        v2_continuations,
+        max_steps,
+        max_polls,
+        deadline_unix_ms,
+        is_v2,
+    ) = match schema {
+        Some("ag.governed-loop.run-input/v1") => {
+            let input: RunInputV1 = strict_json_from_slice(&input_bytes)?;
+            let material = RunOccurrenceMaterialV1 {
+                occurrence: None,
+                plan_binding: input.plan_binding,
+                plan_binding_sha256: None,
+                review_input: input.review_input,
+                nightshift_cycle_request: input.nightshift_cycle_request,
+                nightshift_cycle_request_sha256: None,
+                executor_config: input.executor_config,
+            };
+            (
+                input.campaign,
+                input.runtime_profile_digest,
+                material,
+                input.continuation_input,
+                Vec::new(),
+                input.max_steps,
+                input.max_polls,
+                input.deadline_unix_ms,
+                false,
+            )
+        }
+        Some("ag.governed-loop.run-input/v2") => {
+            let input: RunInputV2 = strict_json_from_slice(&input_bytes)?;
+            if input.continuations.len() > 8 {
+                bail!("too many continuation envelopes");
+            }
+            (
+                input.campaign,
+                input.runtime_profile_digest,
+                input.initial,
+                None,
+                input.continuations,
+                input.max_steps,
+                input.max_polls,
+                input.deadline_unix_ms,
+                true,
+            )
+        }
+        _ => bail!("unsupported finite run input schema"),
+    };
+    let canonical = JcsDocument::from_canonical_bytes(&input_bytes)?;
+    let absolute = [
+        &initial.plan_binding,
+        &initial.review_input,
+        &initial.nightshift_cycle_request,
+        &initial.executor_config,
+    ]
+    .into_iter()
+    .all(|path| path.is_absolute())
+        && v1_continuation
             .as_ref()
-            .is_some_and(|path| !path.is_absolute())
-    {
+            .is_none_or(|path| path.is_absolute())
+        && v2_continuations.iter().all(|path| path.is_absolute());
+    if max_steps == 0 || max_polls == 0 || !absolute {
         bail!("invalid finite run input");
     }
     let (mut engine, profile, profile_digest) = open_bound_with_digest(database)?;
-    engine.set_process_deadline(input.deadline_unix_ms);
-    if engine.current()?.key().campaign != input.campaign
-        || profile_digest != input.runtime_profile_digest
+    engine.set_process_deadline(deadline_unix_ms);
+    let first_current = engine.current()?;
+    if first_current.key().campaign != campaign
+        || profile_digest != profile_input_digest
         || engine
             .runtime_profile()?
             .is_none_or(|stored| stored.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2)
     {
         bail!("run input differs from protected campaign genesis");
     }
-    let run_id = engine.begin_run(canonical.as_bytes(), clock()?)?;
+    let run_id = if is_v2 {
+        engine.begin_run_v2(canonical.as_bytes(), clock()?)?
+    } else {
+        engine.begin_run(canonical.as_bytes(), clock()?)?
+    };
     let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
     let controlling_review = profile
         .controlling_review
@@ -962,14 +1079,26 @@ fn run_finite(
         .transpose()?;
     let mut observation =
         CommandObservationResolverV1::new(profile.observation_resolver.path.clone())
-            .with_deadline(input.deadline_unix_ms);
+            .with_deadline(deadline_unix_ms);
     let mut standing = CommandStandingResolverV1::new(profile.standing_resolver.path.clone())
-        .with_deadline(input.deadline_unix_ms);
+        .with_deadline(deadline_unix_ms);
     let mut steps = 0_u64;
     let mut polls = 0_u64;
     loop {
         let now_unix_ms = clock()?;
         let current = engine.current()?;
+        let material = if !is_v2 || Some(current.key().occurrence) == initial.occurrence {
+            initial.clone()
+        } else {
+            let (_, retained) = engine
+                .retained_run_continuation(&run_id, &current.key().occurrence)?
+                .context("current V2 occurrence lacks a retained continuation")?;
+            let continuation: RunContinuationV1 = strict_json_from_slice(&retained)?;
+            continuation.material()
+        };
+        if is_v2 {
+            verify_material_pins(&material)?;
+        }
         let terminal = |status, reason, steps, polls| RunStatusV1 {
             schema: "ag.governed-loop.run-status/v1",
             run_id: run_id.clone(),
@@ -979,19 +1108,20 @@ fn run_finite(
             steps,
             polls,
         };
-        if now_unix_ms >= input.deadline_unix_ms {
+        if now_unix_ms >= deadline_unix_ms {
             let status = terminal("waiting", "deadline_exhausted", steps, polls);
             engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
             return write_exact(&status);
         }
-        if steps >= input.max_steps {
+        if steps >= max_steps {
             let status = terminal("waiting", "step_bound_exhausted", steps, polls);
             engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
             return write_exact(&status);
         }
         match current.program_counter() {
             ProgramCounterV1::ObservationRequired => {
-                let cycle_request = read_exact_input(&input.nightshift_cycle_request, 1024 * 1024)?;
+                let cycle_request =
+                    read_exact_input(&material.nightshift_cycle_request, 16 * 1024 * 1024)?;
                 let cycle_request_digest = Digest::hash_domain(
                     "ag.governed-loop.nightshift-cycle-request/v1",
                     &cycle_request,
@@ -1008,9 +1138,9 @@ fn run_finite(
                     strict_json_from_slice(&stored.canonical_bytes)?
                 };
                 let response = stored.nightshift_cycle.run_cycle(
-                    &input.nightshift_cycle_request,
+                    &material.nightshift_cycle_request,
                     recover_cycle,
-                    input.deadline_unix_ms,
+                    deadline_unix_ms,
                 );
                 let Ok(response) = response else {
                     let status = terminal(
@@ -1036,15 +1166,15 @@ fn run_finite(
                 }
             }
             ProgramCounterV1::ProposalRecorded => {
-                if input.review_input.try_exists()? {
-                    let review: RecordReviewInputV1 = read_exact_record(&input.review_input)?;
+                if material.review_input.try_exists()? {
+                    let review: RecordReviewInputV1 = read_exact_record(&material.review_input)?;
                     let _ = engine.record_review(&review, now_unix_ms)?;
                 }
                 engine.require_standing(now_unix_ms)?;
             }
             ProgramCounterV1::StandingRequired => {
-                if input.review_input.try_exists()? {
-                    let review: RecordReviewInputV1 = read_exact_record(&input.review_input)?;
+                if material.review_input.try_exists()? {
+                    let review: RecordReviewInputV1 = read_exact_record(&material.review_input)?;
                     let _ = engine.record_review(&review, now_unix_ms)?;
                 }
                 match engine.decide_versioned(
@@ -1080,13 +1210,13 @@ fn run_finite(
             }
             ProgramCounterV1::AuthorizationConsumed => {
                 let mut reconciliation =
-                    docket_port_from_profile(&profile, &input.executor_config)?
-                        .with_deadline(input.deadline_unix_ms);
+                    docket_port_from_profile(&profile, &material.executor_config)?
+                        .with_deadline(deadline_unix_ms);
                 match engine.recover(&mut reconciliation, now_unix_ms) {
                     Ok(CampaignRecoveryV1::IssuanceNotAccepted(_)) => {
                         let mut docket =
-                            docket_custody_from_profile(&profile, &input.executor_config)?
-                                .with_deadline(input.deadline_unix_ms);
+                            docket_custody_from_profile(&profile, &material.executor_config)?
+                                .with_deadline(deadline_unix_ms);
                         if engine.dispatch(&mut docket, now_unix_ms).is_err() {
                             let status = terminal(
                                 "waiting",
@@ -1123,29 +1253,61 @@ fn run_finite(
                 }
             }
             ProgramCounterV1::Dispatched => {
-                if polls >= input.max_polls {
+                if polls >= max_polls {
                     let status = terminal("waiting", "poll_bound_exhausted", steps, polls);
                     engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                     return write_exact(&status);
                 }
-                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?
-                    .with_deadline(input.deadline_unix_ms);
+                let mut docket = docket_port_from_profile(&profile, &material.executor_config)?
+                    .with_deadline(deadline_unix_ms);
                 let _ = engine.recover(&mut docket, now_unix_ms)?;
                 polls = polls.saturating_add(1);
             }
             ProgramCounterV1::ReconciliationRequired => {
-                if polls >= input.max_polls {
+                if polls >= max_polls {
                     let status = terminal("waiting", "reconciliation_indeterminate", steps, polls);
                     engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                     return write_exact(&status);
                 }
-                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?
-                    .with_deadline(input.deadline_unix_ms);
+                let mut docket = docket_port_from_profile(&profile, &material.executor_config)?
+                    .with_deadline(deadline_unix_ms);
                 let _ = engine.recover(&mut docket, now_unix_ms)?;
                 polls = polls.saturating_add(1);
             }
             ProgramCounterV1::SettledObservationRequired => {
-                let Some(path) = input.continuation_input.as_ref() else {
+                if is_v2 {
+                    let ordinal = engine.run_continuation_count(&run_id)?;
+                    let Some(path) = v2_continuations.get(usize::from(ordinal)) else {
+                        let status = terminal(
+                            "terminal",
+                            "finite_continuation_bound_complete",
+                            steps,
+                            polls,
+                        );
+                        engine.record_run_observation(&run_id, &status, "terminal", now_unix_ms)?;
+                        return write_exact(&status);
+                    };
+                    if !path.try_exists()? {
+                        let status =
+                            terminal("waiting", "continuation_input_required", steps, polls);
+                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        return write_exact(&status);
+                    }
+                    let bytes = read_exact_input(path, 1024 * 1024)?;
+                    let continuation = validate_run_continuation(&bytes, &campaign, &current)?;
+                    engine.open_run_continuation(
+                        &run_id,
+                        ordinal,
+                        path,
+                        &bytes,
+                        continuation.occurrence,
+                        continuation.expected_ag_work,
+                        now_unix_ms,
+                    )?;
+                    steps = steps.saturating_add(1);
+                    continue;
+                }
+                let Some(path) = v1_continuation.as_ref() else {
                     let status = terminal("waiting", "continuation_input_required", steps, polls);
                     engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                     return write_exact(&status);
@@ -1170,6 +1332,110 @@ fn run_finite(
         }
         steps = steps.saturating_add(1);
     }
+}
+
+fn validate_run_continuation(
+    bytes: &[u8],
+    campaign: &CampaignId,
+    current: &OccurrenceSnapshotV1,
+) -> anyhow::Result<RunContinuationV1> {
+    JcsDocument::from_canonical_bytes(bytes)?;
+    let continuation: RunContinuationV1 = strict_json_from_slice(bytes)?;
+    let paths = [
+        &continuation.plan_binding,
+        &continuation.review_input,
+        &continuation.nightshift_cycle_request,
+        &continuation.executor_config,
+    ];
+    if continuation.schema != "ag.governed-loop.run-continuation/v1"
+        || &continuation.campaign != campaign
+        || continuation.predecessor_occurrence != current.key().occurrence
+        || &continuation.predecessor_expected_ag_work != current.state().meta().expected_work()
+        || continuation.occurrence == current.key().occurrence
+        || !paths.into_iter().all(|path| path.is_absolute())
+    {
+        bail!("continuation envelope does not bind the current occurrence");
+    }
+    let binding_bytes = read_exact_input(&continuation.plan_binding, 16 * 1024 * 1024)?;
+    JcsDocument::from_canonical_bytes(&binding_bytes)?;
+    let binding: serde_json::Value = strict_json_from_slice(&binding_bytes)?;
+    let successor_occurrence = continuation.occurrence.to_string();
+    if binding.get("schema").and_then(serde_json::Value::as_str)
+        != Some("maude.governed-plan-binding/v1")
+        || binding.get("campaign").and_then(serde_json::Value::as_str) != Some(campaign.as_str())
+        || binding
+            .get("occurrence")
+            .and_then(serde_json::Value::as_str)
+            != Some(successor_occurrence.as_str())
+        || binding.get("work").and_then(serde_json::Value::as_str)
+            != Some(continuation.expected_ag_work.as_str())
+    {
+        bail!("continuation plan binding differs from the successor boundary");
+    }
+    let request_bytes = read_exact_input(&continuation.nightshift_cycle_request, 16 * 1024 * 1024)?;
+    JcsDocument::from_canonical_bytes(&request_bytes)?;
+    let request: serde_json::Value = strict_json_from_slice(&request_bytes)?;
+    let proposal = request
+        .get("proposal")
+        .context("cycle request has no proposal")?;
+    if proposal
+        .get("campaign_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(campaign.as_str())
+        || proposal
+            .get("occurrence_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(successor_occurrence.as_str())
+    {
+        bail!("continuation cycle request differs from the successor boundary");
+    }
+    let transport = request
+        .get("reviewed_plan_binding")
+        .context("cycle request has no reviewed plan binding")?;
+    if transport.get("schema").and_then(serde_json::Value::as_str)
+        != Some("nightshift.reviewed-plan-binding-transport/v1")
+    {
+        bail!("cycle request has unsupported plan-binding transport");
+    }
+    let encoded = transport
+        .get("binding_base64")
+        .and_then(serde_json::Value::as_str)
+        .context("cycle request plan binding is absent")?;
+    let transported = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&transported));
+    if transported.is_empty()
+        || transported.len() > 16 * 1024 * 1024
+        || base64::engine::general_purpose::STANDARD.encode(&transported) != encoded
+        || transported != binding_bytes
+        || transport
+            .get("binding_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(digest.as_str())
+    {
+        bail!("cycle request substitutes the continuation plan binding");
+    }
+    Ok(continuation)
+}
+
+fn verify_material_pins(material: &RunOccurrenceMaterialV1) -> anyhow::Result<()> {
+    for (path, expected) in [
+        (
+            &material.plan_binding,
+            material.plan_binding_sha256.as_deref(),
+        ),
+        (
+            &material.nightshift_cycle_request,
+            material.nightshift_cycle_request_sha256.as_deref(),
+        ),
+    ] {
+        let expected = expected.context("V2 run material lacks a required content pin")?;
+        let bytes = read_exact_input(path, 16 * 1024 * 1024)?;
+        let actual = format!("sha256:{:x}", Sha256::digest(&bytes));
+        if actual != expected {
+            bail!("V2 run material content differs from its retained pin");
+        }
+    }
+    Ok(())
 }
 
 fn docket_custody_from_profile(
@@ -1611,4 +1877,52 @@ fn now_unix_ms() -> anyhow::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?;
     u64::try_from(duration.as_millis()).context("system clock exceeds u64 milliseconds")
+}
+
+#[cfg(test)]
+mod finite_continuation_tests {
+    use super::*;
+
+    #[test]
+    fn v2_material_pins_refuse_content_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = directory.path().join("binding.json");
+        let request = directory.path().join("request.json");
+        fs::write(&binding, b"binding-one").unwrap();
+        fs::write(&request, b"request-one").unwrap();
+        let material = RunOccurrenceMaterialV1 {
+            occurrence: Some(OccurrenceId::allocate()),
+            plan_binding: binding.clone(),
+            plan_binding_sha256: Some(format!("sha256:{:x}", Sha256::digest(b"binding-one"))),
+            review_input: directory.path().join("review.json"),
+            nightshift_cycle_request: request,
+            nightshift_cycle_request_sha256: Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(b"request-one")
+            )),
+            executor_config: directory.path().join("executor.json"),
+        };
+        verify_material_pins(&material).unwrap();
+        fs::write(binding, b"binding-two").unwrap();
+        assert!(verify_material_pins(&material).is_err());
+    }
+
+    #[test]
+    fn v2_material_requires_both_content_pins() {
+        let directory = tempfile::tempdir().unwrap();
+        let binding = directory.path().join("binding.json");
+        let request = directory.path().join("request.json");
+        fs::write(&binding, b"binding").unwrap();
+        fs::write(&request, b"request").unwrap();
+        let material = RunOccurrenceMaterialV1 {
+            occurrence: Some(OccurrenceId::allocate()),
+            plan_binding: binding,
+            plan_binding_sha256: None,
+            review_input: directory.path().join("review.json"),
+            nightshift_cycle_request: request,
+            nightshift_cycle_request_sha256: None,
+            executor_config: directory.path().join("executor.json"),
+        };
+        assert!(verify_material_pins(&material).is_err());
+    }
 }

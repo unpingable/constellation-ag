@@ -249,6 +249,20 @@ CREATE TABLE shared_runs (
 CREATE UNIQUE INDEX one_live_shared_run_per_campaign
     ON shared_runs(campaign_id) WHERE status != 'terminal';
 
+CREATE TABLE shared_run_continuations (
+    run_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 8),
+    locator TEXT NOT NULL,
+    envelope_jcs BLOB NOT NULL,
+    envelope_digest TEXT NOT NULL UNIQUE,
+    predecessor_occurrence_id TEXT NOT NULL,
+    successor_occurrence_id TEXT NOT NULL,
+    transition_state_digest TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (run_id, ordinal),
+    UNIQUE (run_id, successor_occurrence_id),
+    FOREIGN KEY (run_id) REFERENCES shared_runs(run_id)
+) STRICT;
+
 CREATE TABLE shared_run_observations (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
@@ -457,6 +471,51 @@ pub struct CampaignTransitionHistoryV1 {
     pub transitions: Vec<CampaignTransitionProjectionV1>,
     /// State digest current when this projection was verified.
     pub current_state_digest: Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRunContinuationEnvelopeV1 {
+    schema: String,
+    campaign: CampaignId,
+    predecessor_occurrence: String,
+    predecessor_expected_ag_work: Digest,
+    occurrence: String,
+    expected_ag_work: Digest,
+    plan_binding: PathBuf,
+    plan_binding_sha256: String,
+    review_input: PathBuf,
+    nightshift_cycle_request: PathBuf,
+    nightshift_cycle_request_sha256: String,
+    executor_config: PathBuf,
+}
+
+impl StoredRunContinuationEnvelopeV1 {
+    fn paths_are_absolute(&self) -> bool {
+        [
+            &self.plan_binding,
+            &self.review_input,
+            &self.nightshift_cycle_request,
+            &self.executor_config,
+        ]
+        .into_iter()
+        .all(|path| path.is_absolute())
+    }
+
+    fn pins_are_sha256(&self) -> bool {
+        [
+            &self.plan_binding_sha256,
+            &self.nightshift_cycle_request_sha256,
+        ]
+        .into_iter()
+        .all(|pin| {
+            pin.len() == 71
+                && pin.starts_with("sha256:")
+                && pin[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    }
 }
 
 /// One durable non-authorizing refusal in recording order.
@@ -1109,9 +1168,47 @@ impl CampaignStoreV1 {
         input_jcs: &[u8],
         recorded_at_unix_ms: u64,
     ) -> Result<Digest, CampaignStoreErrorV1> {
+        self.begin_shared_run_with_domain(
+            "ag.governed-loop.run-input/v1",
+            profile_digest,
+            input_jcs,
+            recorded_at_unix_ms,
+        )
+    }
+
+    /// Begins or resumes an exact finite V2 run without changing the PC.
+    pub fn begin_shared_run_v2(
+        &mut self,
+        profile_digest: &Digest,
+        input_jcs: &[u8],
+        recorded_at_unix_ms: u64,
+    ) -> Result<Digest, CampaignStoreErrorV1> {
+        self.begin_shared_run_with_domain(
+            "ag.governed-loop.run-input/v2",
+            profile_digest,
+            input_jcs,
+            recorded_at_unix_ms,
+        )
+    }
+
+    fn begin_shared_run_with_domain(
+        &mut self,
+        domain: &str,
+        profile_digest: &Digest,
+        input_jcs: &[u8],
+        recorded_at_unix_ms: u64,
+    ) -> Result<Digest, CampaignStoreErrorV1> {
         JcsDocument::from_canonical_bytes(input_jcs)
             .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
-        let run_id = Digest::hash_domain("ag.governed-loop.run-input/v1", input_jcs);
+        let input: serde_json::Value = serde_json::from_slice(input_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let expected_schema = domain
+            .strip_prefix("ag.governed-loop.run-input/")
+            .map(|version| format!("ag.governed-loop.run-input/{version}"));
+        if input.get("schema").and_then(serde_json::Value::as_str) != expected_schema.as_deref() {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let run_id = Digest::hash_domain(domain, input_jcs);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1162,6 +1259,125 @@ impl CampaignStoreV1 {
         )?;
         transaction.commit()?;
         Ok(run_id)
+    }
+
+    /// Atomically opens a continuation and retains its exact canonical input.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments are the closed continuation binding"
+    )]
+    pub fn commit_shared_run_continuation(
+        &mut self,
+        run_id: &Digest,
+        ordinal: u8,
+        locator: &Path,
+        envelope_jcs: &[u8],
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        recorded_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        if ordinal >= 8 || !locator.is_absolute() {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let locator = locator
+            .to_str()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        JcsDocument::from_canonical_bytes(envelope_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let envelope: StoredRunContinuationEnvelopeV1 = serde_json::from_slice(envelope_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let predecessor_occurrence = expected.key().occurrence.to_string();
+        let successor_occurrence = successor.key().occurrence.to_string();
+        if envelope.schema != "ag.governed-loop.run-continuation/v1"
+            || envelope.campaign != expected.key().campaign
+            || envelope.predecessor_occurrence != predecessor_occurrence
+            || &envelope.predecessor_expected_ag_work != expected.state().meta().expected_work()
+            || envelope.occurrence != successor_occurrence
+            || &envelope.expected_ag_work != successor.state().meta().expected_work()
+            || !envelope.paths_are_absolute()
+            || !envelope.pins_are_sha256()
+        {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let envelope_digest =
+            Digest::hash_domain("ag.governed-loop.run-continuation/v1", envelope_jcs);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM shared_runs WHERE run_id=?1 AND campaign_id=?2",
+                params![run_id.as_str(), expected.key().campaign.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if run_status.as_deref() == Some("terminal") || run_status.is_none() {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM shared_run_continuations WHERE run_id=?1",
+            params![run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if count != i64::from(ordinal) {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        let receipt = write_transition(
+            &transaction,
+            expected,
+            successor,
+            CampaignTransitionKindV1::ContinuationOpened,
+            &CampaignTransitionEvidenceV1::None,
+            recorded_at_unix_ms,
+        )?;
+        transaction.execute(
+            "INSERT INTO shared_run_continuations
+             (run_id, ordinal, locator, envelope_jcs, envelope_digest,
+              predecessor_occurrence_id, successor_occurrence_id, transition_state_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id.as_str(),
+                i64::from(ordinal),
+                locator,
+                envelope_jcs,
+                envelope_digest.as_str(),
+                expected.key().occurrence.to_string(),
+                successor.key().occurrence.to_string(),
+                successor.state_digest().as_str()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Returns the retained continuation for an occurrence in a run.
+    pub fn shared_run_continuation(
+        &self,
+        run_id: &Digest,
+        occurrence: &str,
+    ) -> Result<Option<(u8, Vec<u8>)>, CampaignStoreErrorV1> {
+        self.connection
+            .query_row(
+                "SELECT ordinal, envelope_jcs FROM shared_run_continuations
+                 WHERE run_id=?1 AND successor_occurrence_id=?2",
+                params![run_id.as_str(), occurrence],
+                |row| Ok((row.get::<_, u8>(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the number of atomically retained continuations for a run.
+    pub fn shared_run_continuation_count(
+        &self,
+        run_id: &Digest,
+    ) -> Result<u8, CampaignStoreErrorV1> {
+        let count: u8 = self.connection.query_row(
+            "SELECT count(*) FROM shared_run_continuations WHERE run_id=?1",
+            params![run_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Appends one machine-readable run observation and updates run status.
@@ -2910,6 +3126,8 @@ fn verify_shared_runs(
         .map(|row| row.successor.as_str())
         .collect();
     let mut runs = BTreeSet::new();
+    let mut v2_runs = BTreeSet::new();
+    let mut v2_tails = BTreeMap::new();
     let mut live = 0_u64;
     let mut statement = connection.prepare(
         "SELECT run_id, profile_digest, input_jcs, status,
@@ -2932,7 +3150,29 @@ fn verify_shared_runs(
         let profile = parse_digest(&row.1)?;
         JcsDocument::from_canonical_bytes(&row.2)
             .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
-        if run != Digest::hash_domain("ag.governed-loop.run-input/v1", &row.2)
+        let input: serde_json::Value = serde_json::from_slice(&row.2)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        let run_domain = match input.get("schema").and_then(serde_json::Value::as_str) {
+            Some("ag.governed-loop.run-input/v1") => "ag.governed-loop.run-input/v1",
+            Some("ag.governed-loop.run-input/v2") => "ag.governed-loop.run-input/v2",
+            _ => {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "unsupported shared run input schema".to_owned(),
+                ));
+            }
+        };
+        if run_domain == "ag.governed-loop.run-input/v2" {
+            v2_runs.insert(row.0.clone());
+            let initial = input
+                .get("initial")
+                .and_then(|value| value.get("occurrence"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    CampaignStoreErrorV1::Corrupt("V2 run lacks its initial occurrence".to_owned())
+                })?;
+            v2_tails.insert(row.0.clone(), initial.to_owned());
+        }
+        if run != Digest::hash_domain(run_domain, &row.2)
             || Some(&profile) != profile_digest
             || !runs.insert(row.0)
             || !matches!(row.3.as_str(), "active" | "waiting" | "terminal")
@@ -2973,6 +3213,89 @@ fn verify_shared_runs(
         }
         JcsDocument::from_canonical_bytes(&row.2)
             .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+    }
+    if table_exists(connection, "shared_run_continuations")? {
+        let transition_states: BTreeMap<&str, &StoredTransitionRow> = transitions
+            .iter()
+            .map(|row| (row.successor.as_str(), row))
+            .collect();
+        let mut ordinals: BTreeMap<String, u8> = BTreeMap::new();
+        let mut statement = connection.prepare(
+            "SELECT run_id, ordinal, locator, envelope_jcs, envelope_digest,
+                    predecessor_occurrence_id, successor_occurrence_id, transition_state_digest
+             FROM shared_run_continuations ORDER BY run_id, ordinal",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u8>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let row = row?;
+            let next = ordinals.entry(row.0.clone()).or_insert(0);
+            let tail = v2_tails.get_mut(&row.0);
+            let transition = transition_states.get(row.7.as_str());
+            let envelope_digest = parse_digest(&row.4)?;
+            JcsDocument::from_canonical_bytes(&row.3)
+                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+            let envelope: StoredRunContinuationEnvelopeV1 = serde_json::from_slice(&row.3)
+                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+            let envelope_exact = envelope.schema == "ag.governed-loop.run-continuation/v1"
+                && envelope.campaign == *campaign
+                && envelope.predecessor_occurrence == row.5
+                && envelope.occurrence == row.6
+                && envelope.paths_are_absolute()
+                && envelope.pins_are_sha256();
+            let work_exact = transition.is_some_and(|transition| {
+                transition_states
+                    .get(transition.predecessor.as_str())
+                    .is_some_and(|predecessor| {
+                        &envelope.predecessor_expected_ag_work
+                            == predecessor.snapshot.state().meta().expected_work()
+                    })
+                    && &envelope.expected_ag_work
+                        == transition.snapshot.state().meta().expected_work()
+            });
+            if !runs.contains(&row.0)
+                || !v2_runs.contains(&row.0)
+                || row.1 != *next
+                || tail.as_deref() != Some(row.5.as_str())
+                || row.1 >= 8
+                || !Path::new(&row.2).is_absolute()
+                || envelope_digest
+                    != Digest::hash_domain("ag.governed-loop.run-continuation/v1", &row.3)
+                || !envelope_exact
+                || !work_exact
+                || transition.is_none_or(|transition| {
+                    transition.kind != CampaignTransitionKindV1::ContinuationOpened
+                        || transition.source_occurrence.as_deref() != Some(row.5.as_str())
+                        || transition.successor_occurrence != row.6
+                })
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "shared run continuation failed replay".to_owned(),
+                ));
+            }
+            *tail.expect("V2 continuation checked above") = row.6.clone();
+            *next = next.saturating_add(1);
+        }
+        for tail in v2_tails.values() {
+            if transitions.iter().any(|transition| {
+                transition.kind == CampaignTransitionKindV1::ContinuationOpened
+                    && transition.source_occurrence.as_deref() == Some(tail.as_str())
+            }) {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "V2 continuation transition lacks its retained envelope".to_owned(),
+                ));
+            }
+        }
     }
     Ok(())
 }

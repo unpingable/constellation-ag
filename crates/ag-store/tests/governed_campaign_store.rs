@@ -768,3 +768,126 @@ fn governed_intervention_evidence_survives_restart_and_conflicting_replay_loses(
     ));
     assert_eq!(reopened.replay().unwrap().transitions, 2);
 }
+
+#[test]
+fn v2_run_continuation_is_atomic_bounded_and_replays() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let profile = br#"{"schema":"test.profile/v1"}"#;
+    let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile);
+    let mut store = CampaignStoreV1::create_with_runtime_profile(
+        &database,
+        &start,
+        Some(("test.profile/v1", profile)),
+        NOW,
+    )
+    .unwrap();
+    let settled = commit_normal_path(&mut store, &start);
+    let run_input = JcsDocument::canonicalize(&serde_json::json!({
+        "schema": "ag.governed-loop.run-input/v2",
+        "campaign": campaign(),
+        "initial": { "occurrence": settled.key().occurrence }
+    }))
+    .unwrap();
+    let run = store
+        .begin_shared_run_v2(&profile_digest, run_input.as_bytes(), NOW + 3)
+        .unwrap();
+    let occurrence = OccurrenceId::allocate();
+    let expected_work = digest("successor-work");
+    let successor =
+        GovernedLoopKernelV1::open_continuation(&settled, occurrence, expected_work.clone())
+            .unwrap();
+    let envelope = JcsDocument::canonicalize(&serde_json::json!({
+        "schema": "ag.governed-loop.run-continuation/v1",
+        "campaign": campaign(),
+        "predecessor_occurrence": settled.key().occurrence,
+        "predecessor_expected_ag_work": settled.state().meta().expected_work(),
+        "occurrence": occurrence,
+        "expected_ag_work": expected_work,
+        "plan_binding": "/campaign/plan-binding.json",
+        "plan_binding_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "review_input": "/campaign/review.json",
+        "nightshift_cycle_request": "/campaign/cycle-request.json",
+        "nightshift_cycle_request_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "executor_config": "/campaign/executor.json"
+    }))
+    .unwrap();
+    let mismatched = JcsDocument::canonicalize(&serde_json::json!({
+        "schema": "ag.governed-loop.run-continuation/v1",
+        "campaign": campaign(),
+        "predecessor_occurrence": settled.key().occurrence,
+        "predecessor_expected_ag_work": digest("substituted-predecessor-work"),
+        "occurrence": occurrence,
+        "expected_ag_work": expected_work,
+        "plan_binding": "/campaign/plan-binding.json",
+        "plan_binding_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "review_input": "/campaign/review.json",
+        "nightshift_cycle_request": "/campaign/cycle-request.json",
+        "nightshift_cycle_request_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "executor_config": "/campaign/executor.json"
+    }))
+    .unwrap();
+    assert!(matches!(
+        store.commit_shared_run_continuation(
+            &run,
+            0,
+            std::path::Path::new("/campaign/continuation-1.json"),
+            mismatched.as_bytes(),
+            &settled,
+            &successor,
+            NOW + 4,
+        ),
+        Err(CampaignStoreErrorV1::BindingMismatch)
+    ));
+    assert_eq!(store.current().unwrap(), settled);
+    store
+        .commit_shared_run_continuation(
+            &run,
+            0,
+            std::path::Path::new("/campaign/continuation-1.json"),
+            envelope.as_bytes(),
+            &settled,
+            &successor,
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(store.shared_run_continuation_count(&run).unwrap(), 1);
+    assert_eq!(
+        store
+            .shared_run_continuation(&run, &occurrence.to_string())
+            .unwrap(),
+        Some((0, envelope.as_bytes().to_vec()))
+    );
+    assert!(matches!(
+        store.commit_shared_run_continuation(
+            &run,
+            0,
+            std::path::Path::new("/campaign/continuation-1.json"),
+            envelope.as_bytes(),
+            &settled,
+            &successor,
+            NOW + 5,
+        ),
+        Err(CampaignStoreErrorV1::SharedRunConflict)
+    ));
+    assert!(matches!(
+        store.commit_shared_run_continuation(
+            &run,
+            8,
+            std::path::Path::new("/campaign/continuation-9.json"),
+            envelope.as_bytes(),
+            &successor,
+            &successor,
+            NOW + 6,
+        ),
+        Err(CampaignStoreErrorV1::BindingMismatch)
+    ));
+    drop(store);
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(
+        reopened.replay().unwrap().current_state_digest,
+        *successor.state_digest()
+    );
+    assert_eq!(reopened.shared_run_continuation_count(&run).unwrap(), 1);
+}
