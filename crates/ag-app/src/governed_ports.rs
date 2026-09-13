@@ -18,8 +18,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
@@ -65,7 +68,7 @@ pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str = "maude.governed-plan-bin
 pub const GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1: &str =
     "ag.governed-loop.nightshift-cycle-port/v1";
 /// Closed nonsecret configuration consumed by the Nightshift cycle adapter.
-pub const NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1: &str = "nightshift.ag-cycle-port-config/v1";
+pub const NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1: &str = "nightshift.ag_cycle_config.v1";
 /// Schema for the deployment-owned Docket adapter root.
 pub const GOVERNED_DOCKET_ROOT_SCHEMA_V1: &str = "ag.governed-loop.docket-root/v1";
 /// Schema for the Docket portion of runtime-profile enrollment.
@@ -274,6 +277,8 @@ pub struct GovernedSharedAdmissionV1 {
     pub plan_validator_config: PinnedDeploymentFileV1,
     /// Authenticated review-custody verifier.
     pub review_verifier: PinnedDeploymentFileV1,
+    /// Closed verifier route/backend configuration.
+    pub review_verifier_config: PinnedDeploymentFileV1,
     /// Nonsecret independent-review requirement.
     pub review_requirement: PinnedDeploymentFileV1,
 }
@@ -294,12 +299,17 @@ impl GovernedSharedAdmissionV1 {
         let config = self.plan_validator_config.verify(false)?;
         let _ = crate::shared_admission::canonical_file_identity(&config)?;
         let _ = self.review_verifier.verify(true)?;
+        let verifier_config = self.review_verifier_config.verify(false)?;
+        let verifier_config_digest =
+            crate::shared_admission::canonical_file_identity(&verifier_config)?;
         let requirement = self.review_requirement.verify(false)?;
         let requirement =
             crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
-        if requirement.compiler_contract != self.compiler_contract {
+        if requirement.compiler_contract != self.compiler_contract
+            || requirement.route_enrollment_digest != verifier_config_digest
+        {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
-                "review requirement compiler contract differs from shared admission",
+                "review requirement differs from shared admission enrollment",
             ));
         }
         Ok(())
@@ -343,16 +353,24 @@ pub struct GovernedNightshiftCyclePortV1 {
 struct NightshiftCyclePortConfigV1 {
     schema: String,
     store: PathBuf,
-    present_evidence_resolver: PathBuf,
-    nq_program: PathBuf,
-    nq_config: PathBuf,
+    present_evidence_resolver: NightshiftPinnedFileV1,
+    nq_program: NightshiftPinnedFileV1,
+    nq_config: NightshiftPinnedFileV1,
     nq_source_id: String,
-    ag_loopctl: PathBuf,
+    ag_loopctl: NightshiftPinnedFileV1,
     ag_database: PathBuf,
-    ag_observation_resolver: PathBuf,
+    ag_observation_resolver: NightshiftPinnedFileV1,
     ag_observation_resolver_id: String,
     ag_runtime_profile: PathBuf,
-    recover_observed_at: u64,
+    shared_admission_requirement_digest: Digest,
+    recover_observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NightshiftPinnedFileV1 {
+    path: PathBuf,
+    sha256: Digest,
 }
 
 impl NightshiftCyclePortConfigV1 {
@@ -360,14 +378,15 @@ impl NightshiftCyclePortConfigV1 {
         if self.schema != NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1
             || self.nq_source_id.is_empty()
             || self.ag_observation_resolver_id.is_empty()
+            || self.recover_observed_at.is_empty()
             || [
                 &self.store,
-                &self.present_evidence_resolver,
-                &self.nq_program,
-                &self.nq_config,
-                &self.ag_loopctl,
+                &self.present_evidence_resolver.path,
+                &self.nq_program.path,
+                &self.nq_config.path,
+                &self.ag_loopctl.path,
                 &self.ag_database,
-                &self.ag_observation_resolver,
+                &self.ag_observation_resolver.path,
                 &self.ag_runtime_profile,
             ]
             .into_iter()
@@ -376,6 +395,19 @@ impl NightshiftCyclePortConfigV1 {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "invalid Nightshift cycle adapter config",
             ));
+        }
+        for (file, executable) in [
+            (&self.present_evidence_resolver, true),
+            (&self.nq_program, true),
+            (&self.nq_config, false),
+            (&self.ag_loopctl, true),
+            (&self.ag_observation_resolver, true),
+        ] {
+            let _ = PinnedDeploymentFileV1 {
+                path: file.path.clone(),
+                identity: file.sha256.clone(),
+            }
+            .verify(executable)?;
         }
         Ok(())
     }
@@ -405,6 +437,7 @@ impl GovernedNightshiftCyclePortV1 {
         &self,
         request: &Path,
         recover: bool,
+        deadline_unix_ms: u64,
     ) -> Result<serde_json::Value, GovernedPortErrorV1> {
         self.verify_all()?;
         if !request.is_absolute() {
@@ -425,7 +458,12 @@ impl GovernedNightshiftCyclePortV1 {
             "--request".to_owned(),
             request.display().to_string(),
         ];
-        run_json_program(&self.program.path, &arguments, &serde_json::json!({}))
+        run_json_program_until(
+            &self.program.path,
+            &arguments,
+            &serde_json::json!({}),
+            Some(deadline_unix_ms),
+        )
     }
 }
 
@@ -439,7 +477,22 @@ impl GovernedRuntimeProfileV2 {
         }
         self.common_profile().verify_genesis()?;
         self.nightshift_cycle.verify_all()?;
-        self.shared_admission.verify_all()
+        self.shared_admission.verify_all()?;
+        let config_bytes = self.nightshift_cycle.config.verify(false)?;
+        let config: NightshiftCyclePortConfigV1 = JcsDocument::from_canonical_bytes(
+            config_bytes.strip_suffix(b"\n").unwrap_or(&config_bytes),
+        )
+        .and_then(|document| document.decode())
+        .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        let requirement_bytes = self.shared_admission.review_requirement.verify(false)?;
+        let requirement_digest =
+            crate::shared_admission::canonical_file_identity(&requirement_bytes)?;
+        if config.shared_admission_requirement_digest != requirement_digest {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "Nightshift config differs from shared admission requirement",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the unchanged common coordinates consumed by existing ports.
@@ -610,6 +663,7 @@ pub struct GovernedSharedAdmissionEnrollmentV1 {
     pub plan_validator: PathBuf,
     pub plan_validator_config: PathBuf,
     pub review_verifier: PathBuf,
+    pub review_verifier_config: PathBuf,
     pub review_requirement: PathBuf,
 }
 
@@ -669,6 +723,10 @@ impl GovernedRuntimeProfileEnrollmentV2 {
             review_verifier: PinnedDeploymentFileV1::measure(
                 self.shared_admission.review_verifier,
                 true,
+            )?,
+            review_verifier_config: PinnedDeploymentFileV1::measure(
+                self.shared_admission.review_verifier_config,
+                false,
             )?,
             review_requirement: PinnedDeploymentFileV1::measure(
                 self.shared_admission.review_requirement,
@@ -958,6 +1016,7 @@ struct InterventionVerificationCommandResponseV1 {
 /// Fresh process adapter for an external observation owner.
 pub struct CommandObservationResolverV1 {
     program: PathBuf,
+    deadline_unix_ms: Option<u64>,
 }
 
 impl CommandObservationResolverV1 {
@@ -966,7 +1025,14 @@ impl CommandObservationResolverV1 {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            deadline_unix_ms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
+        self.deadline_unix_ms = Some(deadline_unix_ms);
+        self
     }
 }
 
@@ -975,7 +1041,7 @@ impl ObservationResolverV1 for CommandObservationResolverV1 {
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
     ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
-        run_json_program(
+        run_json_program_until(
             &self.program,
             &[],
             &ObservationCommandRequestV1 {
@@ -985,6 +1051,7 @@ impl ObservationResolverV1 for CommandObservationResolverV1 {
                 subject: request.subject,
                 now_unix_ms: request.now_unix_ms,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -993,6 +1060,7 @@ impl ObservationResolverV1 for CommandObservationResolverV1 {
 /// Fresh process adapter for the authoritative current-standing owner.
 pub struct CommandStandingResolverV1 {
     program: PathBuf,
+    deadline_unix_ms: Option<u64>,
 }
 
 impl CommandStandingResolverV1 {
@@ -1001,7 +1069,14 @@ impl CommandStandingResolverV1 {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            deadline_unix_ms: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
+        self.deadline_unix_ms = Some(deadline_unix_ms);
+        self
     }
 }
 
@@ -1010,7 +1085,7 @@ impl StandingResolverV1 for CommandStandingResolverV1 {
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
     ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1> {
-        run_json_program(
+        run_json_program_until(
             &self.program,
             &[],
             &StandingCommandRequestV1 {
@@ -1022,6 +1097,7 @@ impl StandingResolverV1 for CommandStandingResolverV1 {
                 scope: request.scope,
                 now_unix_ms: request.now_unix_ms,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -1123,6 +1199,7 @@ pub struct CommandDocketCustodyPortV1 {
     executor_adapter: PathBuf,
     executor_config: PathBuf,
     signer: AgIssuanceSignerV1,
+    deadline_unix_ms: Option<u64>,
 }
 
 impl CommandDocketCustodyPortV1 {
@@ -1146,7 +1223,15 @@ impl CommandDocketCustodyPortV1 {
             executor_adapter: executor_adapter.into(),
             executor_config: executor_config.into(),
             signer,
+            deadline_unix_ms: None,
         }
+    }
+
+    /// Applies an absolute deadline for finite-run subprocess I/O and wait.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
+        self.deadline_unix_ms = Some(deadline_unix_ms);
+        self
     }
 
     fn arguments(&self, operation: &str) -> Vec<String> {
@@ -1174,7 +1259,13 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
     ) -> Result<DocketCustodyV1, ExternalBoundaryErrorV1> {
         let envelope = self.signer.sign(issuance).map_err(external_error)?;
         let arguments = self.arguments("accept");
-        run_json_program(&self.docket_program, &arguments, &envelope).map_err(external_error)
+        run_json_program_until(
+            &self.docket_program,
+            &arguments,
+            &envelope,
+            self.deadline_unix_ms,
+        )
+        .map_err(external_error)
     }
 
     fn reconcile_issuance(
@@ -1187,12 +1278,13 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
             issuance: &'a AgIssuanceRefV1,
         }
         let arguments = self.arguments("reconcile-issuance");
-        run_json_program(
+        run_json_program_until(
             &self.docket_program,
             &arguments,
             &Request {
                 issuance: &issuance.issuance,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -1208,13 +1300,14 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
             attempt: &'a DocketAttemptRefV1,
         }
         let arguments = self.arguments("reconcile-attempt");
-        run_json_program(
+        run_json_program_until(
             &self.docket_program,
             &arguments,
             &Request {
                 issuance: &custody.issuance,
                 attempt: &custody.attempt,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -1232,6 +1325,7 @@ pub struct CommandDocketReconciliationPortV1 {
     standing_resolver: PathBuf,
     executor_adapter: PathBuf,
     executor_config: PathBuf,
+    deadline_unix_ms: Option<u64>,
 }
 
 impl CommandDocketReconciliationPortV1 {
@@ -1253,7 +1347,15 @@ impl CommandDocketReconciliationPortV1 {
             standing_resolver: standing_resolver.into(),
             executor_adapter: executor_adapter.into(),
             executor_config: executor_config.into(),
+            deadline_unix_ms: None,
         }
+    }
+
+    /// Applies an absolute deadline for finite-run reconciliation calls.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
+        self.deadline_unix_ms = Some(deadline_unix_ms);
+        self
     }
 
     fn arguments(&self, operation: &str) -> Vec<String> {
@@ -1294,12 +1396,13 @@ impl DocketCustodyPortV1 for CommandDocketReconciliationPortV1 {
         struct Request<'a> {
             issuance: &'a AgIssuanceRefV1,
         }
-        run_json_program(
+        run_json_program_until(
             &self.docket_program,
             &self.arguments("reconcile-issuance"),
             &Request {
                 issuance: &issuance.issuance,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -1314,13 +1417,14 @@ impl DocketCustodyPortV1 for CommandDocketReconciliationPortV1 {
             issuance: &'a AgIssuanceRefV1,
             attempt: &'a DocketAttemptRefV1,
         }
-        run_json_program(
+        run_json_program_until(
             &self.docket_program,
             &self.arguments("reconcile-attempt"),
             &Request {
                 issuance: &custody.issuance,
                 attempt: &custody.attempt,
             },
+            self.deadline_unix_ms,
         )
         .map_err(external_error)
     }
@@ -1350,6 +1454,9 @@ pub enum GovernedPortErrorV1 {
     /// External owner returned a malformed response.
     #[error("external governed owner returned malformed output: {0}")]
     MalformedResponse(String),
+    /// A finite process boundary exceeded its absolute deadline and was reaped.
+    #[error("governed-port deadline exhausted")]
+    DeadlineExhausted,
 }
 
 pub(crate) fn run_json_program<I, O>(
@@ -1361,35 +1468,128 @@ where
     I: Serialize + ?Sized,
     O: DeserializeOwned,
 {
+    run_json_program_until(program, arguments, input, None)
+}
+
+const MAX_PROCESS_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+
+pub(crate) fn run_json_program_until<I, O>(
+    program: &Path,
+    arguments: &[String],
+    input: &I,
+    deadline_unix_ms: Option<u64>,
+) -> Result<O, GovernedPortErrorV1>
+where
+    I: Serialize + ?Sized,
+    O: DeserializeOwned,
+{
     let body = JcsDocument::canonicalize(input)
         .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
     let mut child = Command::new(program)
         .args(arguments)
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(GovernedPortErrorV1::Io)?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| {
-            GovernedPortErrorV1::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "child stdin unavailable",
-            ))
-        })?
-        .write_all(body.as_bytes())
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        GovernedPortErrorV1::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "child stdin unavailable",
+        ))
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        GovernedPortErrorV1::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "child stdout unavailable",
+        ))
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        GovernedPortErrorV1::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "child stderr unavailable",
+        ))
+    })?;
+    let input_bytes = body.as_bytes().to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&input_bytes));
+    let output_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_PROCESS_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let error_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(MAX_PROCESS_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(GovernedPortErrorV1::Io)? {
+            break status;
+        }
+        if deadline_unix_ms.is_some_and(|deadline| unix_time_ms() >= deadline) {
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            let _ = output_reader.join();
+            let _ = error_reader.join();
+            return Err(GovernedPortErrorV1::DeadlineExhausted);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // A direct child may exit while a descendant retains one of its pipes.
+    // Close the whole invocation boundary before joining the pipe workers.
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    writer
+        .join()
+        .map_err(|_| GovernedPortErrorV1::MalformedResponse("stdin writer failed".to_owned()))?
         .map_err(GovernedPortErrorV1::Io)?;
-    let output = child.wait_with_output().map_err(GovernedPortErrorV1::Io)?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
+    let stdout = output_reader
+        .join()
+        .map_err(|_| GovernedPortErrorV1::MalformedResponse("stdout reader failed".to_owned()))?
+        .map_err(GovernedPortErrorV1::Io)?;
+    let stderr = error_reader
+        .join()
+        .map_err(|_| GovernedPortErrorV1::MalformedResponse("stderr reader failed".to_owned()))?
+        .map_err(GovernedPortErrorV1::Io)?;
+    if stdout.len() > usize::try_from(MAX_PROCESS_OUTPUT_BYTES).unwrap_or(usize::MAX)
+        || stderr.len() > usize::try_from(MAX_PROCESS_OUTPUT_BYTES).unwrap_or(usize::MAX)
+    {
+        return Err(GovernedPortErrorV1::MalformedResponse(
+            "process output exceeds bound".to_owned(),
+        ));
+    }
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         return Err(GovernedPortErrorV1::Refused(
             detail.chars().take(512).collect(),
         ));
     }
-    serde_json::from_slice(&output.stdout)
+    serde_json::from_slice(&stdout)
         .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn external_error(error: GovernedPortErrorV1) -> ExternalBoundaryErrorV1 {
@@ -1456,13 +1656,29 @@ mod tests {
     fn nightshift_cycle_config_is_closed_and_requires_absolute_coordinates() {
         let value = serde_json::json!({
             "schema": NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1,
-            "store": "/state", "present_evidence_resolver": "/bin/present",
-            "nq_program": "/bin/nq", "nq_config": "/etc/nq.json",
-            "nq_source_id": "source", "ag_loopctl": "/bin/ag-loopctl",
-            "ag_database": "/state/ag.sqlite", "ag_observation_resolver": "/bin/observe",
+            "store": "/state", "present_evidence_resolver": {"path":"/bin/present","sha256":Digest::hash_bytes(b"p")},
+            "nq_program": {"path":"/bin/nq","sha256":Digest::hash_bytes(b"nq")},
+            "nq_config": {"path":"/etc/nq.json","sha256":Digest::hash_bytes(b"nqc")},
+            "nq_source_id": "source", "ag_loopctl": {"path":"/bin/ag-loopctl","sha256":Digest::hash_bytes(b"ag")},
+            "ag_database": "/state/ag.sqlite", "ag_observation_resolver": {"path":"/bin/observe","sha256":Digest::hash_bytes(b"obs")},
             "ag_observation_resolver_id": "observe/v1", "ag_runtime_profile": "/etc/ag-profile.json",
-            "recover_observed_at": 1, "substituted_program": "/tmp/other"
+            "shared_admission_requirement_digest": Digest::hash_bytes(b"requirement"),
+            "recover_observed_at": "2026-09-12T12:00:00Z", "substituted_program": "/tmp/other"
         });
         assert!(serde_json::from_value::<NightshiftCyclePortConfigV1>(value).is_err());
+    }
+
+    #[test]
+    fn process_boundary_bounds_nonreading_nonexiting_and_pipe_flood_children() {
+        for script in ["sleep 10", "yes x", "(sleep 10) & exit 0"] {
+            let deadline = unix_time_ms().saturating_add(200);
+            let result = run_json_program_until::<_, serde_json::Value>(
+                Path::new("/bin/sh"),
+                &["-c".to_owned(), script.to_owned()],
+                &serde_json::json!({"input": "fixture"}),
+                Some(deadline),
+            );
+            assert!(result.is_err(), "fixture unexpectedly succeeded: {script}");
+        }
     }
 }

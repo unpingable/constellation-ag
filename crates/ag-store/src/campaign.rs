@@ -242,6 +242,8 @@ CREATE TABLE shared_runs (
     profile_digest TEXT NOT NULL,
     input_jcs BLOB NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'terminal')),
+    cycle_request_digest TEXT,
+    cycle_inflight INTEGER NOT NULL DEFAULT 0 CHECK (cycle_inflight IN (0, 1)),
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0)
 ) STRICT;
 CREATE UNIQUE INDEX one_live_shared_run_per_campaign
@@ -1201,6 +1203,50 @@ impl CampaignStoreV1 {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Fences one exact Nightshift cycle request before external submission.
+    pub fn mark_shared_cycle_inflight(
+        &mut self,
+        run_id: &Digest,
+        request_digest: &Digest,
+    ) -> Result<bool, CampaignStoreErrorV1> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: (Option<String>, bool) = transaction.query_row(
+            "SELECT cycle_request_digest, cycle_inflight FROM shared_runs WHERE run_id=?1",
+            params![run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(digest) = existing.0.as_deref()
+            && digest != request_digest.as_str()
+        {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        transaction.execute(
+            "UPDATE shared_runs SET cycle_request_digest=?1, cycle_inflight=1 WHERE run_id=?2",
+            params![request_digest.as_str(), run_id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(existing.1)
+    }
+
+    /// Clears the exact request marker only after a response is durably observed.
+    pub fn clear_shared_cycle_inflight(
+        &mut self,
+        run_id: &Digest,
+        request_digest: &Digest,
+    ) -> Result<(), CampaignStoreErrorV1> {
+        let changed = self.connection.execute(
+            "UPDATE shared_runs SET cycle_inflight=0
+             WHERE run_id=?1 AND cycle_request_digest=?2 AND cycle_inflight=1",
+            params![run_id.as_str(), request_digest.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        Ok(())
     }
 
     /// Atomically consumes one exact human disposition and applies its closed effect.
@@ -2738,7 +2784,7 @@ fn verify_shared_admission(
                 .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
         }
         if admissions.get(&row.0) != Some(&binding)
-            || !dispatches.insert(dispatch)
+            || !dispatches.insert(dispatch.clone())
             || !review_ids.insert(review.clone())
             || review != Digest::hash_bytes(&row.5)
             || event
@@ -2823,7 +2869,9 @@ fn verify_shared_runs(
     let mut runs = BTreeSet::new();
     let mut live = 0_u64;
     let mut statement = connection.prepare(
-        "SELECT run_id, profile_digest, input_jcs, status FROM shared_runs WHERE campaign_id=?1",
+        "SELECT run_id, profile_digest, input_jcs, status,
+                cycle_request_digest, cycle_inflight
+         FROM shared_runs WHERE campaign_id=?1",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
         Ok((
@@ -2831,6 +2879,8 @@ fn verify_shared_runs(
             row.get::<_, String>(1)?,
             row.get::<_, Vec<u8>>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, bool>(5)?,
         ))
     })?;
     for row in rows {
@@ -2843,6 +2893,11 @@ fn verify_shared_runs(
             || Some(&profile) != profile_digest
             || !runs.insert(row.0)
             || !matches!(row.3.as_str(), "active" | "waiting" | "terminal")
+            || row
+                .4
+                .as_deref()
+                .is_some_and(|digest| parse_digest(digest).is_err())
+            || (row.5 && row.4.is_none())
         {
             return Err(CampaignStoreErrorV1::Corrupt(
                 "shared run identity failed replay".to_owned(),

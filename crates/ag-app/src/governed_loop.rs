@@ -474,6 +474,7 @@ pub enum CampaignEngineErrorV1 {
 /// One production-reachable canonical campaign engine.
 pub struct CampaignEngineV1 {
     store: CampaignStoreV1,
+    process_deadline_unix_ms: Option<u64>,
 }
 
 struct FreshSharedGateV1 {
@@ -521,6 +522,7 @@ impl CampaignEngineV1 {
         let validation = crate::shared_admission::validate_plan_binding(
             &profile.shared_admission,
             &evidence.binding_jcs,
+            self.process_deadline_unix_ms,
         )?;
         if validation.binding_id != evidence.binding_id {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
@@ -554,6 +556,7 @@ impl CampaignEngineV1 {
                 &profile.shared_admission,
                 &requirement,
                 &input,
+                self.process_deadline_unix_ms,
             )?;
             return Ok(FreshSharedGateV1 {
                 binding_id: evidence.binding_id.clone(),
@@ -593,7 +596,10 @@ impl CampaignEngineV1 {
             budget,
         )?;
         let store = CampaignStoreV1::create(database, &initial, now_unix_ms)?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            process_deadline_unix_ms: None,
+        })
     }
 
     /// Creates one campaign whose production boundary profile is committed in
@@ -625,14 +631,23 @@ impl CampaignEngineV1 {
             Some((runtime_profile_schema, runtime_profile_jcs)),
             now_unix_ms,
         )?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            process_deadline_unix_ms: None,
+        })
     }
 
     /// Opens an existing campaign without reconstructing freshness or authority.
     pub fn open(database: &Path) -> Result<Self, CampaignEngineErrorV1> {
         Ok(Self {
             store: CampaignStoreV1::open(database)?,
+            process_deadline_unix_ms: None,
         })
+    }
+
+    /// Bounds subprocess boundaries used by a finite foreground run.
+    pub fn set_process_deadline(&mut self, deadline_unix_ms: u64) {
+        self.process_deadline_unix_ms = Some(deadline_unix_ms);
     }
 
     /// Returns the exact authoritative current occurrence.
@@ -763,8 +778,11 @@ impl CampaignEngineV1 {
         {
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        let response =
-            crate::shared_admission::validate_plan_binding(&profile.shared_admission, binding_jcs)?;
+        let response = crate::shared_admission::validate_plan_binding(
+            &profile.shared_admission,
+            binding_jcs,
+            self.process_deadline_unix_ms,
+        )?;
         let config_bytes = profile
             .shared_admission
             .plan_validator_config
@@ -847,8 +865,12 @@ impl CampaignEngineV1 {
             }
             return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
         }
-        let verification =
-            crate::shared_admission::verify_review(&profile.shared_admission, &requirement, input)?;
+        let verification = crate::shared_admission::verify_review(
+            &profile.shared_admission,
+            &requirement,
+            input,
+            self.process_deadline_unix_ms,
+        )?;
         let verification_jcs = JcsDocument::canonicalize(&verification)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
         self.store
@@ -925,11 +947,11 @@ impl CampaignEngineV1 {
         }
         match self.fresh_shared_gate(&current, now_unix_ms) {
             Ok(gate) => {
-                result.decision = Decision::Allowed;
+                result.decision = Decision::Indeterminate;
                 result.review_id = Some(gate.review_id.clone());
                 result.evidence.push(gate.review_id);
                 result.expires_at_unix_ms = gate.expires_at_unix_ms;
-                result.reasons = vec!["all_owner_checks_current".to_owned()];
+                result.reasons = vec!["permission_checks_not_evaluated".to_owned()];
             }
             Err(CampaignEngineErrorV1::SharedPort(
                 crate::governed_ports::GovernedPortErrorV1::Refused(reason),
@@ -952,6 +974,87 @@ impl CampaignEngineV1 {
                 result.reasons = vec!["review_rejected".to_owned()];
             }
             Err(_) => result.reasons = vec!["owner_check_unavailable".to_owned()],
+        }
+        Ok(result)
+    }
+
+    /// Performs the complete read-only permission judgment, including the
+    /// current program counter, observation, standing, exact-work catalog,
+    /// fresh plan validation, and current accepted review.
+    #[allow(clippy::too_many_arguments)]
+    pub fn permission_preflight_versioned<O, S>(
+        &self,
+        expected_binding: Digest,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &VersionedExactWorkCatalogV1,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<crate::shared_admission::PermissionPreflightV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        use crate::shared_admission::PermissionPreflightDecisionV1 as Decision;
+        let current = self.store.current()?;
+        let mut result = self.permission_preflight(expected_binding, now_unix_ms)?;
+        if current.program_counter() != ProgramCounterV1::StandingRequired {
+            result.decision = Decision::Denied;
+            result.reasons = vec!["not_current_admissible_pre_authorization_phase".to_owned()];
+            return Ok(result);
+        }
+        let judgment = match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(catalog) => {
+                let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
+                GovernedLoopKernelV1::record_admissible(
+                    &current,
+                    observation,
+                    standing,
+                    &mut decider,
+                    controlling_review,
+                    expected_observation_resolver,
+                    expected_standing_resolver,
+                    max_standing_ttl_ms,
+                    now_unix_ms,
+                )
+            }
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => {
+                let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
+                GovernedLoopKernelV1::record_admissible(
+                    &current,
+                    observation,
+                    standing,
+                    &mut decider,
+                    controlling_review,
+                    expected_observation_resolver,
+                    expected_standing_resolver,
+                    max_standing_ttl_ms,
+                    now_unix_ms,
+                )
+            }
+        };
+        match judgment {
+            Ok(_)
+                if result.review_id.is_some()
+                    && result.reasons == ["permission_checks_not_evaluated"] =>
+            {
+                result.decision = Decision::Allowed;
+                result.reasons = vec!["all_owner_checks_current".to_owned()];
+            }
+            Ok(_) => {}
+            Err(KernelErrorV1::External(ExternalBoundaryErrorV1::Unavailable { .. })) => {
+                if result.decision != Decision::Denied {
+                    result.decision = Decision::Indeterminate;
+                    result.reasons = vec!["permission_owner_unavailable".to_owned()];
+                }
+            }
+            Err(error) => {
+                result.decision = Decision::Denied;
+                result.reasons = vec![format!("permission_refused:{error}")];
+            }
         }
         Ok(result)
     }
@@ -1003,6 +1106,29 @@ impl CampaignEngineV1 {
     ) -> Result<Option<Vec<u8>>, CampaignEngineErrorV1> {
         self.store
             .last_shared_run_observation(run_id)
+            .map_err(Into::into)
+    }
+
+    /// Fences one exact Nightshift request before first contact. Returns true
+    /// when restart must use recovery for the already-contacted request.
+    pub fn mark_cycle_inflight(
+        &mut self,
+        run_id: &Digest,
+        request_digest: &Digest,
+    ) -> Result<bool, CampaignEngineErrorV1> {
+        self.store
+            .mark_shared_cycle_inflight(run_id, request_digest)
+            .map_err(Into::into)
+    }
+
+    /// Clears the request fence only after its response is durably retained.
+    pub fn clear_cycle_inflight(
+        &mut self,
+        run_id: &Digest,
+        request_digest: &Digest,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        self.store
+            .clear_shared_cycle_inflight(run_id, request_digest)
             .map_err(Into::into)
     }
 

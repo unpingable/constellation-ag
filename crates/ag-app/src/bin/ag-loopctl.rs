@@ -446,7 +446,6 @@ struct OperationalSnapshotV1 {
 struct PermissionPreflightInputV1 {
     schema: String,
     binding_id: Digest,
-    evaluated_at_unix_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -618,8 +617,29 @@ fn main() -> anyhow::Result<()> {
             if input.schema != "ag.governed-loop.permission-preflight-input/v1" {
                 bail!("unsupported permission-preflight input schema");
             }
-            let engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.permission_preflight(input.binding_id, input.evaluated_at_unix_ms)?)
+            let (engine, profile) = open_bound(&database)?;
+            let catalog: VersionedExactWorkCatalogV1 =
+                read_exact_record(&profile.exact_work_catalog.path)?;
+            let review = profile
+                .controlling_review
+                .as_ref()
+                .map(|pinned| read_exact_record(&pinned.path))
+                .transpose()?;
+            let mut observation =
+                CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
+            let mut standing =
+                CommandStandingResolverV1::new(profile.standing_resolver.path.clone());
+            write_exact(&engine.permission_preflight_versioned(
+                input.binding_id,
+                &mut observation,
+                &mut standing,
+                &catalog,
+                review.as_ref(),
+                &profile.observation_resolver_id,
+                &profile.standing_resolver_id,
+                profile.max_standing_ttl_ms,
+                now()?,
+            )?)
         }
         Command::Run {
             database,
@@ -922,6 +942,7 @@ fn run_finite(
         bail!("invalid finite run input");
     }
     let (mut engine, profile, profile_digest) = open_bound_with_digest(database)?;
+    engine.set_process_deadline(input.deadline_unix_ms);
     if engine.current()?.key().campaign != input.campaign
         || profile_digest != input.runtime_profile_digest
         || engine
@@ -938,8 +959,10 @@ fn run_finite(
         .map(|pinned| read_exact_record(&pinned.path))
         .transpose()?;
     let mut observation =
-        CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
-    let mut standing = CommandStandingResolverV1::new(profile.standing_resolver.path.clone());
+        CommandObservationResolverV1::new(profile.observation_resolver.path.clone())
+            .with_deadline(input.deadline_unix_ms);
+    let mut standing = CommandStandingResolverV1::new(profile.standing_resolver.path.clone())
+        .with_deadline(input.deadline_unix_ms);
     let mut steps = 0_u64;
     let mut polls = 0_u64;
     loop {
@@ -966,17 +989,12 @@ fn run_finite(
         }
         match current.program_counter() {
             ProgramCounterV1::ObservationRequired => {
-                let recover_cycle = engine
-                    .last_run_observation(&run_id)?
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|value| {
-                        value
-                            .get("reason")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("cycle_request_started");
+                let cycle_request = read_exact_input(&input.nightshift_cycle_request, 1024 * 1024)?;
+                let cycle_request_digest = Digest::hash_domain(
+                    "ag.governed-loop.nightshift-cycle-request/v1",
+                    &cycle_request,
+                );
+                let recover_cycle = engine.mark_cycle_inflight(&run_id, &cycle_request_digest)?;
                 if !recover_cycle {
                     let started = terminal("active", "cycle_request_started", steps, polls);
                     engine.record_run_observation(&run_id, &started, "active", now_unix_ms)?;
@@ -987,12 +1005,15 @@ fn run_finite(
                         .context("protected profile missing")?;
                     strict_json_from_slice(&stored.canonical_bytes)?
                 };
-                let response = stored
-                    .nightshift_cycle
-                    .run_cycle(&input.nightshift_cycle_request, recover_cycle);
+                let response = stored.nightshift_cycle.run_cycle(
+                    &input.nightshift_cycle_request,
+                    recover_cycle,
+                    input.deadline_unix_ms,
+                );
                 match response {
                     Ok(response) => {
                         engine.record_run_observation(&run_id, &response, "active", now_unix_ms)?;
+                        engine.clear_cycle_inflight(&run_id, &cycle_request_digest)?;
                         if engine.current()?.program_counter()
                             == ProgramCounterV1::ObservationRequired
                         {
@@ -1068,8 +1089,50 @@ fn run_finite(
                 )?;
             }
             ProgramCounterV1::AuthorizationConsumed => {
-                let mut docket = docket_custody_from_profile(&profile, &input.executor_config)?;
-                engine.dispatch(&mut docket, now_unix_ms)?;
+                let mut reconciliation =
+                    docket_port_from_profile(&profile, &input.executor_config)?
+                        .with_deadline(input.deadline_unix_ms);
+                match engine.recover(&mut reconciliation, now_unix_ms) {
+                    Ok(CampaignRecoveryV1::IssuanceNotAccepted(_)) => {
+                        let mut docket =
+                            docket_custody_from_profile(&profile, &input.executor_config)?
+                                .with_deadline(input.deadline_unix_ms);
+                        if let Err(error) = engine.dispatch(&mut docket, now_unix_ms) {
+                            let status = terminal(
+                                "waiting",
+                                "docket_acceptance_indeterminate",
+                                steps,
+                                polls,
+                            );
+                            engine.record_run_observation(
+                                &run_id,
+                                &status,
+                                "waiting",
+                                now_unix_ms,
+                            )?;
+                            let _ = error;
+                            return write_exact(&status);
+                        }
+                    }
+                    Ok(CampaignRecoveryV1::Advanced(_)) => {}
+                    Ok(CampaignRecoveryV1::ExternalRevalidation(_)) => {
+                        let status =
+                            terminal("waiting", "docket_revalidation_required", steps, polls);
+                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        return write_exact(&status);
+                    }
+                    Err(error) => {
+                        let status = terminal(
+                            "waiting",
+                            "docket_reconciliation_indeterminate",
+                            steps,
+                            polls,
+                        );
+                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                        let _ = error;
+                        return write_exact(&status);
+                    }
+                }
             }
             ProgramCounterV1::Dispatched => {
                 if polls >= input.max_polls {
@@ -1077,7 +1140,8 @@ fn run_finite(
                     engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                     return write_exact(&status);
                 }
-                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?;
+                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?
+                    .with_deadline(input.deadline_unix_ms);
                 let _ = engine.recover(&mut docket, now_unix_ms)?;
                 polls = polls.saturating_add(1);
             }
@@ -1087,7 +1151,8 @@ fn run_finite(
                     engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                     return write_exact(&status);
                 }
-                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?;
+                let mut docket = docket_port_from_profile(&profile, &input.executor_config)?
+                    .with_deadline(input.deadline_unix_ms);
                 let _ = engine.recover(&mut docket, now_unix_ms)?;
                 polls = polls.saturating_add(1);
             }

@@ -9,7 +9,7 @@ use ag_primitives::{Digest, JcsDocument};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-use crate::governed_ports::{GovernedPortErrorV1, GovernedSharedAdmissionV1, run_json_program};
+use crate::governed_ports::{GovernedPortErrorV1, GovernedSharedAdmissionV1};
 
 pub const REVIEW_REQUIREMENT_SCHEMA_V1: &str = "ag.governed-loop.review-requirement/v1";
 pub const PLAN_REVIEW_SCHEMA_V1: &str = "maude.governed-plan-review/v1";
@@ -179,6 +179,7 @@ pub struct MaudePlanValidationV1 {
 pub fn validate_plan_binding(
     profile: &GovernedSharedAdmissionV1,
     binding_bytes: &[u8],
+    deadline_unix_ms: Option<u64>,
 ) -> Result<MaudePlanValidationV1, GovernedPortErrorV1> {
     let _ = profile.plan_validator.verify(true)?;
     let _ = profile.plan_validator_config.verify(false)?;
@@ -189,7 +190,7 @@ pub fn validate_plan_binding(
         .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
     let mut binding_file = tempfile::NamedTempFile::new().map_err(GovernedPortErrorV1::Io)?;
     std::io::Write::write_all(&mut binding_file, binding_bytes).map_err(GovernedPortErrorV1::Io)?;
-    let response: MaudePlanValidationV1 = run_json_program(
+    let response: MaudePlanValidationV1 = crate::governed_ports::run_json_program_until(
         &profile.plan_validator.path,
         &[
             "validate".to_owned(),
@@ -199,6 +200,7 @@ pub fn validate_plan_binding(
             binding_file.path().display().to_string(),
         ],
         &serde_json::json!({}),
+        deadline_unix_ms,
     )?;
     if response.schema != MAUDE_PLAN_VALIDATION_SCHEMA_V1 || response.result != "passed" {
         return Err(GovernedPortErrorV1::Refused(
@@ -221,24 +223,32 @@ pub fn verify_review(
     profile: &GovernedSharedAdmissionV1,
     requirement: &ReviewRequirementV1,
     input: &RecordReviewInputV1,
+    deadline_unix_ms: Option<u64>,
 ) -> Result<OwnerVerificationResponseV1, GovernedPortErrorV1> {
     input.validate_artifacts()?;
     input.review.validate(requirement)?;
     let _ = profile.review_verifier.verify(true)?;
-    let response: OwnerVerificationResponseV1 = run_json_program(
+    let verifier_config = profile.review_verifier_config.verify(false)?;
+    let verifier_config_digest = canonical_file_identity(&verifier_config)?;
+    let response: OwnerVerificationResponseV1 = crate::governed_ports::run_json_program_until(
         &profile.review_verifier.path,
-        &[],
+        &[
+            "--config".to_owned(),
+            profile.review_verifier_config.path.display().to_string(),
+        ],
         &ReviewVerificationRequestV1 {
             schema: REVIEW_VERIFICATION_REQUEST_SCHEMA_V1,
             requirement,
             review: &input.review,
             artifacts: &input.artifacts,
         },
+        deadline_unix_ms,
     )?;
     if response.schema != OWNER_VERIFICATION_RESPONSE_SCHEMA_V1
         || !response.accepted
         || response.binding_id != input.binding_id
         || response.configuration_digest != requirement.route_enrollment_digest
+        || response.configuration_digest != verifier_config_digest
     {
         return Err(GovernedPortErrorV1::Refused(
             "review verifier did not authenticate exact custody".to_owned(),
