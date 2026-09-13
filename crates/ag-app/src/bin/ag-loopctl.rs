@@ -1034,7 +1034,7 @@ fn run_finite(
                             return write_exact(&status);
                         }
                     }
-                    Err(error) => {
+                    Err(_) => {
                         let status = terminal(
                             "waiting",
                             "independent_observation_unavailable",
@@ -1042,7 +1042,6 @@ fn run_finite(
                             polls,
                         );
                         engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
-                        let _ = error;
                         return write_exact(&status);
                     }
                 }
@@ -1099,7 +1098,7 @@ fn run_finite(
                         let mut docket =
                             docket_custody_from_profile(&profile, &input.executor_config)?
                                 .with_deadline(input.deadline_unix_ms);
-                        if let Err(error) = engine.dispatch(&mut docket, now_unix_ms) {
+                        if engine.dispatch(&mut docket, now_unix_ms).is_err() {
                             let status = terminal(
                                 "waiting",
                                 "docket_acceptance_indeterminate",
@@ -1112,7 +1111,6 @@ fn run_finite(
                                 "waiting",
                                 now_unix_ms,
                             )?;
-                            let _ = error;
                             return write_exact(&status);
                         }
                     }
@@ -1123,7 +1121,7 @@ fn run_finite(
                         engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
                         return write_exact(&status);
                     }
-                    Err(error) => {
+                    Err(_) => {
                         let status = terminal(
                             "waiting",
                             "docket_reconciliation_indeterminate",
@@ -1131,7 +1129,6 @@ fn run_finite(
                             polls,
                         );
                         engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
-                        let _ = error;
                         return write_exact(&status);
                     }
                 }

@@ -1543,13 +1543,13 @@ where
             "child stdin unavailable",
         ))
     })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         GovernedPortErrorV1::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "child stdout unavailable",
         ))
     })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| {
+    let stderr = child.stderr.take().ok_or_else(|| {
         GovernedPortErrorV1::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "child stderr unavailable",

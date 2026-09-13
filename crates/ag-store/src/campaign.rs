@@ -536,6 +536,20 @@ pub struct StoredSharedReviewV1 {
     pub recorded_at_unix_ms: u64,
 }
 
+struct ExistingSharedReviewRow {
+    identity: String,
+    review_jcs: Vec<u8>,
+    artifacts_jcs: Vec<u8>,
+    verification_jcs: Vec<u8>,
+}
+
+struct SharedAdmissionRow {
+    predecessor: String,
+    binding: String,
+    binding_jcs: Vec<u8>,
+    validation_jcs: Vec<u8>,
+}
+
 /// Transactional campaign-store failures.
 #[derive(Debug, Error)]
 pub enum CampaignStoreErrorV1 {
@@ -966,21 +980,28 @@ impl CampaignStoreV1 {
         if admitted.as_deref() != Some(binding_id.as_str()) {
             return Err(CampaignStoreErrorV1::BindingMismatch);
         }
-        let existing: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)> = transaction
+        let existing: Option<ExistingSharedReviewRow> = transaction
             .query_row(
                 "SELECT review_id, review_jcs, artifacts_jcs, verification_jcs
                  FROM shared_review_events WHERE dispatch_id=?1",
                 params![dispatch_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok(ExistingSharedReviewRow {
+                        identity: row.get(0)?,
+                        review_jcs: row.get(1)?,
+                        artifacts_jcs: row.get(2)?,
+                        verification_jcs: row.get(3)?,
+                    })
+                },
             )
             .optional()?;
-        if let Some((identity, old_review, old_artifacts, old_verification)) = existing {
-            if old_review == review_jcs
-                && old_artifacts == artifacts_jcs
-                && old_verification == verification_jcs
-                && identity == review_id.as_str()
+        if let Some(existing) = existing {
+            if existing.review_jcs == review_jcs
+                && existing.artifacts_jcs == artifacts_jcs
+                && existing.verification_jcs == verification_jcs
+                && existing.identity == review_id.as_str()
             {
-                return parse_digest(&identity);
+                return parse_digest(&existing.identity);
             }
             return Err(CampaignStoreErrorV1::BindingMismatch);
         }
@@ -1450,17 +1471,24 @@ impl CampaignStoreV1 {
         if !table_exists(&self.connection, "shared_plan_admissions")? {
             return Ok(None);
         }
-        let row: Option<(String, String, Vec<u8>, Vec<u8>)> = self
+        let row: Option<SharedAdmissionRow> = self
             .connection
             .query_row(
                 "SELECT predecessor_state_digest, binding_id, binding_jcs, validation_jcs
                  FROM shared_plan_admissions
                  WHERE campaign_id=?1 AND occurrence_id=?2",
                 params![key.campaign.as_str(), key.occurrence.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok(SharedAdmissionRow {
+                        predecessor: row.get(0)?,
+                        binding: row.get(1)?,
+                        binding_jcs: row.get(2)?,
+                        validation_jcs: row.get(3)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((predecessor, binding, binding_jcs, validation_jcs)) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
         let requirement: String = self.connection.query_row(
@@ -1505,11 +1533,11 @@ impl CampaignStoreV1 {
         Ok(Some(StoredSharedAdmissionV1 {
             campaign: key.campaign.clone(),
             occurrence: key.occurrence.to_string(),
-            predecessor_state_digest: parse_digest(&predecessor)?,
-            binding_id: parse_digest(&binding)?,
+            predecessor_state_digest: parse_digest(&row.predecessor)?,
+            binding_id: parse_digest(&row.binding)?,
             requirement_digest: parse_digest(&requirement)?,
-            binding_jcs,
-            validation_jcs,
+            binding_jcs: row.binding_jcs,
+            validation_jcs: row.validation_jcs,
             reviews,
         }))
     }
