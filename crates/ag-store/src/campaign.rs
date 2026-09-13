@@ -3352,7 +3352,7 @@ fn verify_shared_runs(
             if !runs.contains(&row.0)
                 || !v2_runs.contains(&row.0)
                 || row.1 != *next
-                || tail.as_deref() != Some(row.5.as_str())
+                || tail.as_ref().map(|value| value.as_str()) != Some(row.5.as_str())
                 || row.1 >= 8
                 || v2_locators
                     .get(&row.0)

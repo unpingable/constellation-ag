@@ -869,6 +869,9 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
             .mark_shared_cycle_inflight(&run, &digest("successor-cycle"))
             .unwrap()
     );
+    store
+        .clear_shared_cycle_inflight(&run, &digest("successor-cycle"))
+        .unwrap();
     assert_eq!(
         store
             .shared_run_continuation(&run, &occurrence.to_string())
@@ -899,6 +902,33 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
         ),
         Err(CampaignStoreErrorV1::BindingMismatch)
     ));
+    let terminal = JcsDocument::canonicalize(&serde_json::json!({
+        "schema": "ag.governed-loop.run-status/v1",
+        "run_id": run,
+        "status": "terminal",
+        "reason": "finite_continuation_bound_complete",
+        "program_counter": "observation_required",
+        "steps": 7,
+        "polls": 2
+    }))
+    .unwrap();
+    store
+        .record_shared_run_observation(
+            &run,
+            successor.state_digest(),
+            terminal.as_bytes(),
+            "terminal",
+            NOW + 7,
+        )
+        .unwrap();
+    assert_eq!(
+        store.shared_run_status(&run).unwrap().as_deref(),
+        Some("terminal")
+    );
+    assert_eq!(
+        store.last_shared_run_observation(&run).unwrap().as_deref(),
+        Some(terminal.as_bytes())
+    );
     drop(store);
     let reopened = CampaignStoreV1::open(&database).unwrap();
     assert_eq!(

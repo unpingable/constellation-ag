@@ -1248,13 +1248,7 @@ fn run_finite(
                     strict_json_from_slice(&stored.canonical_bytes)?
                 };
                 let captured_request = if is_v2 {
-                    let parent = database
-                        .parent()
-                        .context("campaign database has no parent")?;
-                    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-                    file.as_file_mut().write_all(&cycle_request)?;
-                    file.as_file_mut().sync_all()?;
-                    Some(file)
+                    Some(capture_cycle_request(database, &cycle_request)?)
                 } else {
                     None
                 };
@@ -1545,6 +1539,19 @@ fn validate_run_continuation(
         bail!("cycle request substitutes the continuation plan binding");
     }
     Ok(continuation)
+}
+
+fn capture_cycle_request(
+    database: &Path,
+    request: &[u8],
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    let parent = database
+        .parent()
+        .context("campaign database has no parent")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.as_file_mut().write_all(request)?;
+    file.as_file_mut().sync_all()?;
+    Ok(file)
 }
 
 fn verify_material_pins(material: &RunOccurrenceMaterialV1) -> anyhow::Result<()> {
@@ -2138,7 +2145,7 @@ mod finite_continuation_tests {
     }
 
     #[test]
-    fn startup_refuses_wrong_new_occurrence_but_resumes_existing_successor() {
+    fn startup_selection_refuses_new_mismatch_and_selects_existing_resume() {
         let current = OccurrenceId::allocate();
         let wrong = OccurrenceId::allocate();
         assert!(v2_startup_disposition(None, Some(wrong), current).is_err());
@@ -2149,7 +2156,7 @@ mod finite_continuation_tests {
     }
 
     #[test]
-    fn terminal_status_is_owned_and_replayable_without_input_files() {
+    fn owned_terminal_status_round_trips_nonzero_counters() {
         let status = RunStatusV1 {
             schema: "ag.governed-loop.run-status/v1".to_owned(),
             run_id: Digest::hash_domain("test.run/v1", b"run"),
@@ -2163,5 +2170,17 @@ mod finite_continuation_tests {
         let decoded: RunStatusV1 = strict_json_from_slice(bytes.as_bytes()).unwrap();
         assert_eq!(decoded.status, "terminal");
         assert_eq!(decoded.steps, 7);
+    }
+
+    #[test]
+    fn captured_cycle_request_is_independent_of_source_content_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("campaign.sqlite");
+        let source = directory.path().join("cycle-request.json");
+        fs::write(&source, b"first-request").unwrap();
+        let bytes = fs::read(&source).unwrap();
+        let captured = capture_cycle_request(&database, &bytes).unwrap();
+        fs::write(source, b"replacement-request").unwrap();
+        assert_eq!(fs::read(captured.path()).unwrap(), b"first-request");
     }
 }
