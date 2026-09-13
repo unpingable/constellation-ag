@@ -482,11 +482,37 @@ struct RunOccurrenceMaterialV1 {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct RunInitialMaterialV1 {
+    occurrence: OccurrenceId,
+    plan_binding: PathBuf,
+    plan_binding_sha256: String,
+    review_input: PathBuf,
+    nightshift_cycle_request: PathBuf,
+    nightshift_cycle_request_sha256: String,
+    executor_config: PathBuf,
+}
+
+impl RunInitialMaterialV1 {
+    fn material(self) -> RunOccurrenceMaterialV1 {
+        RunOccurrenceMaterialV1 {
+            occurrence: Some(self.occurrence),
+            plan_binding: self.plan_binding,
+            plan_binding_sha256: Some(self.plan_binding_sha256),
+            review_input: self.review_input,
+            nightshift_cycle_request: self.nightshift_cycle_request,
+            nightshift_cycle_request_sha256: Some(self.nightshift_cycle_request_sha256),
+            executor_config: self.executor_config,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RunInputV2 {
     schema: String,
     campaign: CampaignId,
     runtime_profile_digest: Digest,
-    initial: RunOccurrenceMaterialV1,
+    initial: RunInitialMaterialV1,
     continuations: Vec<PathBuf>,
     max_steps: u64,
     max_polls: u64,
@@ -508,6 +534,18 @@ struct RunContinuationV1 {
     nightshift_cycle_request: PathBuf,
     nightshift_cycle_request_sha256: String,
     executor_config: PathBuf,
+}
+
+struct NormalizedRunInput {
+    campaign: CampaignId,
+    profile_digest: Digest,
+    initial: RunOccurrenceMaterialV1,
+    v1_continuation: Option<PathBuf>,
+    v2_continuations: Vec<PathBuf>,
+    max_steps: u64,
+    max_polls: u64,
+    deadline_unix_ms: u64,
+    is_v2: bool,
 }
 
 impl RunContinuationV1 {
@@ -986,9 +1024,9 @@ fn run_finite(
     let input_bytes = read_exact_input(run_input_path, 1024 * 1024)?;
     let value: serde_json::Value = strict_json_from_slice(&input_bytes)?;
     let schema = value.get("schema").and_then(|value| value.as_str());
-    let (
+    let NormalizedRunInput {
         campaign,
-        profile_input_digest,
+        profile_digest: profile_input_digest,
         initial,
         v1_continuation,
         v2_continuations,
@@ -996,7 +1034,7 @@ fn run_finite(
         max_polls,
         deadline_unix_ms,
         is_v2,
-    ) = match schema {
+    } = match schema {
         Some("ag.governed-loop.run-input/v1") => {
             let input: RunInputV1 = strict_json_from_slice(&input_bytes)?;
             let material = RunOccurrenceMaterialV1 {
@@ -1008,34 +1046,34 @@ fn run_finite(
                 nightshift_cycle_request_sha256: None,
                 executor_config: input.executor_config,
             };
-            (
-                input.campaign,
-                input.runtime_profile_digest,
-                material,
-                input.continuation_input,
-                Vec::new(),
-                input.max_steps,
-                input.max_polls,
-                input.deadline_unix_ms,
-                false,
-            )
+            NormalizedRunInput {
+                campaign: input.campaign,
+                profile_digest: input.runtime_profile_digest,
+                initial: material,
+                v1_continuation: input.continuation_input,
+                v2_continuations: Vec::new(),
+                max_steps: input.max_steps,
+                max_polls: input.max_polls,
+                deadline_unix_ms: input.deadline_unix_ms,
+                is_v2: false,
+            }
         }
         Some("ag.governed-loop.run-input/v2") => {
             let input: RunInputV2 = strict_json_from_slice(&input_bytes)?;
             if input.continuations.len() > 8 {
                 bail!("too many continuation envelopes");
             }
-            (
-                input.campaign,
-                input.runtime_profile_digest,
-                input.initial,
-                None,
-                input.continuations,
-                input.max_steps,
-                input.max_polls,
-                input.deadline_unix_ms,
-                true,
-            )
+            NormalizedRunInput {
+                campaign: input.campaign,
+                profile_digest: input.runtime_profile_digest,
+                initial: input.initial.material(),
+                v1_continuation: None,
+                v2_continuations: input.continuations,
+                max_steps: input.max_steps,
+                max_polls: input.max_polls,
+                deadline_unix_ms: input.deadline_unix_ms,
+                is_v2: true,
+            }
         }
         _ => bail!("unsupported finite run input schema"),
     };
