@@ -6,6 +6,7 @@ version = 4
 name = "ag-app"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-effect",
  "ag-kernel",
  "ag-primitives",
@@ -20,15 +21,27 @@ dependencies = [
  "nix",
  "rand",
  "ring",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_jcs",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ag-campaign"
+version = "0.1.0"
+dependencies = [
+ "ag-primitives",
+ "serde",
+ "thiserror",
  "uuid",
 ]
 
@@ -109,6 +122,7 @@ dependencies = [
 name = "ag-store"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-primitives",
  "anyhow",
  "clap",
