@@ -31,6 +31,9 @@ pub const MAUDE_PLAN_VALIDATION_SCHEMA_V1: &str = "maude.governed-plan-validatio
 pub const PERMISSION_PREFLIGHT_SCHEMA_V1: &str = "ag.governed-loop.permission-preflight/v1";
 
 /// Validates canonical JSON file bytes and returns their content identity.
+///
+/// # Errors
+/// Refuses non-canonical JSON bytes.
 pub fn canonical_file_identity(bytes: &[u8]) -> Result<Digest, GovernedPortErrorV1> {
     let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     JcsDocument::from_canonical_bytes(canonical)
@@ -56,6 +59,9 @@ pub struct ReviewRequirementV1 {
 
 impl ReviewRequirementV1 {
     /// Parses and validates canonical requirement bytes.
+    ///
+    /// # Errors
+    /// Refuses malformed, non-canonical, or unsupported requirements.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GovernedPortErrorV1> {
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
         let document = JcsDocument::from_canonical_bytes(bytes)
@@ -76,6 +82,9 @@ impl ReviewRequirementV1 {
     }
 
     /// Returns the canonical requirement identity.
+    ///
+    /// # Errors
+    /// Returns an error if canonical serialization fails.
     pub fn identity(&self) -> Result<Digest, GovernedPortErrorV1> {
         let canonical = JcsDocument::canonicalize(self)
             .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
@@ -121,6 +130,9 @@ pub struct PlanReviewV1 {
 
 impl PlanReviewV1 {
     /// Checks the review against its exact requirement.
+    ///
+    /// # Errors
+    /// Refuses mismatched identity, reviewer, or expiry coordinates.
     pub fn validate(&self, requirement: &ReviewRequirementV1) -> Result<(), GovernedPortErrorV1> {
         if self.schema != PLAN_REVIEW_SCHEMA_V1
             || self.reviewer_id != requirement.reviewer_id
@@ -168,6 +180,9 @@ pub struct RecordReviewInputV1 {
 
 impl RecordReviewInputV1 {
     /// Validates exact bindings and bounded artifact identities.
+    ///
+    /// # Errors
+    /// Refuses malformed base64, oversized artifacts, or identity mismatch.
     pub fn validate_artifacts(&self) -> Result<(), GovernedPortErrorV1> {
         if self.schema != REVIEW_RECORD_INPUT_SCHEMA_V1
             || self.binding_id != self.review.binding_id
@@ -233,6 +248,9 @@ pub struct MaudePlanValidationV1 {
 }
 
 /// Invokes the deployment-pinned Maude validator with an exact parsed binding.
+///
+/// # Errors
+/// Refuses deployment drift, invalid binding bytes, timeout, or validator refusal.
 pub fn validate_plan_binding(
     profile: &GovernedSharedAdmissionV1,
     binding_bytes: &[u8],
@@ -277,6 +295,9 @@ struct ReviewVerificationRequestV1<'a> {
 }
 
 /// Authenticates an accepted or rejected review and its exact custody.
+///
+/// # Errors
+/// Refuses invalid artifacts, deployment drift, timeout, or verifier mismatch.
 pub fn verify_review(
     profile: &GovernedSharedAdmissionV1,
     requirement: &ReviewRequirementV1,

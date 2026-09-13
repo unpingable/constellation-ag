@@ -64,6 +64,8 @@ pub struct VerifiedCampaignStartBasisV1 {
 }
 
 impl VerifiedCampaignStartBasisV1 {
+    /// # Errors
+    /// Refuses an invalid or non-canonical start basis.
     pub fn seal(mut self) -> Result<Self, LifecycleErrorV1> {
         self.schema = VERIFIED_CAMPAIGN_START_BASIS_SCHEMA_V1.into();
         self.basis_id.clear();
@@ -72,6 +74,8 @@ impl VerifiedCampaignStartBasisV1 {
         Ok(self)
     }
 
+    /// # Errors
+    /// Refuses inconsistent start identities or coordinates.
     pub fn validate(&self) -> Result<(), LifecycleErrorV1> {
         let mut preimage = self.clone();
         preimage.basis_id.clear();
@@ -157,6 +161,8 @@ pub struct ProductionCampaignLifecycleV1 {
 }
 
 impl ProductionCampaignLifecycleV1 {
+    /// # Errors
+    /// Refuses a stage contract inconsistent with the campaign packet.
     pub fn seal(mut self, packet: &CampaignPacketV1) -> Result<Self, LifecycleErrorV1> {
         self.schema = PRODUCTION_LIFECYCLE_SCHEMA_V1.into();
         self.lifecycle_id.clear();
@@ -165,6 +171,8 @@ impl ProductionCampaignLifecycleV1 {
         Ok(self)
     }
 
+    /// # Errors
+    /// Refuses invalid stage ordering, templates, or packet bindings.
     pub fn validate(&self, packet: &CampaignPacketV1) -> Result<(), LifecycleErrorV1> {
         packet.validate().map_err(LifecycleErrorV1::Packet)?;
         self.verified_start.validate()?;
@@ -243,6 +251,8 @@ impl ProductionCampaignLifecycleV1 {
         Ok(())
     }
 
+    /// # Errors
+    /// Refuses any mismatch in stage, work, observation, standing, or issuance evidence.
     pub fn validate_issuance<'a>(
         &self,
         ordinal: u32,
@@ -323,6 +333,11 @@ impl ProductionCampaignLifecycleV1 {
         Ok(issuance)
     }
 
+    /// # Errors
+    /// Refuses a terminal observation not bound to the third stage.
+    ///
+    /// # Panics
+    /// Panics only if the statically validated three-stage contract is internally absent.
     pub fn validate_terminal(
         &self,
         snapshot: &OccurrenceSnapshotV1,
@@ -443,7 +458,7 @@ pub enum ProductionLifecycleFactV1 {
         occurrence: String,
     },
     HumanRequired {
-        receipt: HumanRequiredReceiptV1,
+        receipt: Box<HumanRequiredReceiptV1>,
     },
 }
 
@@ -457,6 +472,8 @@ pub struct ProductionLifecycleEventV1 {
 }
 
 impl ProductionLifecycleEventV1 {
+    /// # Errors
+    /// Returns an error if the event cannot be canonically identified.
     pub fn seal(
         lifecycle_id: String,
         fact: ProductionLifecycleFactV1,
@@ -478,6 +495,8 @@ pub struct ProductionLifecycleJournalV1 {
 }
 
 impl ProductionLifecycleJournalV1 {
+    /// # Errors
+    /// Refuses an invalid contract or an existing/inaccessible journal.
     pub fn create(
         path: &Path,
         contract: &ProductionCampaignLifecycleV1,
@@ -519,6 +538,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses a missing, malformed, or replay-invalid journal.
     pub fn open(path: &Path) -> Result<Self, LifecycleErrorV1> {
         let connection = Connection::open(path)?;
         let bytes: Vec<u8> = connection.query_row(
@@ -534,6 +555,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses a start basis inconsistent with the journal contract.
     pub fn record_verified_start(
         &self,
         basis: &VerifiedCampaignStartBasisV1,
@@ -547,6 +570,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses issuance evidence inconsistent with the exact stage.
     pub fn record_issuance(
         &self,
         ordinal: u32,
@@ -563,6 +588,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses custody evidence inconsistent with the exact issuance.
     pub fn record_docket_custody(
         &self,
         ordinal: u32,
@@ -577,6 +604,8 @@ impl ProductionLifecycleJournalV1 {
         self.append(custody_fact(ordinal, custody))
     }
 
+    /// # Errors
+    /// Refuses settlement evidence inconsistent with the exact attempt.
     pub fn record_settlement(
         &self,
         ordinal: u32,
@@ -591,6 +620,8 @@ impl ProductionLifecycleJournalV1 {
         self.append(settlement_fact(ordinal, settlement))
     }
 
+    /// # Errors
+    /// Refuses stale or mismatched reservation evidence.
     pub fn record_reservation_current(
         &self,
         ordinal: u32,
@@ -641,6 +672,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses a continuation outside the contract sequence.
     pub fn record_continuation_opened(
         &self,
         ordinal: u32,
@@ -665,6 +698,8 @@ impl ProductionLifecycleJournalV1 {
         })
     }
 
+    /// # Errors
+    /// Refuses a terminal receipt inconsistent with the exact third stage.
     pub fn record_human_required(
         &self,
         snapshot: &OccurrenceSnapshotV1,
@@ -675,7 +710,7 @@ impl ProductionLifecycleJournalV1 {
             .contract
             .validate_terminal(snapshot, resolution, now_unix_ms)?;
         let inserted = self.append(ProductionLifecycleFactV1::HumanRequired {
-            receipt: receipt.clone(),
+            receipt: Box::new(receipt.clone()),
         })?;
         Ok((inserted, receipt))
     }
@@ -713,6 +748,8 @@ impl ProductionLifecycleJournalV1 {
         Ok(true)
     }
 
+    /// # Errors
+    /// Refuses malformed or replay-invalid retained events.
     pub fn events(&self) -> Result<Vec<ProductionLifecycleEventV1>, LifecycleErrorV1> {
         let connection = Connection::open(&self.path)?;
         let mut statement =
@@ -725,6 +762,7 @@ impl ProductionLifecycleJournalV1 {
         .collect()
     }
 
+    #[must_use]
     pub const fn contract(&self) -> &ProductionCampaignLifecycleV1 {
         &self.contract
     }
@@ -823,6 +861,7 @@ fn domain_hash<T: Serialize>(domain: &str, value: &T) -> Result<String, Lifecycl
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+#[must_use]
 pub fn custody_fact(ordinal: u32, custody: &DocketCustodyV1) -> ProductionLifecycleFactV1 {
     ProductionLifecycleFactV1::DocketCustody {
         ordinal,
@@ -830,6 +869,7 @@ pub fn custody_fact(ordinal: u32, custody: &DocketCustodyV1) -> ProductionLifecy
     }
 }
 
+#[must_use]
 pub fn settlement_fact(ordinal: u32, settlement: &DocketSettlementV1) -> ProductionLifecycleFactV1 {
     ProductionLifecycleFactV1::Settlement {
         ordinal,

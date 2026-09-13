@@ -104,12 +104,16 @@ pub struct ExternalEvidenceReservationV1 {
 }
 
 impl ExternalEvidenceReservationV1 {
+    /// # Errors
+    /// Returns an error when canonical identity construction fails.
     pub fn computed_id(&self) -> Result<String, String> {
         let mut preimage = self.clone();
         preimage.reservation_id.clear();
         domain_hash("ag.external-evidence-reservation/v1", &preimage)
     }
 
+    /// # Errors
+    /// Refuses a campaign packet with invalid closed coordinates.
     pub fn seal(mut self) -> Result<Self, String> {
         self.schema = EXTERNAL_EVIDENCE_RESERVATION_SCHEMA_V1.into();
         self.reservation_id.clear();
@@ -118,6 +122,8 @@ impl ExternalEvidenceReservationV1 {
         Ok(self)
     }
 
+    /// # Errors
+    /// Refuses an invalid identity, stage sequence, or reservation binding.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != EXTERNAL_EVIDENCE_RESERVATION_SCHEMA_V1
             || self.reservation_id != self.computed_id()?
@@ -199,6 +205,8 @@ pub struct CampaignStageV1 {
 }
 
 impl CampaignStageV1 {
+    /// # Errors
+    /// Refuses a stage not exactly bound to the campaign.
     pub fn validate(&self, campaign_id: &str) -> Result<(), String> {
         self.reservation.validate()?;
         if self.stage_id != self.reservation.stage_id
@@ -254,12 +262,16 @@ pub struct CampaignPacketV1 {
 }
 
 impl CampaignPacketV1 {
+    /// # Errors
+    /// Returns an error when canonical identity construction fails.
     pub fn computed_id(&self) -> Result<String, String> {
         let mut preimage = self.clone();
         preimage.packet_id.clear();
         domain_hash("ag.governed-campaign.packet/v1", &preimage)
     }
 
+    /// # Errors
+    /// Refuses an invalid reservation or predecessor law.
     pub fn seal(mut self) -> Result<Self, String> {
         self.schema = CAMPAIGN_PACKET_SCHEMA_V1.into();
         self.packet_id.clear();
@@ -268,6 +280,8 @@ impl CampaignPacketV1 {
         Ok(self)
     }
 
+    /// # Errors
+    /// Refuses inconsistent reservation identity or coordinates.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != CAMPAIGN_PACKET_SCHEMA_V1
             || self.packet_id != self.computed_id()?
@@ -327,6 +341,9 @@ impl CampaignPacketV1 {
 
 /// Materialize one exact W5 runtime plan from a frozen predecessor-coordinate
 /// template. This is construction, not qualification of a prior realization.
+///
+/// # Errors
+/// Refuses malformed templates or predecessor/reservation substitution.
 pub fn materialize_executor_plan_template(
     template: &serde_json::Value,
     reservation: &ExternalEvidenceReservationV1,
@@ -337,10 +354,10 @@ pub fn materialize_executor_plan_template(
     if !predecessor_head.validate() || !predecessor_tree.validate() {
         return Err("malformed realized predecessor identity".into());
     }
-    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor {
-        if head != &predecessor_head || tree != &predecessor_tree {
-            return Err("initial predecessor realization mismatch".into());
-        }
+    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor
+        && (head != &predecessor_head || tree != &predecessor_tree)
+    {
+        return Err("initial predecessor realization mismatch".into());
     }
     validate_predecessor_template(
         template,
@@ -368,6 +385,8 @@ pub fn materialize_executor_plan_template(
 /// Computes the exact identity W5 reports for a materialized executor plan.
 ///
 /// This remains unknown while a predecessor-coordinate template is frozen.
+/// # Errors
+/// Refuses a plan that is not a closed canonical executor-plan object.
 pub fn executor_plan_identity(plan: &serde_json::Value) -> Result<String, String> {
     if plan.get("schema").and_then(serde_json::Value::as_str)
         != Some("campaign-driver-ng.gcl-v1-worker-vm-plan/v2")
@@ -378,6 +397,8 @@ pub fn executor_plan_identity(plan: &serde_json::Value) -> Result<String, String
     Ok(AgDigest::hash_domain("ag-effectd.docket-executor-plan/v2", bytes.as_bytes()).to_string())
 }
 
+/// # Errors
+/// Refuses a malformed template or inconsistent reservation substitution.
 pub fn materialize_template(
     template: &serde_json::Value,
     reservation: &str,
@@ -399,12 +420,17 @@ pub fn materialize_template(
     Ok(value)
 }
 
+/// # Errors
+/// Returns an error when canonical serialization fails.
 pub fn canonical_sha256(value: &serde_json::Value) -> Result<String, String> {
     let bytes = serde_jcs::to_vec(value).map_err(|error| error.to_string())?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 /// Materialize an exact NQ profile after packet sealing and predecessor
 /// realization. The template and packet remain unchanged.
+///
+/// # Errors
+/// Refuses malformed templates or inconsistent packet/predecessor bindings.
 pub fn materialize_nq_profile_template(
     template: &serde_json::Value,
     reservation: &ExternalEvidenceReservationV1,
@@ -419,10 +445,10 @@ pub fn materialize_nq_profile_template(
     {
         return Err("malformed NQ template coordinate".into());
     }
-    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor {
-        if head != &predecessor_head || tree != &predecessor_tree {
-            return Err("initial NQ predecessor realization mismatch".into());
-        }
+    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor
+        && (head != &predecessor_head || tree != &predecessor_tree)
+    {
+        return Err("initial NQ predecessor realization mismatch".into());
     }
     validate_predecessor_template(
         template,
