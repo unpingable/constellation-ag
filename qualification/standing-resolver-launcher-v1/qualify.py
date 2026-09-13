@@ -9,6 +9,8 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 
 
 def canonical(value):
@@ -92,9 +94,54 @@ def main():
                                  timeout=5)
         assert refused.returncode != 0
         assert b"digest mismatch" in refused.stderr
+
+        # A writer racing the pathname cannot alter an image after it has been
+        # copied and sealed. Each attempt must either refuse a mixed/changed
+        # capture or return the authentic resolver's complete answer.
+        original = resolver.read_bytes()
+        concurrent = root / "concurrent-resolver"
+        concurrent.write_bytes(original)
+        concurrent.chmod(0o700)
+        value = json.loads(enrollment.read_bytes())
+        value["resolver_program"] = str(concurrent)
+        value["resolver_sha256"] = sha(original)
+        racing_enrollment = root / "racing-enrollment.json"
+        racing_launcher = root / "racing-launcher"
+        racing_manifest = root / "racing-manifest.json"
+        racing_enrollment.write_bytes(canonical(value))
+        subprocess.run([python, generator, "--enrollment", racing_enrollment,
+                        "--launcher", racing_launcher, "--manifest", racing_manifest],
+                       check=True, timeout=5)
+        write(store, {"schema": "ag.governed-loop.standing-mandate-store/v1",
+                      "mandates": [mandate("active", 3000)]})
+        stop = threading.Event()
+        def mutate():
+            changed = original + b"x"
+            while not stop.is_set():
+                concurrent.write_bytes(changed)
+                concurrent.write_bytes(original)
+                time.sleep(0.002)
+        writer = threading.Thread(target=mutate)
+        writer.start()
+        successes = 0
+        try:
+            for _ in range(20):
+                outcome = subprocess.run([racing_launcher], input=canonical(request(1000)),
+                                         capture_output=True, timeout=5)
+                if outcome.returncode == 0:
+                    assert json.loads(outcome.stdout)["status"] == "current"
+                    successes += 1
+                else:
+                    assert b"digest mismatch" in outcome.stderr
+        finally:
+            stop.set()
+            writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert successes > 0
     print(canonical({"schema": "ag.standing-launcher-qualification/v1", "result": "passed",
                      "cases": ["absent", "current", "revoked", "expired",
-                               "mutable_store_reread", "resolver_content_mutation_refused"]}).decode())
+                               "mutable_store_reread", "resolver_content_mutation_refused",
+                               "concurrent_content_capture"]}).decode())
 
 
 if __name__ == "__main__":

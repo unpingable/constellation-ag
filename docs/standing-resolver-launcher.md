@@ -12,13 +12,15 @@ The enrollment is closed canonical JSON schema
 absolute. The generated launcher and manifest are created exclusively.
 
 At every invocation the launcher opens the configured resolver with
-`O_NOFOLLOW`, validates the opened regular executable's SHA-256, makes that
-descriptor inheritable, and executes `/proc/self/fd/FD` with only the three
-fixed options. It accepts no argv and passes an empty environment. The
+`O_NOFOLLOW`, captures at most 512 MiB into a new `memfd`, validates the
+captured bytes' SHA-256, applies the write/shrink/grow/seal seals, closes the
+pathname-backed descriptor, and executes `/proc/self/fd/FD` from that sealed
+image with only the three fixed options. It accepts no argv and passes an empty environment. The
 mandate-store pathname remains mutable authority state and is deliberately not
 hashed; the canonical resolver rereads it for each request.
 
-The launcher uses an absolute Python shebang. Enrollment records the exact
+The launcher uses an absolute Python shebang with isolated `-I` startup.
+Enrollment records the exact
 interpreter hash, and deployment must verify it before AG profile sealing.
 Runtime relies on the deployed interpreter and its standard library remaining
 within the deployment trust boundary; the launcher itself does not recursively
