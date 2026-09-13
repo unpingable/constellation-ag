@@ -24,6 +24,11 @@ On restart, AG selects successor material only from that retained envelope. A
 missing next file returns `continuation_input_required`; acquiring a fresh
 observation and preparing that file remain external inputs. Exhausting the
 declared sequence returns terminal `finite_continuation_bound_complete`.
-Version 1 parsing, identity, and its single continuation behavior are unchanged.
+The declared continuation count may not exceed the run's step bound. Version 1
+parsing, identity, and its single continuation behavior are unchanged.
 An older schema-V2 database that predates the additive continuation table stays
 readable and replayable, but refuses `run-input/v2` before claiming a run.
+
+The review record and Docket executor configuration remain protected by their
+existing typed admission gates and deployment permission boundary; V2 does not
+claim byte capture for those later-mutating inputs.

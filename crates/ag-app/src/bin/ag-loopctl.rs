@@ -565,13 +565,34 @@ impl RunContinuationV1 {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunStatusV1 {
-    schema: &'static str,
+    schema: String,
     run_id: Digest,
-    status: &'static str,
-    reason: &'static str,
+    status: String,
+    reason: String,
     program_counter: ProgramCounterV1,
     steps: u64,
     polls: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V2StartupDisposition {
+    ReplayTerminal,
+    ValidateInitial,
+    ResumeActive,
+}
+
+fn v2_startup_disposition(
+    prior_status: Option<&str>,
+    declared_initial: Option<OccurrenceId>,
+    current: OccurrenceId,
+) -> anyhow::Result<V2StartupDisposition> {
+    match prior_status {
+        Some("terminal") => Ok(V2StartupDisposition::ReplayTerminal),
+        Some("active" | "waiting") => Ok(V2StartupDisposition::ResumeActive),
+        None if declared_initial == Some(current) => Ok(V2StartupDisposition::ValidateInitial),
+        None => bail!("new V2 run initial occurrence differs from the current campaign occurrence"),
+        Some(_) => bail!("V2 run has an unsupported durable lifecycle status"),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1060,7 +1081,9 @@ fn run_finite(
         }
         Some("ag.governed-loop.run-input/v2") => {
             let input: RunInputV2 = strict_json_from_slice(&input_bytes)?;
-            if input.continuations.len() > 8 {
+            if input.continuations.len() > 8
+                || u64::try_from(input.continuations.len())? > input.max_steps
+            {
                 bail!("too many continuation envelopes");
             }
             NormalizedRunInput {
@@ -1104,7 +1127,39 @@ fn run_finite(
     {
         bail!("run input differs from protected campaign genesis");
     }
-    if is_v2 {
+    let prospective_run_id = Digest::hash_domain(
+        if is_v2 {
+            "ag.governed-loop.run-input/v2"
+        } else {
+            "ag.governed-loop.run-input/v1"
+        },
+        canonical.as_bytes(),
+    );
+    let prior_status = if is_v2 {
+        engine.run_status(&prospective_run_id)?
+    } else {
+        None
+    };
+    let startup = is_v2
+        .then(|| {
+            v2_startup_disposition(
+                prior_status.as_deref(),
+                initial.occurrence,
+                first_current.key().occurrence,
+            )
+        })
+        .transpose()?;
+    if startup == Some(V2StartupDisposition::ReplayTerminal) {
+        let status = engine
+            .terminal_run_observation(&prospective_run_id)?
+            .context("terminal V2 run lacks its retained terminal observation")?;
+        let status: RunStatusV1 = strict_json_from_slice(&status)?;
+        if status.run_id != prospective_run_id || status.status != "terminal" {
+            bail!("retained terminal observation differs from its V2 run identity");
+        }
+        return write_exact(&status);
+    }
+    if startup == Some(V2StartupDisposition::ValidateInitial) {
         validate_material_binding(
             &initial,
             &campaign,
@@ -1117,10 +1172,6 @@ fn run_finite(
     } else {
         engine.begin_run(canonical.as_bytes(), clock()?)?
     };
-    if let Some(status) = engine.terminal_run_observation(&run_id)? {
-        let status: RunStatusV1 = strict_json_from_slice(&status)?;
-        return write_exact(&status);
-    }
     let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
     let controlling_review = profile
         .controlling_review
@@ -1156,11 +1207,11 @@ fn run_finite(
         } else {
             None
         };
-        let terminal = |status, reason, steps, polls| RunStatusV1 {
-            schema: "ag.governed-loop.run-status/v1",
+        let terminal = |status: &str, reason: &str, steps, polls| RunStatusV1 {
+            schema: "ag.governed-loop.run-status/v1".to_owned(),
             run_id: run_id.clone(),
-            status,
-            reason,
+            status: status.to_owned(),
+            reason: reason.to_owned(),
             program_counter: current.program_counter(),
             steps,
             polls,
@@ -2084,5 +2135,33 @@ mod finite_continuation_tests {
             executor_config: directory.path().join("executor.json"),
         };
         assert!(verify_material_pins(&material).is_err());
+    }
+
+    #[test]
+    fn startup_refuses_wrong_new_occurrence_but_resumes_existing_successor() {
+        let current = OccurrenceId::allocate();
+        let wrong = OccurrenceId::allocate();
+        assert!(v2_startup_disposition(None, Some(wrong), current).is_err());
+        assert_eq!(
+            v2_startup_disposition(Some("waiting"), Some(wrong), current).unwrap(),
+            V2StartupDisposition::ResumeActive
+        );
+    }
+
+    #[test]
+    fn terminal_status_is_owned_and_replayable_without_input_files() {
+        let status = RunStatusV1 {
+            schema: "ag.governed-loop.run-status/v1".to_owned(),
+            run_id: Digest::hash_domain("test.run/v1", b"run"),
+            status: "terminal".to_owned(),
+            reason: "finite_continuation_bound_complete".to_owned(),
+            program_counter: ProgramCounterV1::SettledObservationRequired,
+            steps: 7,
+            polls: 2,
+        };
+        let bytes = JcsDocument::canonicalize(&status).unwrap();
+        let decoded: RunStatusV1 = strict_json_from_slice(bytes.as_bytes()).unwrap();
+        assert_eq!(decoded.status, "terminal");
+        assert_eq!(decoded.steps, 7);
     }
 }

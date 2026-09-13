@@ -1126,6 +1126,11 @@ impl CampaignEngineV1 {
             .map_err(Into::into)
     }
 
+    /// Returns the durable lifecycle status without claiming or resuming a run.
+    pub fn run_status(&self, run_id: &Digest) -> Result<Option<String>, CampaignEngineErrorV1> {
+        self.store.shared_run_status(run_id).map_err(Into::into)
+    }
+
     /// Retains a run observation without changing campaign state.
     pub fn record_run_observation<T: Serialize>(
         &mut self,

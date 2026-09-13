@@ -788,7 +788,8 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
         "schema": "ag.governed-loop.run-input/v2",
         "campaign": campaign(),
         "initial": { "occurrence": settled.key().occurrence },
-        "continuations": ["/campaign/continuation-1.json"]
+        "continuations": ["/campaign/continuation-1.json"],
+        "max_steps": 8
     }))
     .unwrap();
     let run = store
@@ -932,7 +933,8 @@ fn legacy_store_without_continuation_table_refuses_v2_before_begin() {
     let input = JcsDocument::canonicalize(&serde_json::json!({
         "schema": "ag.governed-loop.run-input/v2",
         "initial": { "occurrence": start.key().occurrence },
-        "continuations": []
+        "continuations": [],
+        "max_steps": 1
     }))
     .unwrap();
     assert!(matches!(

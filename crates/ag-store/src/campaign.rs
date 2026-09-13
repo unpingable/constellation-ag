@@ -3226,6 +3226,20 @@ fn verify_shared_runs(
                     "V2 run exceeds its continuation bound".to_owned(),
                 ));
             }
+            let max_steps = input
+                .get("max_steps")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    CampaignStoreErrorV1::Corrupt("V2 run lacks its finite step bound".to_owned())
+                })?;
+            if u64::try_from(locators.len())
+                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?
+                > max_steps
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "V2 continuation sequence exceeds its step bound".to_owned(),
+                ));
+            }
             let locators = locators
                 .iter()
                 .map(|locator| {
