@@ -8,6 +8,9 @@ occurrence and its exact plan binding, review input, sealed Nightshift request,
 and Docket executor configuration. V2 material pins the literal plan-binding
 and sealed-request bytes with lowercase `sha256:` identities, so pathname
 replacement or content mutation fails closed before the corresponding port use.
+AG passes the already-checked sealed-request bytes through an exclusive
+campaign-local temporary file for that bounded Nightshift call; it does not
+reread the configured request pathname between validation and invocation.
 
 A continuation file uses `ag.governed-loop.run-continuation/v1`. It binds the
 campaign, predecessor occurrence and work, successor occurrence and work, and
@@ -22,3 +25,5 @@ missing next file returns `continuation_input_required`; acquiring a fresh
 observation and preparing that file remain external inputs. Exhausting the
 declared sequence returns terminal `finite_continuation_bound_complete`.
 Version 1 parsing, identity, and its single continuation behavior are unchanged.
+An older schema-V2 database that predates the additive continuation table stays
+readable and replayable, but refuses `run-input/v2` before claiming a run.

@@ -415,7 +415,7 @@ const RUNTIME_PROFILE_SEAL_RECEIPT_SCHEMA_V1: &str =
     "ag.governed-loop.runtime-profile-seal-receipt/v1";
 const OPERATIONAL_SNAPSHOT_SCHEMA_V1: &str = "ag.governed-loop.operational-snapshot/v1";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeProfileSealReceiptV1 {
     schema: &'static str,
@@ -562,7 +562,7 @@ impl RunContinuationV1 {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RunStatusV1 {
     schema: &'static str,
@@ -1104,11 +1104,23 @@ fn run_finite(
     {
         bail!("run input differs from protected campaign genesis");
     }
+    if is_v2 {
+        validate_material_binding(
+            &initial,
+            &campaign,
+            first_current.key().occurrence,
+            first_current.state().meta().expected_work(),
+        )?;
+    }
     let run_id = if is_v2 {
         engine.begin_run_v2(canonical.as_bytes(), clock()?)?
     } else {
         engine.begin_run(canonical.as_bytes(), clock()?)?
     };
+    if let Some(status) = engine.terminal_run_observation(&run_id)? {
+        let status: RunStatusV1 = strict_json_from_slice(&status)?;
+        return write_exact(&status);
+    }
     let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
     let controlling_review = profile
         .controlling_review
@@ -1134,9 +1146,16 @@ fn run_finite(
             let continuation: RunContinuationV1 = strict_json_from_slice(&retained)?;
             continuation.material()
         };
-        if is_v2 {
-            verify_material_pins(&material)?;
-        }
+        let captured_cycle_request = if is_v2 {
+            Some(validate_material_binding(
+                &material,
+                &campaign,
+                current.key().occurrence,
+                current.state().meta().expected_work(),
+            )?)
+        } else {
+            None
+        };
         let terminal = |status, reason, steps, polls| RunStatusV1 {
             schema: "ag.governed-loop.run-status/v1",
             run_id: run_id.clone(),
@@ -1158,8 +1177,10 @@ fn run_finite(
         }
         match current.program_counter() {
             ProgramCounterV1::ObservationRequired => {
-                let cycle_request =
-                    read_exact_input(&material.nightshift_cycle_request, 16 * 1024 * 1024)?;
+                let cycle_request = match captured_cycle_request {
+                    Some(bytes) => bytes,
+                    None => read_exact_input(&material.nightshift_cycle_request, 16 * 1024 * 1024)?,
+                };
                 let cycle_request_digest = Digest::hash_domain(
                     "ag.governed-loop.nightshift-cycle-request/v1",
                     &cycle_request,
@@ -1175,8 +1196,23 @@ fn run_finite(
                         .context("protected profile missing")?;
                     strict_json_from_slice(&stored.canonical_bytes)?
                 };
+                let captured_request = if is_v2 {
+                    let parent = database
+                        .parent()
+                        .context("campaign database has no parent")?;
+                    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                    file.as_file_mut().write_all(&cycle_request)?;
+                    file.as_file_mut().sync_all()?;
+                    Some(file)
+                } else {
+                    None
+                };
+                let cycle_request_path = captured_request.as_ref().map_or_else(
+                    || material.nightshift_cycle_request.as_path(),
+                    tempfile::NamedTempFile::path,
+                );
                 let response = stored.nightshift_cycle.run_cycle(
-                    &material.nightshift_cycle_request,
+                    cycle_request_path,
                     recover_cycle,
                     deadline_unix_ms,
                 );
@@ -1395,6 +1431,7 @@ fn validate_run_continuation(
         bail!("continuation envelope does not bind the current occurrence");
     }
     let binding_bytes = read_exact_input(&continuation.plan_binding, 16 * 1024 * 1024)?;
+    require_sha256(&binding_bytes, &continuation.plan_binding_sha256)?;
     JcsDocument::from_canonical_bytes(&binding_bytes)?;
     let binding: serde_json::Value = strict_json_from_slice(&binding_bytes)?;
     let successor_occurrence = continuation.occurrence.to_string();
@@ -1411,6 +1448,10 @@ fn validate_run_continuation(
         bail!("continuation plan binding differs from the successor boundary");
     }
     let request_bytes = read_exact_input(&continuation.nightshift_cycle_request, 16 * 1024 * 1024)?;
+    require_sha256(
+        &request_bytes,
+        &continuation.nightshift_cycle_request_sha256,
+    )?;
     JcsDocument::from_canonical_bytes(&request_bytes)?;
     let request: serde_json::Value = strict_json_from_slice(&request_bytes)?;
     let proposal = request
@@ -1474,6 +1515,87 @@ fn verify_material_pins(material: &RunOccurrenceMaterialV1) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+fn require_sha256(bytes: &[u8], expected: &str) -> anyhow::Result<()> {
+    let actual = format!("sha256:{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        bail!("V2 run material content differs from its retained pin");
+    }
+    Ok(())
+}
+
+fn validate_material_binding(
+    material: &RunOccurrenceMaterialV1,
+    campaign: &CampaignId,
+    occurrence: OccurrenceId,
+    expected_work: &Digest,
+) -> anyhow::Result<Vec<u8>> {
+    verify_material_pins(material)?;
+    let binding_bytes = read_exact_input(&material.plan_binding, 16 * 1024 * 1024)?;
+    require_sha256(
+        &binding_bytes,
+        material
+            .plan_binding_sha256
+            .as_deref()
+            .context("missing binding pin")?,
+    )?;
+    JcsDocument::from_canonical_bytes(&binding_bytes)?;
+    let binding: serde_json::Value = strict_json_from_slice(&binding_bytes)?;
+    let occurrence = occurrence.to_string();
+    if binding.get("schema").and_then(serde_json::Value::as_str)
+        != Some("maude.governed-plan-binding/v1")
+        || binding.get("campaign").and_then(serde_json::Value::as_str) != Some(campaign.as_str())
+        || binding
+            .get("occurrence")
+            .and_then(serde_json::Value::as_str)
+            != Some(occurrence.as_str())
+        || binding.get("work").and_then(serde_json::Value::as_str) != Some(expected_work.as_str())
+    {
+        bail!("V2 run plan binding differs from its occurrence boundary");
+    }
+    let request_bytes = read_exact_input(&material.nightshift_cycle_request, 16 * 1024 * 1024)?;
+    require_sha256(
+        &request_bytes,
+        material
+            .nightshift_cycle_request_sha256
+            .as_deref()
+            .context("missing cycle-request pin")?,
+    )?;
+    JcsDocument::from_canonical_bytes(&request_bytes)?;
+    let request: serde_json::Value = strict_json_from_slice(&request_bytes)?;
+    let proposal = request
+        .get("proposal")
+        .context("cycle request has no proposal")?;
+    let transport = request
+        .get("reviewed_plan_binding")
+        .context("cycle request has no reviewed plan binding")?;
+    let encoded = transport
+        .get("binding_base64")
+        .and_then(serde_json::Value::as_str)
+        .context("cycle request plan binding is absent")?;
+    let transported = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    let binding_digest = format!("sha256:{:x}", Sha256::digest(&transported));
+    if proposal
+        .get("campaign_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(campaign.as_str())
+        || proposal
+            .get("occurrence_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(occurrence.as_str())
+        || transport.get("schema").and_then(serde_json::Value::as_str)
+            != Some("nightshift.reviewed-plan-binding-transport/v1")
+        || base64::engine::general_purpose::STANDARD.encode(&transported) != encoded
+        || transported != binding_bytes
+        || transport
+            .get("binding_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(binding_digest.as_str())
+    {
+        bail!("V2 cycle request differs from its plan/occurrence boundary");
+    }
+    Ok(request_bytes)
 }
 
 fn docket_custody_from_profile(

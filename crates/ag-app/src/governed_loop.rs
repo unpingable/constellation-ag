@@ -1113,6 +1113,19 @@ impl CampaignEngineV1 {
             .map_err(Into::into)
     }
 
+    /// Returns the retained terminal observation for response-loss replay.
+    pub fn terminal_run_observation(
+        &self,
+        run_id: &Digest,
+    ) -> Result<Option<Vec<u8>>, CampaignEngineErrorV1> {
+        if self.store.shared_run_status(run_id)?.as_deref() != Some("terminal") {
+            return Ok(None);
+        }
+        self.store
+            .last_shared_run_observation(run_id)
+            .map_err(Into::into)
+    }
+
     /// Retains a run observation without changing campaign state.
     pub fn record_run_observation<T: Serialize>(
         &mut self,

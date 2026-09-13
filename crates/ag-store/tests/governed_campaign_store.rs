@@ -787,11 +787,21 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
     let run_input = JcsDocument::canonicalize(&serde_json::json!({
         "schema": "ag.governed-loop.run-input/v2",
         "campaign": campaign(),
-        "initial": { "occurrence": settled.key().occurrence }
+        "initial": { "occurrence": settled.key().occurrence },
+        "continuations": ["/campaign/continuation-1.json"]
     }))
     .unwrap();
     let run = store
         .begin_shared_run_v2(&profile_digest, run_input.as_bytes(), NOW + 3)
+        .unwrap();
+    let first_cycle = digest("first-cycle");
+    assert!(
+        !store
+            .mark_shared_cycle_inflight(&run, &first_cycle)
+            .unwrap()
+    );
+    store
+        .clear_shared_cycle_inflight(&run, &first_cycle)
         .unwrap();
     let occurrence = OccurrenceId::allocate();
     let expected_work = digest("successor-work");
@@ -853,6 +863,11 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
         )
         .unwrap();
     assert_eq!(store.shared_run_continuation_count(&run).unwrap(), 1);
+    assert!(
+        !store
+            .mark_shared_cycle_inflight(&run, &digest("successor-cycle"))
+            .unwrap()
+    );
     assert_eq!(
         store
             .shared_run_continuation(&run, &occurrence.to_string())
@@ -890,4 +905,39 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
         *successor.state_digest()
     );
     assert_eq!(reopened.shared_run_continuation_count(&run).unwrap(), 1);
+}
+
+#[test]
+fn legacy_store_without_continuation_table_refuses_v2_before_begin() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let profile = br#"{"schema":"test.profile/v1"}"#;
+    let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile);
+    drop(
+        CampaignStoreV1::create_with_runtime_profile(
+            &database,
+            &start,
+            Some(("test.profile/v1", profile)),
+            NOW,
+        )
+        .unwrap(),
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute("DROP TABLE shared_run_continuations", [])
+        .unwrap();
+    drop(connection);
+    let mut store = CampaignStoreV1::open(&database).unwrap();
+    let input = JcsDocument::canonicalize(&serde_json::json!({
+        "schema": "ag.governed-loop.run-input/v2",
+        "initial": { "occurrence": start.key().occurrence },
+        "continuations": []
+    }))
+    .unwrap();
+    assert!(matches!(
+        store.begin_shared_run_v2(&profile_digest, input.as_bytes(), NOW + 1),
+        Err(CampaignStoreErrorV1::SharedRunContinuationUnavailable)
+    ));
+    assert!(store.replay().is_ok());
 }

@@ -656,6 +656,9 @@ pub enum CampaignStoreErrorV1 {
     /// Another run identity owns the campaign's finite producer slot.
     #[error("another shared run identity is active")]
     SharedRunConflict,
+    /// This pre-extension database cannot host durable V2 continuations.
+    #[error("campaign store lacks finite-continuation V2 capability")]
+    SharedRunContinuationUnavailable,
 }
 
 /// One authoritative `SQLite` campaign store.
@@ -1183,6 +1186,9 @@ impl CampaignStoreV1 {
         input_jcs: &[u8],
         recorded_at_unix_ms: u64,
     ) -> Result<Digest, CampaignStoreErrorV1> {
+        if !table_exists(&self.connection, "shared_run_continuations")? {
+            return Err(CampaignStoreErrorV1::SharedRunContinuationUnavailable);
+        }
         self.begin_shared_run_with_domain(
             "ag.governed-loop.run-input/v2",
             profile_digest,
@@ -1304,14 +1310,30 @@ impl CampaignStoreV1 {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let run_status: Option<String> = transaction
+        let run_record: Option<(String, Vec<u8>)> = transaction
             .query_row(
-                "SELECT status FROM shared_runs WHERE run_id=?1 AND campaign_id=?2",
+                "SELECT status, input_jcs FROM shared_runs WHERE run_id=?1 AND campaign_id=?2",
                 params![run_id.as_str(), expected.key().campaign.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if run_status.as_deref() == Some("terminal") || run_status.is_none() {
+        let Some((run_status, run_input)) = run_record else {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        };
+        if run_status == "terminal" {
+            return Err(CampaignStoreErrorV1::SharedRunConflict);
+        }
+        let run_input: serde_json::Value = serde_json::from_slice(&run_input)
+            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+        let configured_locator = run_input
+            .get("continuations")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|locators| locators.get(usize::from(ordinal)))
+            .and_then(serde_json::Value::as_str);
+        if run_input.get("schema").and_then(serde_json::Value::as_str)
+            != Some("ag.governed-loop.run-input/v2")
+            || configured_locator != Some(locator)
+        {
             return Err(CampaignStoreErrorV1::SharedRunConflict);
         }
         let count: i64 = transaction.query_row(
@@ -1329,6 +1351,10 @@ impl CampaignStoreV1 {
             CampaignTransitionKindV1::ContinuationOpened,
             &CampaignTransitionEvidenceV1::None,
             recorded_at_unix_ms,
+        )?;
+        transaction.execute(
+            "UPDATE shared_runs SET cycle_request_digest=NULL, cycle_inflight=0 WHERE run_id=?1",
+            params![run_id.as_str()],
         )?;
         transaction.execute(
             "INSERT INTO shared_run_continuations
@@ -1450,6 +1476,21 @@ impl CampaignStoreV1 {
             .query_row(
                 "SELECT observation_jcs FROM shared_run_observations
              WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
+                params![run_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns the durable lifecycle status of an exact finite run.
+    pub fn shared_run_status(
+        &self,
+        run_id: &Digest,
+    ) -> Result<Option<String>, CampaignStoreErrorV1> {
+        self.connection
+            .query_row(
+                "SELECT status FROM shared_runs WHERE run_id=?1",
                 params![run_id.as_str()],
                 |row| row.get(0),
             )
@@ -3128,6 +3169,7 @@ fn verify_shared_runs(
     let mut runs = BTreeSet::new();
     let mut v2_runs = BTreeSet::new();
     let mut v2_tails = BTreeMap::new();
+    let mut v2_locators: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut live = 0_u64;
     let mut statement = connection.prepare(
         "SELECT run_id, profile_digest, input_jcs, status,
@@ -3171,6 +3213,36 @@ fn verify_shared_runs(
                     CampaignStoreErrorV1::Corrupt("V2 run lacks its initial occurrence".to_owned())
                 })?;
             v2_tails.insert(row.0.clone(), initial.to_owned());
+            let locators = input
+                .get("continuations")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    CampaignStoreErrorV1::Corrupt(
+                        "V2 run lacks its continuation locator sequence".to_owned(),
+                    )
+                })?;
+            if locators.len() > 8 {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "V2 run exceeds its continuation bound".to_owned(),
+                ));
+            }
+            let locators = locators
+                .iter()
+                .map(|locator| {
+                    let locator = locator.as_str().ok_or_else(|| {
+                        CampaignStoreErrorV1::Corrupt(
+                            "V2 continuation locator is not a string".to_owned(),
+                        )
+                    })?;
+                    if !Path::new(locator).is_absolute() {
+                        return Err(CampaignStoreErrorV1::Corrupt(
+                            "V2 continuation locator is not absolute".to_owned(),
+                        ));
+                    }
+                    Ok(locator.to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            v2_locators.insert(row.0.clone(), locators);
         }
         if run != Digest::hash_domain(run_domain, &row.2)
             || Some(&profile) != profile_digest
@@ -3268,6 +3340,10 @@ fn verify_shared_runs(
                 || row.1 != *next
                 || tail.as_deref() != Some(row.5.as_str())
                 || row.1 >= 8
+                || v2_locators
+                    .get(&row.0)
+                    .and_then(|locators| locators.get(usize::from(row.1)))
+                    .is_none_or(|locator| locator != &row.2)
                 || !Path::new(&row.2).is_absolute()
                 || envelope_digest
                     != Digest::hash_domain("ag.governed-loop.run-continuation/v1", &row.3)
