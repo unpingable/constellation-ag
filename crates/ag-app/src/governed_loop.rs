@@ -1568,6 +1568,9 @@ impl CampaignEngineV1 {
     }
 
     /// Opens a continuation and retains its exact V2 envelope in one commit.
+    /// The explicit run position, envelope and successor coordinates are checked
+    /// together by the store; none is inferred from a mutable deployment path.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_run_continuation(
         &mut self,
         run_id: &Digest,
