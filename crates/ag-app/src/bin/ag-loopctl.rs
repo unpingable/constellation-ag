@@ -19,7 +19,9 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1, VersionedExactWorkCatalogV1};
+use ag_app::governed_loop::{
+    CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, VersionedExactWorkCatalogV1,
+};
 use ag_app::governed_ports::{
     AgIssuanceSignerV1, CommandDocketCustodyPortV1, CommandDocketReconciliationPortV1,
     CommandGovernedInterventionVerifierV1, CommandHumanDispositionVerifierV1,
@@ -441,7 +443,7 @@ struct OperationalSnapshotV1 {
     runtime_profile: RuntimeProfileBindingV1,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PermissionPreflightInputV1 {
     schema: String,

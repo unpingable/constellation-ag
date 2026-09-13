@@ -40,15 +40,22 @@ pub fn canonical_file_identity(bytes: &[u8]) -> Result<Digest, GovernedPortError
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Genesis-pinned independent review requirement.
 pub struct ReviewRequirementV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Required reviewer identity.
     pub reviewer_id: String,
+    /// Closed verifier-route identity.
     pub route_enrollment_digest: Digest,
+    /// Required compiler contract.
     pub compiler_contract: String,
+    /// Maximum review lifetime.
     pub max_age_ms: u64,
 }
 
 impl ReviewRequirementV1 {
+    /// Parses and validates canonical requirement bytes.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GovernedPortErrorV1> {
         let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
         let document = JcsDocument::from_canonical_bytes(bytes)
@@ -68,6 +75,7 @@ impl ReviewRequirementV1 {
         Ok(value)
     }
 
+    /// Returns the canonical requirement identity.
     pub fn identity(&self) -> Result<Digest, GovernedPortErrorV1> {
         let canonical = JcsDocument::canonicalize(self)
             .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
@@ -77,27 +85,42 @@ impl ReviewRequirementV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Independent review verdict.
 pub enum ReviewVerdictV1 {
+    /// Exact plan accepted.
     Accepted,
+    /// Exact plan rejected.
     Rejected,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Authenticated review of one exact plan binding.
 pub struct PlanReviewV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Reviewed binding identity.
     pub binding_id: Digest,
+    /// Applied requirement identity.
     pub requirement_digest: Digest,
+    /// Unique dispatch identity.
     pub dispatch_id: Digest,
+    /// Reviewer identity.
     pub reviewer_id: String,
+    /// Review verdict.
     pub verdict: ReviewVerdictV1,
+    /// Source-owned review time.
     pub reviewed_at_unix_ms: u64,
+    /// Exclusive expiry boundary.
     pub expires_at_unix_ms: u64,
+    /// Reviewed result identity.
     pub result_digest: Digest,
+    /// Custody receipt identity.
     pub custody_receipt_digest: Digest,
 }
 
 impl PlanReviewV1 {
+    /// Checks the review against its exact requirement.
     pub fn validate(&self, requirement: &ReviewRequirementV1) -> Result<(), GovernedPortErrorV1> {
         if self.schema != PLAN_REVIEW_SCHEMA_V1
             || self.reviewer_id != requirement.reviewer_id
@@ -115,24 +138,36 @@ impl PlanReviewV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Bounded reviewed artifact bytes.
 pub struct ReviewArtifactBundleV1 {
+    /// Standard-base64 result bytes.
     pub result_bytes_base64: String,
+    /// Standard-base64 custody receipt bytes.
     pub custody_receipt_bytes_base64: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Atomic review-recording request.
 pub struct RecordReviewInputV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Campaign identity.
     pub campaign: CampaignId,
+    /// Occurrence identifier.
     pub occurrence: String,
+    /// Reviewed binding identity.
     pub binding_id: Digest,
+    /// Applied requirement identity.
     pub requirement_digest: Digest,
+    /// Authenticated review record.
     pub review: PlanReviewV1,
+    /// Exact reviewed artifacts.
     pub artifacts: ReviewArtifactBundleV1,
 }
 
 impl RecordReviewInputV1 {
+    /// Validates exact bindings and bounded artifact identities.
     pub fn validate_artifacts(&self) -> Result<(), GovernedPortErrorV1> {
         if self.schema != REVIEW_RECORD_INPUT_SCHEMA_V1
             || self.binding_id != self.review.binding_id
@@ -165,22 +200,35 @@ impl RecordReviewInputV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Closed response from the enrolled review verifier.
 pub struct OwnerVerificationResponseV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Whether custody authenticity was established.
     pub accepted: bool,
+    /// Verified binding identity.
     pub binding_id: Digest,
+    /// Verifier configuration identity.
     pub configuration_digest: Digest,
+    /// Verification evidence identity.
     pub evidence_digest: Digest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Native Maude validator response.
 pub struct MaudePlanValidationV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Required passed result.
     pub result: String,
+    /// Validated binding identity.
     pub binding_id: Digest,
+    /// Validator configuration identity.
     pub config_digest: Digest,
+    /// Stored lock identity.
     pub stored_lock_id: Digest,
+    /// Stored compilation identity.
     pub stored_compilation_id: Digest,
 }
 
@@ -228,6 +276,7 @@ struct ReviewVerificationRequestV1<'a> {
     artifacts: &'a ReviewArtifactBundleV1,
 }
 
+/// Authenticates an accepted or rejected review and its exact custody.
 pub fn verify_review(
     profile: &GovernedSharedAdmissionV1,
     requirement: &ReviewRequirementV1,
@@ -268,9 +317,13 @@ pub fn verify_review(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Tri-state permission judgment.
 pub enum PermissionPreflightDecisionV1 {
+    /// Every required check passed.
     Allowed,
+    /// A required check determinately refused.
     Denied,
+    /// A required check was unavailable.
     Indeterminate,
 }
 
@@ -293,18 +346,31 @@ pub const fn permission_decision(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Closed read-only permission-preflight result.
 pub struct PermissionPreflightV1 {
+    /// Exact schema.
     pub schema: String,
+    /// Sampled occurrence key.
     pub key: OccurrenceKeyV1,
+    /// Genesis profile identity.
     pub profile_digest: Digest,
+    /// Exact binding identity.
     pub binding_id: Digest,
+    /// Current review identity.
     pub review_id: Option<Digest>,
+    /// Sampled state identity.
     pub sampled_state_digest: Digest,
+    /// Trusted evaluation time.
     pub evaluated_at_unix_ms: u64,
+    /// Earliest evidence expiry.
     pub expires_at_unix_ms: u64,
+    /// Tri-state decision.
     pub decision: PermissionPreflightDecisionV1,
+    /// Evidence identities.
     pub evidence: Vec<Digest>,
+    /// Machine-readable reasons.
     pub reasons: Vec<String>,
+    /// Always false; preflight grants no authority.
     pub grants_authority: bool,
 }
 

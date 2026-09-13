@@ -1071,6 +1071,7 @@ impl CommandObservationResolverV1 {
         }
     }
 
+    /// Applies an absolute deadline to resolver subprocesses.
     #[must_use]
     pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
         self.deadline_unix_ms = Some(deadline_unix_ms);
@@ -1115,6 +1116,7 @@ impl CommandStandingResolverV1 {
         }
     }
 
+    /// Applies an absolute deadline to resolver subprocesses.
     #[must_use]
     pub fn with_deadline(mut self, deadline_unix_ms: u64) -> Self {
         self.deadline_unix_ms = Some(deadline_unix_ms);
