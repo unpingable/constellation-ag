@@ -1,6 +1,6 @@
 # Constellation AG newcomer guide
 
-AG-ng decides whether a specific piece of automated work may run now. It checks
+Constellation AG decides whether a specific piece of automated work may run now. It checks
 the proposal against current observations, the relevant mandate, and policy.
 If allowed, it records a permission that can be used only once for that run.
 Docket manages the execution attempt; a separate executor does the work.
@@ -63,6 +63,20 @@ and Docket coordinates. Use the read-only `inspect`, `status`, `replay`,
 local read-only UI consumes only those projections. See the
 [operator UI contract](operator-ui.md) and
 [read model](operator-ui-read-model.md).
+
+The initialization example above is the V1 profile path. Shared reviewed-plan
+admission uses the distinct `seal-runtime-profile-v2`,
+`verify-runtime-profile-v2`, and `init-v2` commands; do not pass a V2 profile to
+`init`. Use the exact enrollment and component revisions supplied by the
+selected integration guide.
+
+For bounded continuation, [run input V2](../crates/ag-app/FINITE_CONTINUATION_V2.md)
+retains a finite sequence of occurrence-bound materials across restart. It does
+not acquire new observations or create another permission automatically. Its
+component tests have passed; qualification of the complete reviewed-plan
+workflow through the real reviewer, Nightshift, AG, Docket and executor is still
+in progress. The presence of these commands is not a completed integration
+recipe or a production-readiness claim.
 
 The daemon-oriented `agctl` surface is separately role-scoped. Its proposer
 profile can submit intent, while its effect-admin profile can inspect and
