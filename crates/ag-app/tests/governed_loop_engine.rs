@@ -1428,7 +1428,7 @@ fn assert_demo_semantic_links(corpus: &DemoCorpusV1, reader: &OperatorReaderV1) 
         };
         let detail = reader.campaign_detail_for_link(&link).unwrap();
         render::campaign_detail_for_link_with_context(&detail, reader.mode_label(), &link)
-            .contains("historical occurrence")
+            .contains("historical run")
     }));
     let historical = corpus
         .semantic_link_targets
@@ -1775,7 +1775,7 @@ fn operator_views_render_every_canonical_counter_from_real_persisted_history() {
             }
             ProgramCounterV1::Dispatched => {
                 assert!(html.contains("outcome unknown"));
-                assert!(html.contains("Absence of a receipt is not failure"));
+                assert!(html.contains("A missing receipt is not a failure result"));
             }
             ProgramCounterV1::ReconciliationRequired => {
                 assert!(html.contains("Repeat dispatch is not authorized"));
