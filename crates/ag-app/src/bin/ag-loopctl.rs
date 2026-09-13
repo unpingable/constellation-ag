@@ -1012,38 +1012,27 @@ fn run_finite(
                     recover_cycle,
                     input.deadline_unix_ms,
                 );
-                match response {
-                    Ok(response) => {
-                        engine.record_run_observation(&run_id, &response, "active", now_unix_ms)?;
-                        engine.clear_cycle_inflight(&run_id, &cycle_request_digest)?;
-                        if engine.current()?.program_counter()
-                            == ProgramCounterV1::ObservationRequired
-                        {
-                            let status = terminal(
-                                "waiting",
-                                "independent_observation_unavailable",
-                                steps,
-                                polls,
-                            );
-                            engine.record_run_observation(
-                                &run_id,
-                                &status,
-                                "waiting",
-                                now_unix_ms,
-                            )?;
-                            return write_exact(&status);
-                        }
-                    }
-                    Err(_) => {
-                        let status = terminal(
-                            "waiting",
-                            "independent_observation_unavailable",
-                            steps,
-                            polls,
-                        );
-                        engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
-                        return write_exact(&status);
-                    }
+                let Ok(response) = response else {
+                    let status = terminal(
+                        "waiting",
+                        "independent_observation_unavailable",
+                        steps,
+                        polls,
+                    );
+                    engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                    return write_exact(&status);
+                };
+                engine.record_run_observation(&run_id, &response, "active", now_unix_ms)?;
+                engine.clear_cycle_inflight(&run_id, &cycle_request_digest)?;
+                if engine.current()?.program_counter() == ProgramCounterV1::ObservationRequired {
+                    let status = terminal(
+                        "waiting",
+                        "independent_observation_unavailable",
+                        steps,
+                        polls,
+                    );
+                    engine.record_run_observation(&run_id, &status, "waiting", now_unix_ms)?;
+                    return write_exact(&status);
                 }
             }
             ProgramCounterV1::ProposalRecorded => {
