@@ -66,6 +66,9 @@ pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str =
 /// V2 top-level canonical Nightshift cycle port.
 pub const GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1: &str =
     "ag.governed-loop.nightshift-cycle-port/v1";
+/// Closed nonsecret configuration consumed by the Nightshift cycle adapter.
+pub const NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1: &str =
+    "nightshift.ag-cycle-port-config/v1";
 /// Schema for the deployment-owned Docket adapter root.
 pub const GOVERNED_DOCKET_ROOT_SCHEMA_V1: &str = "ag.governed-loop.docket-root/v1";
 /// Schema for the Docket portion of runtime-profile enrollment.
@@ -337,6 +340,42 @@ pub struct GovernedNightshiftCyclePortV1 {
     pub config: PinnedDeploymentFileV1,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NightshiftCyclePortConfigV1 {
+    schema: String,
+    store: PathBuf,
+    present_evidence_resolver: PathBuf,
+    nq_program: PathBuf,
+    nq_config: PathBuf,
+    nq_source_id: String,
+    ag_loopctl: PathBuf,
+    ag_database: PathBuf,
+    ag_observation_resolver: PathBuf,
+    ag_observation_resolver_id: String,
+    ag_runtime_profile: PathBuf,
+    recover_observed_at: u64,
+}
+
+impl NightshiftCyclePortConfigV1 {
+    fn validate(&self) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1
+            || self.nq_source_id.is_empty()
+            || self.ag_observation_resolver_id.is_empty()
+            || [
+                &self.store, &self.present_evidence_resolver, &self.nq_program,
+                &self.nq_config, &self.ag_loopctl, &self.ag_database,
+                &self.ag_observation_resolver, &self.ag_runtime_profile,
+            ].into_iter().any(|path| !path.is_absolute())
+        {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid Nightshift cycle adapter config",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl GovernedNightshiftCyclePortV1 {
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1 {
@@ -345,6 +384,11 @@ impl GovernedNightshiftCyclePortV1 {
         let _ = self.program.verify(true)?;
         let config = self.config.verify(false)?;
         let _ = crate::shared_admission::canonical_file_identity(&config)?;
+        let config: NightshiftCyclePortConfigV1 =
+            JcsDocument::from_canonical_bytes(config.strip_suffix(b"\n").unwrap_or(&config))
+                .and_then(|document| document.decode())
+                .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        config.validate()?;
         Ok(())
     }
 
@@ -359,27 +403,14 @@ impl GovernedNightshiftCyclePortV1 {
         if !request.is_absolute() {
             return Err(GovernedPortErrorV1::InvalidConfiguration("cycle request is not absolute"));
         }
-        let config_bytes = self.config.verify(false)?;
-        let config = JcsDocument::from_canonical_bytes(config_bytes.strip_suffix(b"\n").unwrap_or(&config_bytes))
-            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let config: serde_json::Value = config.decode()
-            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let store = config.get("store").and_then(serde_json::Value::as_str)
-            .ok_or(GovernedPortErrorV1::InvalidConfiguration("cycle config lacks store"))?;
-        if !Path::new(store).is_absolute() {
-            return Err(GovernedPortErrorV1::InvalidConfiguration("cycle store is not absolute"));
+        let mut arguments = vec![
+            if recover { "recover-config" } else { "run-config" }.to_owned(),
+            "--config".to_owned(), self.config.path.display().to_string(),
+        ];
+        if !recover {
+            arguments.extend(["--request".to_owned(), request.display().to_string()]);
         }
-        run_json_program(
-            &self.program.path,
-            &[
-                "cycle".to_owned(),
-                if recover { "recover" } else { "run-config" }.to_owned(),
-                "--config".to_owned(), self.config.path.display().to_string(),
-                "--request".to_owned(), request.display().to_string(),
-                "--store".to_owned(), store.to_owned(),
-            ],
-            &serde_json::json!({}),
-        )
+        run_json_program(&self.program.path, &arguments, &serde_json::json!({}))
     }
 }
 
@@ -1405,5 +1436,19 @@ mod tests {
         });
         assert!(serde_json::from_value::<GovernedRuntimeProfileV1>(v2.clone()).is_err());
         assert!(serde_json::from_value::<GovernedRuntimeProfileV2>(v2).is_err());
+    }
+
+    #[test]
+    fn nightshift_cycle_config_is_closed_and_requires_absolute_coordinates() {
+        let value = serde_json::json!({
+            "schema": NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1,
+            "store": "/state", "present_evidence_resolver": "/bin/present",
+            "nq_program": "/bin/nq", "nq_config": "/etc/nq.json",
+            "nq_source_id": "source", "ag_loopctl": "/bin/ag-loopctl",
+            "ag_database": "/state/ag.sqlite", "ag_observation_resolver": "/bin/observe",
+            "ag_observation_resolver_id": "observe/v1", "ag_runtime_profile": "/etc/ag-profile.json",
+            "recover_observed_at": 1, "substituted_program": "/tmp/other"
+        });
+        assert!(serde_json::from_value::<NightshiftCyclePortConfigV1>(value).is_err());
     }
 }
