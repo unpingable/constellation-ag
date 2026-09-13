@@ -11,17 +11,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::governed_ports::{GovernedPortErrorV1, GovernedSharedAdmissionV1};
 
+/// Review requirement schema.
 pub const REVIEW_REQUIREMENT_SCHEMA_V1: &str = "ag.governed-loop.review-requirement/v1";
+/// Plan review schema.
 pub const PLAN_REVIEW_SCHEMA_V1: &str = "maude.governed-plan-review/v1";
+/// Review recording input schema.
 pub const REVIEW_RECORD_INPUT_SCHEMA_V1: &str = "ag.governed-loop.review-record-input/v1";
+/// Plan validator request schema.
 pub const PLAN_VALIDATION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.plan-validation-request/v1";
+/// Review verifier request schema.
 pub const REVIEW_VERIFICATION_REQUEST_SCHEMA_V1: &str =
     "ag.governed-loop.review-verification-request/v1";
+/// Review verifier response schema.
 pub const OWNER_VERIFICATION_RESPONSE_SCHEMA_V1: &str =
     "ag.governed-loop.owner-verification-response/v1";
+/// Native Maude validation response schema.
 pub const MAUDE_PLAN_VALIDATION_SCHEMA_V1: &str = "maude.governed-plan-validation/v1";
+/// Permission preflight response schema.
 pub const PERMISSION_PREFLIGHT_SCHEMA_V1: &str = "ag.governed-loop.permission-preflight/v1";
 
+/// Validates canonical JSON file bytes and returns their content identity.
 pub fn canonical_file_identity(bytes: &[u8]) -> Result<Digest, GovernedPortErrorV1> {
     let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     JcsDocument::from_canonical_bytes(canonical)

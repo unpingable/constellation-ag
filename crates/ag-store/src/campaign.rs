@@ -499,25 +499,40 @@ pub struct StoredRuntimeProfileV1 {
 /// Exact authoritative shared evidence for one admitted occurrence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredSharedAdmissionV1 {
+    /// Campaign owning the occurrence.
     pub campaign: CampaignId,
+    /// Occurrence identifier.
     pub occurrence: String,
+    /// State preceding proposal admission.
     pub predecessor_state_digest: Digest,
+    /// Admitted Maude binding identity.
     pub binding_id: Digest,
+    /// Required review-policy identity.
     pub requirement_digest: Digest,
+    /// Canonical binding bytes.
     pub binding_jcs: Vec<u8>,
+    /// Canonical validator response bytes.
     pub validation_jcs: Vec<u8>,
+    /// Retained authenticated review events.
     pub reviews: Vec<StoredSharedReviewV1>,
 }
 
 /// One append-only authenticated review event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredSharedReviewV1 {
+    /// Unique review dispatch identity.
     pub dispatch_id: Digest,
+    /// Exact review-record identity.
     pub review_id: Digest,
+    /// Accepted or rejected review verdict.
     pub verdict: String,
+    /// Canonical review bytes.
     pub review_jcs: Vec<u8>,
+    /// Canonical reviewed artifact bundle.
     pub artifacts_jcs: Vec<u8>,
+    /// Canonical verifier response.
     pub verification_jcs: Vec<u8>,
+    /// Trusted recording time.
     pub recorded_at_unix_ms: u64,
 }
 

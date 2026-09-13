@@ -322,18 +322,30 @@ impl GovernedSharedAdmissionV1 {
 pub struct GovernedRuntimeProfileV2 {
     /// Exact V2 schema.
     pub schema: String,
+    /// Deployment label without authority meaning.
     pub profile_label: String,
+    /// Pinned observation resolver.
     pub observation_resolver: PinnedDeploymentFileV1,
+    /// Required observation resolver identity.
     pub observation_resolver_id: String,
+    /// Pinned standing resolver.
     pub standing_resolver: PinnedDeploymentFileV1,
+    /// Required standing resolver identity.
     pub standing_resolver_id: String,
+    /// Maximum standing lifetime.
     pub max_standing_ttl_ms: u64,
+    /// Pinned exact-work catalog.
     pub exact_work_catalog: PinnedDeploymentFileV1,
+    /// Optional pinned controlling review.
     pub controlling_review: Option<PinnedDeploymentFileV1>,
+    /// Pinned Docket custody boundary.
     pub docket: GovernedDocketRootV1,
+    /// Optional human verifier.
     pub human_verifier: Option<PinnedDeploymentFileV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional intervention ingress.
     pub intervention_ingress: Option<GovernedInterventionIngressV1>,
+    /// Required Nightshift cycle boundary.
     pub nightshift_cycle: GovernedNightshiftCyclePortV1,
     /// Required shared-admission boundary.
     pub shared_admission: GovernedSharedAdmissionV1,
@@ -343,8 +355,11 @@ pub struct GovernedRuntimeProfileV2 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernedNightshiftCyclePortV1 {
+    /// Exact port schema.
     pub schema: String,
+    /// Pinned Nightshift executable.
     pub program: PinnedDeploymentFileV1,
+    /// Pinned closed cycle configuration.
     pub config: PinnedDeploymentFileV1,
 }
 
@@ -414,6 +429,7 @@ impl NightshiftCyclePortConfigV1 {
 }
 
 impl GovernedNightshiftCyclePortV1 {
+    /// Remeasures the complete cycle boundary.
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1 {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
@@ -657,13 +673,21 @@ pub struct GovernedRuntimeProfileEnrollmentV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernedSharedAdmissionEnrollmentV1 {
+    /// Exact shared-admission schema.
     pub schema: String,
+    /// Required Maude binding schema.
     pub plan_binding_schema: String,
+    /// Required compiler contract.
     pub compiler_contract: String,
+    /// Validator executable path.
     pub plan_validator: PathBuf,
+    /// Validator configuration path.
     pub plan_validator_config: PathBuf,
+    /// Review verifier executable path.
     pub review_verifier: PathBuf,
+    /// Review verifier configuration path.
     pub review_verifier_config: PathBuf,
+    /// Review requirement path.
     pub review_requirement: PathBuf,
 }
 
@@ -671,28 +695,46 @@ pub struct GovernedSharedAdmissionEnrollmentV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernedRuntimeProfileEnrollmentV2 {
+    /// Exact V2 enrollment schema.
     pub schema: String,
+    /// Deployment label.
     pub profile_label: String,
+    /// Observation resolver path.
     pub observation_resolver: PathBuf,
+    /// Observation resolver identity.
     pub observation_resolver_id: String,
+    /// Standing resolver path.
     pub standing_resolver: PathBuf,
+    /// Standing resolver identity.
     pub standing_resolver_id: String,
+    /// Maximum standing lifetime.
     pub max_standing_ttl_ms: u64,
+    /// Exact-work catalog path.
     pub exact_work_catalog: PathBuf,
+    /// Optional controlling-review path.
     pub controlling_review: Option<PathBuf>,
+    /// Docket enrollment.
     pub docket: GovernedDocketRootEnrollmentV1,
+    /// Optional human-verifier path.
     pub human_verifier: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional intervention ingress enrollment.
     pub intervention_ingress: Option<GovernedInterventionIngressEnrollmentV1>,
+    /// Nightshift cycle enrollment.
     pub nightshift_cycle: GovernedNightshiftCyclePortEnrollmentV1,
+    /// Shared-admission enrollment.
     pub shared_admission: GovernedSharedAdmissionEnrollmentV1,
 }
 
+/// Deployment paths for the Nightshift cycle boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GovernedNightshiftCyclePortEnrollmentV1 {
+    /// Exact port schema.
     pub schema: String,
+    /// Nightshift executable path.
     pub program: PathBuf,
+    /// Closed configuration path.
     pub config: PathBuf,
 }
 
