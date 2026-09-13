@@ -3071,6 +3071,71 @@ fn advance_repository_specimen(
     engine.require_standing(NOW + 2).unwrap();
 }
 
+fn assert_repository_substitutions_refuse(
+    expected: &TypedOpaqueObservationBasisV1,
+    catalog: &ExactWorkCatalogV2,
+) {
+    for case in [
+        "type",
+        "profile",
+        "occurrence",
+        "observation",
+        "subject",
+        "resolver",
+        "stale",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = create_engine(&directory, ResidualSetV1::default());
+        let mut boundary = RepositoryQualificationBoundary::current(expected.clone());
+        let mut standing = StandingBoundary::current();
+        advance_repository_specimen(&mut engine, &mut boundary);
+        match case {
+            "type" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    "worker.asserted-qualified/v1".to_owned(),
+                    expected.basis_identity.clone(),
+                )
+                .unwrap();
+            }
+            "profile" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
+                    digest("substituted-applicability-profile"),
+                )
+                .unwrap();
+            }
+            "occurrence" => boundary.substitute_occurrence = Some(occurrence(99)),
+            "observation" => {
+                boundary.substitute_observation = Some(ObservationRefV1::from_digest(digest(
+                    "worker-self-asserted-observation",
+                )));
+            }
+            "subject" => boundary.substitute_subject = Some(digest("other-subject")),
+            "resolver" => boundary.resolver_id = "controller.self-qualification/v1".to_owned(),
+            "stale" => boundary.status = TypedObservationStatusV1::Stale,
+            _ => unreachable!(),
+        }
+        let before = engine.current().unwrap();
+        assert!(
+            engine
+                .decide_with_catalog_v2(
+                    &mut boundary,
+                    &mut standing,
+                    catalog,
+                    None,
+                    REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                    STANDING_RESOLVER_ID,
+                    MAX_STANDING_TTL_MS,
+                    NOW + 3,
+                )
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(engine.current().unwrap(), before, "{case}");
+        assert_eq!(engine.replay().unwrap().ag_spends, 0, "{case}");
+    }
+}
+
 #[test]
 fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successor() {
     let expected = repository_basis();
@@ -3112,65 +3177,7 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
     );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 
-    for case in [
-        "type",
-        "profile",
-        "occurrence",
-        "observation",
-        "subject",
-        "resolver",
-        "stale",
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut engine = create_engine(&directory, ResidualSetV1::default());
-        let mut boundary = RepositoryQualificationBoundary::current(expected.clone());
-        let mut standing = StandingBoundary::current();
-        advance_repository_specimen(&mut engine, &mut boundary);
-        match case {
-            "type" => {
-                boundary.basis = TypedOpaqueObservationBasisV1::new(
-                    "worker.asserted-qualified/v1".to_owned(),
-                    expected.basis_identity.clone(),
-                )
-                .unwrap()
-            }
-            "profile" => {
-                boundary.basis = TypedOpaqueObservationBasisV1::new(
-                    REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
-                    digest("substituted-applicability-profile"),
-                )
-                .unwrap()
-            }
-            "occurrence" => boundary.substitute_occurrence = Some(occurrence(99)),
-            "observation" => {
-                boundary.substitute_observation = Some(ObservationRefV1::from_digest(digest(
-                    "worker-self-asserted-observation",
-                )))
-            }
-            "subject" => boundary.substitute_subject = Some(digest("other-subject")),
-            "resolver" => boundary.resolver_id = "controller.self-qualification/v1".to_owned(),
-            "stale" => boundary.status = TypedObservationStatusV1::Stale,
-            _ => unreachable!(),
-        }
-        let before = engine.current().unwrap();
-        assert!(
-            engine
-                .decide_with_catalog_v2(
-                    &mut boundary,
-                    &mut standing,
-                    &catalog,
-                    None,
-                    REPOSITORY_QUALIFICATION_RESOLVER_ID,
-                    STANDING_RESOLVER_ID,
-                    MAX_STANDING_TTL_MS,
-                    NOW + 3
-                )
-                .is_err(),
-            "{case}"
-        );
-        assert_eq!(engine.current().unwrap(), before, "{case}");
-        assert_eq!(engine.replay().unwrap().ag_spends, 0, "{case}");
-    }
+    assert_repository_substitutions_refuse(&expected, &catalog);
 
     let directory = tempfile::tempdir().unwrap();
     let mut engine = create_engine(&directory, ResidualSetV1::default());
