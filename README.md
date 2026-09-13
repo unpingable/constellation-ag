@@ -5,13 +5,9 @@ decides whether one prepared action may proceed and records that decision; it
 does not schedule work, execute it, or turn a receipt into reusable authority.
 For an ordinary bounded repository edit, AG is usually unnecessary overhead.
 
-New here? Start with the [main-branch guide](docs/public-guide.md). This `main`
-revision preserves the older daemon/library workspace and its `agctl` command.
-The newer governed-loop inspection guide and read-only operator UI are published
-separately at exact revision
-[`32f10101c4a93bad77d00803bad3031dd6847698`](https://github.com/unpingable/constellation-ag/blob/32f10101c4a93bad77d00803bad3031dd6847698/docs/public-guide.md).
-That revision contains `ag-loopctl` and `ag-operator-ui`; this `main` tree does
-not. Do not mix commands or relative documentation links between the revisions.
+New here? Start with the [main-branch guide](docs/public-guide.md). This revision
+contains the governed-loop `ag-loopctl` command and read-only `ag-operator-ui`
+surface alongside the existing daemon/library workspace and `agctl` command.
 
 ## Implementation status (2026-08-10)
 
