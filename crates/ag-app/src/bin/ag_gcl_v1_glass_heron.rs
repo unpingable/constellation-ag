@@ -423,7 +423,9 @@ fn main() -> Result<()> {
     let (mut predecessor_head, mut predecessor_tree) =
         match &packet.stages[0].reservation.predecessor {
             PredecessorBindingV1::InitialGit { head, tree } => (head.clone(), tree.clone()),
-            _ => bail!("Stage 1 predecessor is not literal"),
+            PredecessorBindingV1::PriorStageRealization { .. } => {
+                bail!("Stage 1 predecessor is not literal")
+            }
         };
     ensure!(
         git(&fixture, &["rev-parse", "HEAD"])? == predecessor_head.digest,
@@ -708,7 +710,7 @@ fn main() -> Result<()> {
             "source_attempt_id":attempt,
             "source_settlement_id":settled.settlement().unwrap().settlement.as_str(),
             "subject_digest":stage.subject,"resolver_id":OBSERVATION_RESOLVER,
-            "max_age_ms":86400000
+            "max_age_ms":86_400_000
         });
         let mut preimage = applicability.clone();
         preimage.as_object_mut().unwrap().remove("profile_id");
