@@ -1,27 +1,20 @@
 # Agent guidance
 
-Follow applicable workspace instructions and use the ordinary Git workflow for
-bounded edits. Constellation AG is useful when work needs a separate exact-work
-decision, one-use authority, and inspectable custody. It is usually unnecessary
-for a small local edit, documentation change, or read-only check.
+Follow applicable workspace instructions. This guide describes this
+repository's supported paths. Use the ordinary Git workflow for bounded edits.
 
-This default-branch snapshot is the older daemon/library workspace. Build and
-inspect only the commands present here:
+Use AG's governed loop when work needs durable exact-occurrence judgment,
+one-use authority, restart-safe custody, or evidence-backed reconciliation;
+do not route every task through it. Build and inspect the supported surface
+with `cargo build --locked --workspace` and `./target/debug/ag-loopctl --help`.
+Production-shaped state requires an owner-reviewed genesis and runtime profile;
+follow [`docs/governed-loop-c1.md`](docs/governed-loop-c1.md) and
+[`docs/governed-loop-deployment-qualification.md`](docs/governed-loop-deployment-qualification.md).
 
-```sh
-cargo build --locked --workspace
-./target/debug/agctl --help
-```
-
-The `ag-loopctl` and `ag-operator-ui` commands belong to the separately
-published development revision linked from [`docs/public-guide.md`](docs/public-guide.md);
-do not claim that they exist on this revision. For daemon operation, use the
-role-separated profiles and commands in [`docs/agctl.md`](docs/agctl.md), and
-read [`docs/deployment.md`](docs/deployment.md) before relying on a host.
-
-For prolonged work, use the campaign-approved durable producer and persist its
-recovery checkpoint before waiting. After supervisor loss, reconcile the
-original producer and any indeterminate state before opening successor work.
-Tool availability, a proposal, an issuance, or a receipt does not grant
-authority. If the governed path is unavailable, record the reduced claim and
-use the campaign's documented fallback.
+For prolonged work, use the campaign-approved durable producer and checkpoint,
+which may be a named transient user-systemd service when that campaign records
+it. After supervisor loss, inspect the original producer and AG/Docket state;
+reconcile an indeterminate attempt before opening successor work. Never infer
+authorization from tool availability, a proposal, an issuance, or a receipt.
+If the governed path is unavailable, record the reduced claim and use the
+campaign's documented fallback. Pre-alpha design tooling remains opt-in.

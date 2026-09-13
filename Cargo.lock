@@ -6,8 +6,10 @@ version = 4
 name = "ag-app"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-effect",
  "ag-kernel",
+ "ag-operator-ui",
  "ag-primitives",
  "ag-protocol",
  "ag-session",
@@ -20,6 +22,7 @@ dependencies = [
  "nix",
  "rand",
  "ring",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_jcs",
@@ -30,6 +33,17 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ag-campaign"
+version = "0.1.0"
+dependencies = [
+ "ag-primitives",
+ "serde",
+ "serde_json",
+ "thiserror",
  "uuid",
 ]
 
@@ -67,6 +81,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "ag-operator-ui"
+version = "0.1.0"
+dependencies = [
+ "ag-campaign",
+ "ag-primitives",
+ "ag-store",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -129,6 +157,7 @@ dependencies = [
 name = "ag-store"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-primitives",
  "anyhow",
  "clap",

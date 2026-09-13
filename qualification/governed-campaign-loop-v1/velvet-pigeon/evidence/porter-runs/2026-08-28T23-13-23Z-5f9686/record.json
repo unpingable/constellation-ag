@@ -1,0 +1,25 @@
+{
+  "artifacts": [],
+  "declared_command": [],
+  "evidence_reservation": "sha256:34ee1476209fa117e59f3f591a6d24d552c425d9e1d422fd61d6217b7239790a",
+  "notes": "synthetic contract specimen; no endpoint or campaign execution claim",
+  "outcome": "completed",
+  "porter_version": "0.0.1",
+  "preserved": true,
+  "refusal_reason": null,
+  "run_id": "2026-08-28T23-13-23Z-5f9686",
+  "schema": "porter.record.v1",
+  "steps": [],
+  "substrate": {
+    "declared": {
+      "socket_path": "/run/velvet-pigeon-primary.sock"
+    },
+    "declared_facts": {},
+    "ephemeral": false,
+    "fact_mismatches": [],
+    "kind": "vm",
+    "observed": {},
+    "transport": "serial-socket"
+  },
+  "target": "serial:/run/velvet-pigeon-primary.sock"
+}

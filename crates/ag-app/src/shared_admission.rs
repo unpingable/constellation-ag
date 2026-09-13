@@ -1,0 +1,482 @@
+//! Closed records and process checks for shared plan/review admission.
+//!
+//! These judgments are evidence only. They never resolve standing, spend an
+//! authorization, claim Docket custody, or invoke executor mechanics.
+
+use ag_campaign::CampaignId;
+use ag_campaign::governed::OccurrenceKeyV1;
+use ag_primitives::{Digest, JcsDocument};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
+
+use crate::governed_ports::{GovernedPortErrorV1, GovernedSharedAdmissionV1};
+
+/// Review requirement schema.
+pub const REVIEW_REQUIREMENT_SCHEMA_V1: &str = "ag.governed-loop.review-requirement/v1";
+/// Plan review schema.
+pub const PLAN_REVIEW_SCHEMA_V1: &str = "maude.governed-plan-review/v1";
+/// Review recording input schema.
+pub const REVIEW_RECORD_INPUT_SCHEMA_V1: &str = "ag.governed-loop.review-record-input/v1";
+/// Plan validator request schema.
+pub const PLAN_VALIDATION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.plan-validation-request/v1";
+/// Review verifier request schema.
+pub const REVIEW_VERIFICATION_REQUEST_SCHEMA_V1: &str =
+    "ag.governed-loop.review-verification-request/v1";
+/// Review verifier response schema.
+pub const OWNER_VERIFICATION_RESPONSE_SCHEMA_V1: &str =
+    "ag.governed-loop.owner-verification-response/v1";
+/// Native Maude validation response schema.
+pub const MAUDE_PLAN_VALIDATION_SCHEMA_V1: &str = "maude.governed-plan-validation/v1";
+/// Permission preflight response schema.
+pub const PERMISSION_PREFLIGHT_SCHEMA_V1: &str = "ag.governed-loop.permission-preflight/v1";
+
+/// Validates canonical JSON file bytes and returns their content identity.
+///
+/// # Errors
+/// Refuses non-canonical JSON bytes.
+pub fn canonical_file_identity(bytes: &[u8]) -> Result<Digest, GovernedPortErrorV1> {
+    let canonical = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    JcsDocument::from_canonical_bytes(canonical)
+        .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+    Ok(Digest::hash_bytes(canonical))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Genesis-pinned independent review requirement.
+pub struct ReviewRequirementV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Required reviewer identity.
+    pub reviewer_id: String,
+    /// Closed verifier-route identity.
+    pub route_enrollment_digest: Digest,
+    /// Required compiler contract.
+    pub compiler_contract: String,
+    /// Maximum review lifetime.
+    pub max_age_ms: u64,
+}
+
+impl ReviewRequirementV1 {
+    /// Parses and validates canonical requirement bytes.
+    ///
+    /// # Errors
+    /// Refuses malformed, non-canonical, or unsupported requirements.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GovernedPortErrorV1> {
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        let document = JcsDocument::from_canonical_bytes(bytes)
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        let value: Self = document
+            .decode()
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        if value.schema != REVIEW_REQUIREMENT_SCHEMA_V1
+            || value.reviewer_id.is_empty()
+            || value.compiler_contract.is_empty()
+            || value.max_age_ms == 0
+        {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid shared review requirement",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Returns the canonical requirement identity.
+    ///
+    /// # Errors
+    /// Returns an error if canonical serialization fails.
+    pub fn identity(&self) -> Result<Digest, GovernedPortErrorV1> {
+        let canonical = JcsDocument::canonicalize(self)
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        Ok(Digest::hash_bytes(canonical.as_bytes()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Independent review verdict.
+pub enum ReviewVerdictV1 {
+    /// Exact plan accepted.
+    Accepted,
+    /// Exact plan rejected.
+    Rejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Authenticated review of one exact plan binding.
+pub struct PlanReviewV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Reviewed binding identity.
+    pub binding_id: Digest,
+    /// Applied requirement identity.
+    pub requirement_digest: Digest,
+    /// Unique dispatch identity.
+    pub dispatch_id: Digest,
+    /// Reviewer identity.
+    pub reviewer_id: String,
+    /// Review verdict.
+    pub verdict: ReviewVerdictV1,
+    /// Source-owned review time.
+    pub reviewed_at_unix_ms: u64,
+    /// Exclusive expiry boundary.
+    pub expires_at_unix_ms: u64,
+    /// Reviewed result identity.
+    pub result_digest: Digest,
+    /// Custody receipt identity.
+    pub custody_receipt_digest: Digest,
+}
+
+impl PlanReviewV1 {
+    /// Checks the review against its exact requirement.
+    ///
+    /// # Errors
+    /// Refuses mismatched identity, reviewer, or expiry coordinates.
+    pub fn validate(&self, requirement: &ReviewRequirementV1) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != PLAN_REVIEW_SCHEMA_V1
+            || self.reviewer_id != requirement.reviewer_id
+            || self.requirement_digest != requirement.identity()?
+            || self.reviewed_at_unix_ms >= self.expires_at_unix_ms
+            || self.expires_at_unix_ms - self.reviewed_at_unix_ms > requirement.max_age_ms
+        {
+            return Err(GovernedPortErrorV1::Refused(
+                "review does not satisfy the genesis requirement".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Bounded reviewed artifact bytes.
+pub struct ReviewArtifactBundleV1 {
+    /// Standard-base64 result bytes.
+    pub result_bytes_base64: String,
+    /// Standard-base64 custody receipt bytes.
+    pub custody_receipt_bytes_base64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Atomic review-recording request.
+pub struct RecordReviewInputV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Campaign identity.
+    pub campaign: CampaignId,
+    /// Occurrence identifier.
+    pub occurrence: String,
+    /// Reviewed binding identity.
+    pub binding_id: Digest,
+    /// Applied requirement identity.
+    pub requirement_digest: Digest,
+    /// Authenticated review record.
+    pub review: PlanReviewV1,
+    /// Exact reviewed artifacts.
+    pub artifacts: ReviewArtifactBundleV1,
+}
+
+impl RecordReviewInputV1 {
+    /// Validates exact bindings and bounded artifact identities.
+    ///
+    /// # Errors
+    /// Refuses malformed base64, oversized artifacts, or identity mismatch.
+    pub fn validate_artifacts(&self) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != REVIEW_RECORD_INPUT_SCHEMA_V1
+            || self.binding_id != self.review.binding_id
+            || self.requirement_digest != self.review.requirement_digest
+        {
+            return Err(GovernedPortErrorV1::Refused(
+                "review input binding mismatch".to_owned(),
+            ));
+        }
+        let result = STANDARD
+            .decode(&self.artifacts.result_bytes_base64)
+            .map_err(|_| GovernedPortErrorV1::Canonical("invalid result base64".to_owned()))?;
+        let custody = STANDARD
+            .decode(&self.artifacts.custody_receipt_bytes_base64)
+            .map_err(|_| GovernedPortErrorV1::Canonical("invalid custody base64".to_owned()))?;
+        if result.len() > 16 * 1024 * 1024
+            || custody.len() > 16 * 1024 * 1024
+            || STANDARD.encode(&result) != self.artifacts.result_bytes_base64
+            || STANDARD.encode(&custody) != self.artifacts.custody_receipt_bytes_base64
+            || Digest::hash_bytes(&result) != self.review.result_digest
+            || Digest::hash_bytes(&custody) != self.review.custody_receipt_digest
+        {
+            return Err(GovernedPortErrorV1::Refused(
+                "review artifact identity mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Closed response from the enrolled review verifier.
+pub struct OwnerVerificationResponseV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Whether custody authenticity was established.
+    pub accepted: bool,
+    /// Verified binding identity.
+    pub binding_id: Digest,
+    /// Verifier configuration identity.
+    pub configuration_digest: Digest,
+    /// Verification evidence identity.
+    pub evidence_digest: Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Native Maude validator response.
+pub struct MaudePlanValidationV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Required passed result.
+    pub result: String,
+    /// Validated binding identity.
+    pub binding_id: Digest,
+    /// Validator configuration identity.
+    pub config_digest: Digest,
+    /// Stored lock identity.
+    pub stored_lock_id: Digest,
+    /// Stored compilation identity.
+    pub stored_compilation_id: Digest,
+}
+
+/// Invokes the deployment-pinned Maude validator with an exact parsed binding.
+///
+/// # Errors
+/// Refuses deployment drift, invalid binding bytes, timeout, or validator refusal.
+pub fn validate_plan_binding(
+    profile: &GovernedSharedAdmissionV1,
+    binding_bytes: &[u8],
+    deadline_unix_ms: Option<u64>,
+) -> Result<MaudePlanValidationV1, GovernedPortErrorV1> {
+    let _ = profile.plan_validator.verify(true)?;
+    let _ = profile.plan_validator_config.verify(false)?;
+    let document = JcsDocument::from_canonical_bytes(binding_bytes)
+        .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+    let _: serde_json::Value = document
+        .decode()
+        .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+    let mut binding_file = tempfile::NamedTempFile::new().map_err(GovernedPortErrorV1::Io)?;
+    std::io::Write::write_all(&mut binding_file, binding_bytes).map_err(GovernedPortErrorV1::Io)?;
+    let response: MaudePlanValidationV1 = crate::governed_ports::run_json_program_until(
+        &profile.plan_validator.path,
+        &[
+            "validate".to_owned(),
+            "--config".to_owned(),
+            profile.plan_validator_config.path.display().to_string(),
+            "--binding".to_owned(),
+            binding_file.path().display().to_string(),
+        ],
+        &serde_json::json!({}),
+        deadline_unix_ms,
+    )?;
+    if response.schema != MAUDE_PLAN_VALIDATION_SCHEMA_V1 || response.result != "passed" {
+        return Err(GovernedPortErrorV1::Refused(
+            "Maude validator did not accept the exact binding".to_owned(),
+        ));
+    }
+    Ok(response)
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewVerificationRequestV1<'a> {
+    schema: &'static str,
+    requirement: &'a ReviewRequirementV1,
+    review: &'a PlanReviewV1,
+    artifacts: &'a ReviewArtifactBundleV1,
+}
+
+/// Authenticates an accepted or rejected review and its exact custody.
+///
+/// # Errors
+/// Refuses invalid artifacts, deployment drift, timeout, or verifier mismatch.
+pub fn verify_review(
+    profile: &GovernedSharedAdmissionV1,
+    requirement: &ReviewRequirementV1,
+    input: &RecordReviewInputV1,
+    deadline_unix_ms: Option<u64>,
+) -> Result<OwnerVerificationResponseV1, GovernedPortErrorV1> {
+    input.validate_artifacts()?;
+    input.review.validate(requirement)?;
+    let _ = profile.review_verifier.verify(true)?;
+    let verifier_config = profile.review_verifier_config.verify(false)?;
+    let verifier_config_digest = canonical_file_identity(&verifier_config)?;
+    let response: OwnerVerificationResponseV1 = crate::governed_ports::run_json_program_until(
+        &profile.review_verifier.path,
+        &[
+            "--config".to_owned(),
+            profile.review_verifier_config.path.display().to_string(),
+        ],
+        &ReviewVerificationRequestV1 {
+            schema: REVIEW_VERIFICATION_REQUEST_SCHEMA_V1,
+            requirement,
+            review: &input.review,
+            artifacts: &input.artifacts,
+        },
+        deadline_unix_ms,
+    )?;
+    if response.schema != OWNER_VERIFICATION_RESPONSE_SCHEMA_V1
+        || !response.accepted
+        || response.binding_id != input.binding_id
+        || response.configuration_digest != requirement.route_enrollment_digest
+        || response.configuration_digest != verifier_config_digest
+    {
+        return Err(GovernedPortErrorV1::Refused(
+            "review verifier did not authenticate exact custody".to_owned(),
+        ));
+    }
+    Ok(response)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Tri-state permission judgment.
+pub enum PermissionPreflightDecisionV1 {
+    /// Every required check passed.
+    Allowed,
+    /// A required check determinately refused.
+    Denied,
+    /// A required check was unavailable.
+    Indeterminate,
+}
+
+/// Closed tri-state aggregation. Determinate refusal dominates unavailable
+/// evidence; authority is allowed only when every required check is positive.
+#[must_use]
+pub const fn permission_decision(
+    all_positive: bool,
+    determinate_refusal: bool,
+    unavailable: bool,
+) -> PermissionPreflightDecisionV1 {
+    if determinate_refusal {
+        PermissionPreflightDecisionV1::Denied
+    } else if all_positive && !unavailable {
+        PermissionPreflightDecisionV1::Allowed
+    } else {
+        PermissionPreflightDecisionV1::Indeterminate
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Closed read-only permission-preflight result.
+pub struct PermissionPreflightV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Sampled occurrence key.
+    pub key: OccurrenceKeyV1,
+    /// Genesis profile identity.
+    pub profile_digest: Digest,
+    /// Exact binding identity.
+    pub binding_id: Digest,
+    /// Current review identity.
+    pub review_id: Option<Digest>,
+    /// Sampled state identity.
+    pub sampled_state_digest: Digest,
+    /// Trusted evaluation time.
+    pub evaluated_at_unix_ms: u64,
+    /// Earliest evidence expiry.
+    pub expires_at_unix_ms: u64,
+    /// Tri-state decision.
+    pub decision: PermissionPreflightDecisionV1,
+    /// Evidence identities.
+    pub evidence: Vec<Digest>,
+    /// Machine-readable reasons.
+    pub reasons: Vec<String>,
+    /// Always false; preflight grants no authority.
+    pub grants_authority: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(label: &str) -> Digest {
+        Digest::hash_bytes(label.as_bytes())
+    }
+
+    #[test]
+    fn review_requires_exact_target_and_exclusive_bounded_expiry() {
+        let requirement = ReviewRequirementV1 {
+            schema: REVIEW_REQUIREMENT_SCHEMA_V1.to_owned(),
+            reviewer_id: "independent-reviewer".to_owned(),
+            route_enrollment_digest: digest("route"),
+            compiler_contract: "maude.reviewed-local-copy/v1".to_owned(),
+            max_age_ms: 100,
+        };
+        let review = PlanReviewV1 {
+            schema: PLAN_REVIEW_SCHEMA_V1.to_owned(),
+            binding_id: digest("binding"),
+            requirement_digest: requirement.identity().unwrap(),
+            dispatch_id: digest("dispatch"),
+            reviewer_id: requirement.reviewer_id.clone(),
+            verdict: ReviewVerdictV1::Accepted,
+            reviewed_at_unix_ms: 10,
+            expires_at_unix_ms: 110,
+            result_digest: digest("result"),
+            custody_receipt_digest: digest("custody"),
+        };
+        assert!(review.validate(&requirement).is_ok());
+        let mut overlong = review;
+        overlong.expires_at_unix_ms = 111;
+        assert!(overlong.validate(&requirement).is_err());
+    }
+
+    #[test]
+    fn artifact_substitution_is_refused_before_verifier_invocation() {
+        let result = b"accepted result";
+        let custody = b"custody";
+        let input = RecordReviewInputV1 {
+            schema: REVIEW_RECORD_INPUT_SCHEMA_V1.to_owned(),
+            campaign: CampaignId::from_digest(digest("campaign")),
+            occurrence: "1".to_owned(),
+            binding_id: digest("binding"),
+            requirement_digest: digest("requirement"),
+            review: PlanReviewV1 {
+                schema: PLAN_REVIEW_SCHEMA_V1.to_owned(),
+                binding_id: digest("binding"),
+                requirement_digest: digest("requirement"),
+                dispatch_id: digest("dispatch"),
+                reviewer_id: "reviewer".to_owned(),
+                verdict: ReviewVerdictV1::Accepted,
+                reviewed_at_unix_ms: 1,
+                expires_at_unix_ms: 2,
+                result_digest: Digest::hash_bytes(result),
+                custody_receipt_digest: Digest::hash_bytes(custody),
+            },
+            artifacts: ReviewArtifactBundleV1 {
+                result_bytes_base64: STANDARD.encode(b"substituted"),
+                custody_receipt_bytes_base64: STANDARD.encode(custody),
+            },
+        };
+        assert!(input.validate_artifacts().is_err());
+    }
+
+    #[test]
+    fn permission_preflight_has_all_three_outcomes_and_denial_dominates_unknown() {
+        assert_eq!(
+            permission_decision(true, false, false),
+            PermissionPreflightDecisionV1::Allowed
+        );
+        assert_eq!(
+            permission_decision(false, true, false),
+            PermissionPreflightDecisionV1::Denied
+        );
+        assert_eq!(
+            permission_decision(false, false, true),
+            PermissionPreflightDecisionV1::Indeterminate
+        );
+        assert_eq!(
+            permission_decision(false, true, true),
+            PermissionPreflightDecisionV1::Denied
+        );
+    }
+}
