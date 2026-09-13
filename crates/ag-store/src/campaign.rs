@@ -1219,6 +1219,16 @@ impl CampaignStoreV1 {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let campaign = campaign_head(&transaction)?.campaign;
+        let stored_profile: Option<String> = transaction
+            .query_row(
+                "SELECT profile_digest FROM runtime_profile WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored_profile.as_deref() != Some(profile_digest.as_str()) {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
         let same: Option<Vec<u8>> = transaction
             .query_row(
                 "SELECT input_jcs FROM shared_runs WHERE run_id=?1",

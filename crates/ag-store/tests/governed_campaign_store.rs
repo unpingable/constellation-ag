@@ -775,7 +775,7 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
     let database = directory.path().join("campaign.sqlite");
     let start = initial();
     let profile = br#"{"schema":"test.profile/v1"}"#;
-    let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile);
+    let profile_digest = Digest::hash_domain("test.profile/v1", profile);
     let mut store = CampaignStoreV1::create_with_runtime_profile(
         &database,
         &start,
@@ -792,6 +792,14 @@ fn v2_run_continuation_is_atomic_bounded_and_replays() {
         "max_steps": 8
     }))
     .unwrap();
+    assert!(matches!(
+        store.begin_shared_run_v2(
+            &digest("substituted-profile"),
+            run_input.as_bytes(),
+            NOW + 3
+        ),
+        Err(CampaignStoreErrorV1::BindingMismatch)
+    ));
     let run = store
         .begin_shared_run_v2(&profile_digest, run_input.as_bytes(), NOW + 3)
         .unwrap();
@@ -944,7 +952,7 @@ fn legacy_store_without_continuation_table_refuses_v2_before_begin() {
     let database = directory.path().join("campaign.sqlite");
     let start = initial();
     let profile = br#"{"schema":"test.profile/v1"}"#;
-    let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile);
+    let profile_digest = Digest::hash_domain("test.profile/v1", profile);
     drop(
         CampaignStoreV1::create_with_runtime_profile(
             &database,
