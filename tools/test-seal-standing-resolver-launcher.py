@@ -17,7 +17,9 @@ SPEC.loader.exec_module(SEAL)
 
 class LauncherTests(unittest.TestCase):
     def fixture(self):
-        root = pathlib.Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
         resolver = root / "ag-standing-resolver"
         resolver.write_bytes(b"#!/bin/sh\nexit 0\n")
         resolver.chmod(0o500)
@@ -76,7 +78,9 @@ class LauncherTests(unittest.TestCase):
             SEAL.load(config)
 
     def test_generated_launcher_executes_sealed_elf_image(self):
-        root = pathlib.Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
         resolver = pathlib.Path("/usr/bin/true").resolve()
         python = pathlib.Path("/usr/bin/python3").resolve()
         value = {
