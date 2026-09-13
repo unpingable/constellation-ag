@@ -124,6 +124,7 @@ def main():
         writer = threading.Thread(target=mutate)
         writer.start()
         successes = 0
+        refusals = 0
         try:
             for _ in range(20):
                 outcome = subprocess.run([racing_launcher], input=canonical(request(1000)),
@@ -133,12 +134,22 @@ def main():
                     successes += 1
                 else:
                     assert b"digest mismatch" in outcome.stderr
+                    refusals += 1
         finally:
             stop.set()
             writer.join(timeout=5)
         assert not writer.is_alive()
-        assert successes > 0
+        assert successes + refusals == 20
+        # Contention is no longer present: restore the admitted bytes and
+        # require one deterministic successful capture and execution.
+        concurrent.write_bytes(original)
+        settled = subprocess.run([racing_launcher], input=canonical(request(1000)),
+                                 capture_output=True, timeout=5, check=True)
+        assert json.loads(settled.stdout)["status"] == "current"
     print(canonical({"schema": "ag.standing-launcher-qualification/v1", "result": "passed",
+                     "concurrent_capture": {"attempts": 20, "authentic_successes": successes,
+                                            "fail_closed_refusals": refusals,
+                                            "settled_success": True},
                      "cases": ["absent", "current", "revoked", "expired",
                                "mutable_store_reread", "resolver_content_mutation_refused",
                                "concurrent_content_capture"]}).decode())
