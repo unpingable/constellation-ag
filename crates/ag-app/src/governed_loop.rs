@@ -463,6 +463,12 @@ pub enum CampaignEngineErrorV1 {
     /// Docket returned a state that is impossible at this boundary.
     #[error("Docket custody/reconciliation response is not applicable")]
     DocketResponse,
+    /// A protected V2 campaign was reached through an evidence-free legacy API.
+    #[error("protected shared-admission campaign requires the evidence-bearing engine operation")]
+    SharedAdmissionRequired,
+    /// Protected owner validation or verification boundary failed.
+    #[error(transparent)]
+    SharedPort(#[from] crate::governed_ports::GovernedPortErrorV1),
 }
 
 /// One production-reachable canonical campaign engine.
@@ -471,6 +477,19 @@ pub struct CampaignEngineV1 {
 }
 
 impl CampaignEngineV1 {
+    fn refuse_protected_legacy_entrypoint(&self) -> Result<(), CampaignEngineErrorV1> {
+        if self
+            .store
+            .runtime_profile()?
+            .is_some_and(|profile| {
+                profile.schema
+                    == crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2
+            })
+        {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        Ok(())
+    }
     /// Creates one campaign with one authority-empty occurrence bound to one
     /// exact expected executable-work identity.
     #[allow(clippy::too_many_arguments)]
@@ -574,6 +593,7 @@ impl CampaignEngineV1 {
         expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        self.refuse_protected_legacy_entrypoint()?;
         let current = self.store.current()?;
         let successor = match GovernedLoopKernelV1::record_proposal(
             &current,
@@ -597,6 +617,141 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         Ok(successor)
+    }
+
+    /// Records a proposal and exact owner-validated plan binding atomically.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_proposal_with_shared_admission<O: ObservationResolverV1>(
+        &mut self,
+        observation: ObservationRefV1,
+        proposal: ExactWorkProposalV1,
+        class: ProposalClassV1,
+        resolver: &mut O,
+        expected_observation_resolver: &str,
+        binding_jcs: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let stored = self
+            .store
+            .runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if stored.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let profile: crate::governed_ports::GovernedRuntimeProfileV2 =
+            JcsDocument::from_canonical_bytes(&stored.canonical_bytes)
+                .and_then(|document| document.decode())
+                .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        profile.verify_genesis()?;
+        let requirement_bytes = profile.shared_admission.review_requirement.verify(false)?;
+        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(
+            &requirement_bytes,
+        )?;
+        if requirement.compiler_contract != profile.shared_admission.compiler_contract {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let binding_document = JcsDocument::from_canonical_bytes(binding_jcs)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let binding: serde_json::Value = binding_document
+            .decode()
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let binding_id: Digest = serde_json::from_value(
+            binding
+                .get("binding_id")
+                .cloned()
+                .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?,
+        )
+        .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let response = crate::shared_admission::validate_plan_binding(
+            &profile.shared_admission,
+            binding_jcs,
+        )?;
+        let config_bytes = profile.shared_admission.plan_validator_config.verify(false)?;
+        if response.binding_id != binding_id
+            || response.config_digest
+                != crate::shared_admission::canonical_file_identity(&config_bytes)?
+        {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let current = self.store.current()?;
+        let successor = GovernedLoopKernelV1::record_proposal(
+            &current,
+            observation,
+            proposal,
+            class,
+            resolver,
+            expected_observation_resolver,
+            now_unix_ms,
+        )?;
+        let validation_jcs = JcsDocument::canonicalize(&response)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        self.store.commit_shared_proposal(
+            &current,
+            &successor,
+            &binding_id,
+            &requirement.identity()?,
+            binding_jcs,
+            validation_jcs.as_bytes(),
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Authenticates and durably appends accepted or rejected review custody.
+    /// This operation does not change the program counter or spend authority.
+    pub fn record_review(
+        &mut self,
+        input: &crate::shared_admission::RecordReviewInputV1,
+        now_unix_ms: u64,
+    ) -> Result<Digest, CampaignEngineErrorV1> {
+        let stored = self
+            .store
+            .runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::SharedAdmissionRequired)?;
+        if stored.schema != crate::governed_ports::GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let profile: crate::governed_ports::GovernedRuntimeProfileV2 =
+            JcsDocument::from_canonical_bytes(&stored.canonical_bytes)
+                .and_then(|document| document.decode())
+                .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        profile.verify_genesis()?;
+        let requirement = crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(
+            &profile.shared_admission.review_requirement.verify(false)?,
+        )?;
+        let current = self.store.current()?;
+        if input.campaign != current.key().campaign
+            || input.occurrence != current.key().occurrence.to_string()
+            || input.requirement_digest != requirement.identity()?
+        {
+            return Err(CampaignEngineErrorV1::SharedAdmissionRequired);
+        }
+        let verification = crate::shared_admission::verify_review(
+            &profile.shared_admission,
+            &requirement,
+            input,
+        )?;
+        let review_jcs = JcsDocument::canonicalize(&input.review)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let artifacts_jcs = JcsDocument::canonicalize(&input.artifacts)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        let verification_jcs = JcsDocument::canonicalize(&verification)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        self.store
+            .record_shared_review(
+                &current,
+                &input.binding_id,
+                &input.review.dispatch_id,
+                match input.review.verdict {
+                    crate::shared_admission::ReviewVerdictV1::Accepted => "accepted",
+                    crate::shared_admission::ReviewVerdictV1::Rejected => "rejected",
+                },
+                review_jcs.as_bytes(),
+                artifacts_jcs.as_bytes(),
+                verification_jcs.as_bytes(),
+                now_unix_ms,
+            )
+            .map_err(Into::into)
     }
 
     /// Enters the explicit standing-required state.
@@ -632,6 +787,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.refuse_protected_legacy_entrypoint()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::record_admissible(
@@ -672,6 +828,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.refuse_protected_legacy_entrypoint()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
         let successor = GovernedLoopKernelV1::record_admissible(
@@ -753,6 +910,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.refuse_protected_legacy_entrypoint()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::consume_authorization(
@@ -792,6 +950,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.refuse_protected_legacy_entrypoint()?;
         let current = self.store.current()?;
         let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
         let successor = GovernedLoopKernelV1::consume_authorization(

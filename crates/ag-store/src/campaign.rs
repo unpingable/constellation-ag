@@ -189,6 +189,41 @@ CREATE TABLE refusals (
 ) STRICT;
 ";
 
+// Additive tables are intentionally outside the V2 store-identity digest:
+// old V1-profile databases remain readable without migration, while every
+// fresh database can host protected V2 evidence.
+const SHARED_ADMISSION_SCHEMA_SQL: &str = r"
+CREATE TABLE shared_plan_admissions (
+    campaign_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    predecessor_state_digest TEXT NOT NULL,
+    binding_id TEXT NOT NULL UNIQUE,
+    requirement_digest TEXT NOT NULL,
+    binding_jcs BLOB NOT NULL,
+    validation_jcs BLOB NOT NULL,
+    admitted_at_unix_ms INTEGER NOT NULL CHECK (admitted_at_unix_ms >= 0),
+    PRIMARY KEY (campaign_id, occurrence_id),
+    FOREIGN KEY (campaign_id, occurrence_id)
+        REFERENCES occurrences(campaign_id, occurrence_id)
+) STRICT;
+
+CREATE TABLE shared_review_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    dispatch_id TEXT NOT NULL UNIQUE,
+    review_id TEXT NOT NULL UNIQUE,
+    verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'rejected')),
+    review_jcs BLOB NOT NULL,
+    artifacts_jcs BLOB NOT NULL,
+    verification_jcs BLOB NOT NULL,
+    recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+    FOREIGN KEY (campaign_id, occurrence_id)
+        REFERENCES shared_plan_admissions(campaign_id, occurrence_id)
+) STRICT;
+";
+
 /// Exact semantic transition kind stored in the authoritative journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -467,6 +502,9 @@ pub enum CampaignStoreErrorV1 {
     /// A human disposition was replayed or substituted.
     #[error("human disposition replay/substitution")]
     HumanDispositionReplay,
+    /// A protected transition used an evidence-free store operation.
+    #[error("protected shared-admission transition requires its fenced store operation")]
+    SharedAdmissionRequired,
 }
 
 /// One authoritative `SQLite` campaign store.
@@ -525,6 +563,7 @@ impl CampaignStoreV1 {
         configure_connection(&connection)?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(SCHEMA_SQL)?;
+        transaction.execute_batch(SHARED_ADMISSION_SCHEMA_SQL)?;
         let schema_digest =
             Digest::hash_domain("ag.governed-loop.store-schema/v1", SCHEMA_SQL.as_bytes());
         transaction.execute(
@@ -549,7 +588,7 @@ impl CampaignStoreV1 {
                     "runtime profile is not canonical JSON: {error}"
                 ))
             })?;
-            let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile_jcs);
+            let profile_digest = Digest::hash_domain(schema, profile_jcs);
             transaction.execute(
                 "INSERT INTO runtime_profile
                  (singleton, schema, profile_digest, profile_jcs)
@@ -713,6 +752,16 @@ impl CampaignStoreV1 {
         kind: CampaignTransitionKindV1,
         recorded_at_unix_ms: u64,
     ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        if matches!(
+            kind,
+            CampaignTransitionKindV1::ProposalRecorded
+                | CampaignTransitionKindV1::Admissible
+                | CampaignTransitionKindV1::AuthorizationConsumed
+        ) && self.runtime_profile()?.is_some_and(|profile| {
+            profile.schema == "ag.governed-loop.runtime-profile/v2"
+        }) {
+            return Err(CampaignStoreErrorV1::SharedAdmissionRequired);
+        }
         if kind == CampaignTransitionKindV1::HumanDisposition
             || kind == CampaignTransitionKindV1::CampaignCreated
         {
@@ -734,6 +783,139 @@ impl CampaignStoreV1 {
         )?;
         transaction.commit()?;
         Ok(receipt)
+    }
+
+    /// Commits proposal recording and its owner-validated shared binding in
+    /// one predecessor-fenced transaction. The evidence grants no authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_shared_proposal(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        binding_id: &Digest,
+        requirement_digest: &Digest,
+        binding_jcs: &[u8],
+        validation_jcs: &[u8],
+        recorded_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        JcsDocument::from_canonical_bytes(binding_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        JcsDocument::from_canonical_bytes(validation_jcs)
+            .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = write_transition(
+            &transaction,
+            expected,
+            successor,
+            CampaignTransitionKindV1::ProposalRecorded,
+            &CampaignTransitionEvidenceV1::None,
+            recorded_at_unix_ms,
+        )?;
+        transaction.execute(
+            "INSERT INTO shared_plan_admissions
+             (campaign_id, occurrence_id, predecessor_state_digest, binding_id,
+              requirement_digest, binding_jcs, validation_jcs, admitted_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                successor.key().campaign.as_str(),
+                successor.key().occurrence.to_string(),
+                expected.state_digest().as_str(),
+                binding_id.as_str(),
+                requirement_digest.as_str(),
+                binding_jcs,
+                validation_jcs,
+                to_i64(recorded_at_unix_ms)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Atomically appends authenticated review evidence under the current
+    /// occurrence fence. Exact duplicate delivery is idempotent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_shared_review(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        binding_id: &Digest,
+        dispatch_id: &Digest,
+        verdict: &str,
+        review_jcs: &[u8],
+        artifacts_jcs: &[u8],
+        verification_jcs: &[u8],
+        recorded_at_unix_ms: u64,
+    ) -> Result<Digest, CampaignStoreErrorV1> {
+        for bytes in [review_jcs, artifacts_jcs, verification_jcs] {
+            JcsDocument::from_canonical_bytes(bytes)
+                .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+        }
+        if !matches!(verdict, "accepted" | "rejected") {
+            return Err(CampaignStoreErrorV1::Canonical(
+                "invalid shared review verdict".to_owned(),
+            ));
+        }
+        let review_id = Digest::hash_bytes(review_jcs);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head = campaign_head(&transaction)?;
+        if head.campaign != expected.key().campaign.as_str()
+            || head.occurrence != expected.key().occurrence.to_string()
+            || head.state_digest != expected.state_digest().as_str()
+        {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let admitted: Option<String> = transaction
+            .query_row(
+                "SELECT binding_id FROM shared_plan_admissions
+                 WHERE campaign_id=?1 AND occurrence_id=?2",
+                params![head.campaign, head.occurrence],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if admitted.as_deref() != Some(binding_id.as_str()) {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let existing: Option<(String, Vec<u8>, Vec<u8>, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT review_id, review_jcs, artifacts_jcs, verification_jcs
+                 FROM shared_review_events WHERE dispatch_id=?1",
+                params![dispatch_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((identity, old_review, old_artifacts, old_verification)) = existing {
+            if old_review == review_jcs
+                && old_artifacts == artifacts_jcs
+                && old_verification == verification_jcs
+                && identity == review_id.as_str()
+            {
+                return parse_digest(&identity);
+            }
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        transaction.execute(
+            "INSERT INTO shared_review_events
+             (campaign_id, occurrence_id, binding_id, dispatch_id, review_id,
+              verdict, review_jcs, artifacts_jcs, verification_jcs, recorded_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                expected.key().campaign.as_str(),
+                expected.key().occurrence.to_string(),
+                binding_id.as_str(),
+                dispatch_id.as_str(),
+                review_id.as_str(),
+                verdict,
+                review_jcs,
+                artifacts_jcs,
+                verification_jcs,
+                to_i64(recorded_at_unix_ms)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(review_id)
     }
 
     /// Atomically consumes one exact human disposition and applies its closed effect.
@@ -893,7 +1075,7 @@ impl CampaignStoreV1 {
             .optional()?;
         row.map(|(schema, digest, canonical_bytes)| {
             let digest = parse_digest(&digest)?;
-            let expected = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, &canonical_bytes);
+            let expected = Digest::hash_domain(&schema, &canonical_bytes);
             JcsDocument::from_canonical_bytes(&canonical_bytes).map_err(|error| {
                 CampaignStoreErrorV1::Corrupt(format!(
                     "runtime profile is not canonical JSON: {error}"

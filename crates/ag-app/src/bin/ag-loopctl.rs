@@ -24,9 +24,11 @@ use ag_app::governed_ports::{
     AgIssuanceSignerV1, CommandDocketCustodyPortV1, CommandDocketReconciliationPortV1,
     CommandGovernedInterventionVerifierV1, CommandHumanDispositionVerifierV1,
     CommandObservationResolverV1, CommandStandingResolverV1, GOVERNED_RUNTIME_PROFILE_SCHEMA_V1,
-    GovernedRuntimeProfileEnrollmentV1, GovernedRuntimeProfileV1,
+    GOVERNED_RUNTIME_PROFILE_SCHEMA_V2, GovernedRuntimeProfileEnrollmentV1,
+    GovernedRuntimeProfileEnrollmentV2, GovernedRuntimeProfileV1, GovernedRuntimeProfileV2,
 };
 use ag_app::intervention_ingress::*;
+use ag_app::shared_admission::RecordReviewInputV1;
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
@@ -56,8 +58,20 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Measure deployment inputs into an explicit protected V2 profile.
+    SealRuntimeProfileV2 {
+        #[arg(long)]
+        enrollment: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Remeasure and validate one sealed runtime profile without creating authority.
     VerifyRuntimeProfile {
+        #[arg(long)]
+        runtime_profile: PathBuf,
+    },
+    /// Remeasure and validate an explicit protected V2 profile.
+    VerifyRuntimeProfileV2 {
         #[arg(long)]
         runtime_profile: PathBuf,
     },
@@ -102,6 +116,15 @@ enum Command {
         #[arg(long)]
         runtime_profile: PathBuf,
     },
+    /// Create a fresh campaign bound to a protected V2 runtime profile.
+    InitV2 {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        genesis: PathBuf,
+        #[arg(long)]
+        runtime_profile: PathBuf,
+    },
     /// Print the exact authoritative current occurrence.
     Status {
         #[arg(long)]
@@ -121,6 +144,13 @@ enum Command {
     Refusals {
         #[arg(long)]
         database: PathBuf,
+    },
+    /// Authenticate and append occurrence-bound independent review evidence.
+    RecordReview {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
     },
     /// Emit one machine-readable state/replay/profile projection for operators.
     Inspect {
@@ -405,11 +435,24 @@ fn main() -> anyhow::Result<()> {
             write_exact_file(&output, canonical.as_bytes())?;
             write_exact(&runtime_profile_receipt(&profile, canonical.as_bytes()))
         }
+        Command::SealRuntimeProfileV2 { enrollment, output } => {
+            let enrollment: GovernedRuntimeProfileEnrollmentV2 = read_exact_record(&enrollment)?;
+            let profile = enrollment.seal()?;
+            let canonical = JcsDocument::canonicalize(&profile)?;
+            write_exact_file(&output, canonical.as_bytes())?;
+            write_exact(&runtime_profile_receipt_v2(&profile, canonical.as_bytes()))
+        }
         Command::VerifyRuntimeProfile { runtime_profile } => {
             let profile: GovernedRuntimeProfileV1 = read_exact_record(&runtime_profile)?;
             profile.verify_genesis()?;
             let canonical = JcsDocument::canonicalize(&profile)?;
             write_exact(&runtime_profile_receipt(&profile, canonical.as_bytes()))
+        }
+        Command::VerifyRuntimeProfileV2 { runtime_profile } => {
+            let profile: GovernedRuntimeProfileV2 = read_exact_record(&runtime_profile)?;
+            profile.verify_genesis()?;
+            let canonical = JcsDocument::canonicalize(&profile)?;
+            write_exact(&runtime_profile_receipt_v2(&profile, canonical.as_bytes()))
         }
         Command::PrepareInterventionRequest { input, output } => {
             let draft: GovernedInterventionRequestDraftV1 = read_exact_record(&input)?;
@@ -485,9 +528,37 @@ fn main() -> anyhow::Result<()> {
             )?;
             write_exact(&engine.current()?)
         }
+        Command::InitV2 {
+            database,
+            genesis,
+            runtime_profile,
+        } => {
+            let input: GenesisInputV1 = read_exact_record(&genesis)?;
+            let profile: GovernedRuntimeProfileV2 = read_exact_record(&runtime_profile)?;
+            profile.verify_genesis()?;
+            let profile_jcs = JcsDocument::canonicalize(&profile)?;
+            let engine = CampaignEngineV1::create_with_runtime_profile(
+                &database,
+                input.campaign,
+                input.occurrence,
+                input.program,
+                input.expected_ag_work,
+                input.residuals,
+                input.budget,
+                GOVERNED_RUNTIME_PROFILE_SCHEMA_V2,
+                profile_jcs.as_bytes(),
+                now()?,
+            )?;
+            write_exact(&engine.current()?)
+        }
         Command::Status { database } => {
             let (engine, _) = open_bound(&database)?;
             write_exact(&engine.current()?)
+        }
+        Command::RecordReview { database, input } => {
+            let input: RecordReviewInputV1 = read_exact_record(&input)?;
+            let mut engine = CampaignEngineV1::open(&database)?;
+            write_exact(&engine.record_review(&input, now()?)?)
         }
         Command::Replay { database } => {
             let (engine, _) = open_bound(&database)?;
@@ -1044,6 +1115,31 @@ fn runtime_profile_receipt(
             .as_ref()
             .map(|ingress| ingress.submitter_principal.clone()),
         intervention_submitter_key_id: profile
+            .intervention_ingress
+            .as_ref()
+            .map(|ingress| ingress.submitter_key_id.clone()),
+    }
+}
+
+fn runtime_profile_receipt_v2(
+    profile: &GovernedRuntimeProfileV2,
+    canonical_bytes: &[u8],
+) -> RuntimeProfileSealReceiptV1 {
+    RuntimeProfileSealReceiptV1 {
+        schema: RUNTIME_PROFILE_SEAL_RECEIPT_SCHEMA_V1,
+        profile_schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V2,
+        profile_digest: Digest::hash_domain(GOVERNED_RUNTIME_PROFILE_SCHEMA_V2, canonical_bytes),
+        observation_resolver_id: profile.base.observation_resolver_id.clone(),
+        standing_resolver_id: profile.base.standing_resolver_id.clone(),
+        issuer_principal: profile.base.docket.issuer_principal.clone(),
+        issuer_key_id: profile.base.docket.issuer_key_id.clone(),
+        intervention_submitter_principal: profile
+            .base
+            .intervention_ingress
+            .as_ref()
+            .map(|ingress| ingress.submitter_principal.clone()),
+        intervention_submitter_key_id: profile
+            .base
             .intervention_ingress
             .as_ref()
             .map(|ingress| ingress.submitter_key_id.clone()),

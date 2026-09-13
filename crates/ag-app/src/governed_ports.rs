@@ -49,9 +49,20 @@ pub const INTERVENTION_VERIFICATION_RESPONSE_SCHEMA_V1: &str =
     "ag.governed-loop.intervention-verification-response/v1";
 /// Schema for the deployment-owned campaign runtime profile.
 pub const GOVERNED_RUNTIME_PROFILE_SCHEMA_V1: &str = "ag.governed-loop.runtime-profile/v1";
+/// Schema for a runtime profile that requires shared plan and review admission.
+pub const GOVERNED_RUNTIME_PROFILE_SCHEMA_V2: &str = "ag.governed-loop.runtime-profile/v2";
 /// Schema for the deployment input used to seal a runtime profile.
 pub const GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V1: &str =
     "ag.governed-loop.runtime-profile-enrollment/v1";
+/// Deployment enrollment schema for a protected shared-admission profile.
+pub const GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V2: &str =
+    "ag.governed-loop.runtime-profile-enrollment/v2";
+/// Closed shared-admission profile member.
+pub const GOVERNED_SHARED_ADMISSION_SCHEMA_V1: &str =
+    "ag.governed-loop.shared-admission/v1";
+/// Exact Maude governed-plan binding schema.
+pub const MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1: &str =
+    "maude.governed-plan-binding/v1";
 /// Schema for the deployment-owned Docket adapter root.
 pub const GOVERNED_DOCKET_ROOT_SCHEMA_V1: &str = "ag.governed-loop.docket-root/v1";
 /// Schema for the Docket portion of runtime-profile enrollment.
@@ -244,6 +255,109 @@ pub struct GovernedRuntimeProfileV1 {
     pub intervention_ingress: Option<GovernedInterventionIngressV1>,
 }
 
+/// Genesis-pinned programs and policy for the protected shared interface.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedSharedAdmissionV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Exact Maude binding schema accepted by the validator.
+    pub plan_binding_schema: String,
+    /// Exact compiler/executor contract.
+    pub compiler_contract: String,
+    /// Read-only Maude binding validator.
+    pub plan_validator: PinnedDeploymentFileV1,
+    /// Nonsecret validator configuration.
+    pub plan_validator_config: PinnedDeploymentFileV1,
+    /// Authenticated review-custody verifier.
+    pub review_verifier: PinnedDeploymentFileV1,
+    /// Nonsecret independent-review requirement.
+    pub review_requirement: PinnedDeploymentFileV1,
+}
+
+impl GovernedSharedAdmissionV1 {
+    /// Remeasures the complete protected boundary.
+    pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != GOVERNED_SHARED_ADMISSION_SCHEMA_V1
+            || self.plan_binding_schema != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
+            || self.compiler_contract.is_empty()
+            || self.compiler_contract.chars().any(char::is_whitespace)
+        {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid governed shared admission",
+            ));
+        }
+        let _ = self.plan_validator.verify(true)?;
+        let config = self.plan_validator_config.verify(false)?;
+        let _ = crate::shared_admission::canonical_file_identity(&config)?;
+        let _ = self.review_verifier.verify(true)?;
+        let requirement = self.review_requirement.verify(false)?;
+        crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
+        Ok(())
+    }
+}
+
+/// V2 runtime profile. V1 is a distinct type and is never implicitly upgraded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedRuntimeProfileV2 {
+    /// Exact V2 schema.
+    pub schema: String,
+    /// Unchanged V1 profile fields, flattened into the canonical object.
+    #[serde(flatten)]
+    pub base: GovernedRuntimeProfileV1Fields,
+    /// Required shared-admission boundary.
+    pub shared_admission: GovernedSharedAdmissionV1,
+}
+
+/// Fields common to V1 and V2 profiles; serialization remains flat.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedRuntimeProfileV1Fields {
+    pub profile_label: String,
+    pub observation_resolver: PinnedDeploymentFileV1,
+    pub observation_resolver_id: String,
+    pub standing_resolver: PinnedDeploymentFileV1,
+    pub standing_resolver_id: String,
+    pub max_standing_ttl_ms: u64,
+    pub exact_work_catalog: PinnedDeploymentFileV1,
+    pub controlling_review: Option<PinnedDeploymentFileV1>,
+    pub docket: GovernedDocketRootV1,
+    pub human_verifier: Option<PinnedDeploymentFileV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention_ingress: Option<GovernedInterventionIngressV1>,
+}
+
+impl GovernedRuntimeProfileV2 {
+    /// Validates V2 without accepting a V1 object or optional shared policy.
+    pub fn verify_genesis(&self) -> Result<(), GovernedPortErrorV1> {
+        if self.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid governed runtime profile v2",
+            ));
+        }
+        self.as_v1_for_common_validation().verify_genesis()?;
+        self.shared_admission.verify_all()
+    }
+
+    fn as_v1_for_common_validation(&self) -> GovernedRuntimeProfileV1 {
+        GovernedRuntimeProfileV1 {
+            schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V1.to_owned(),
+            profile_label: self.base.profile_label.clone(),
+            observation_resolver: self.base.observation_resolver.clone(),
+            observation_resolver_id: self.base.observation_resolver_id.clone(),
+            standing_resolver: self.base.standing_resolver.clone(),
+            standing_resolver_id: self.base.standing_resolver_id.clone(),
+            max_standing_ttl_ms: self.base.max_standing_ttl_ms,
+            exact_work_catalog: self.base.exact_work_catalog.clone(),
+            controlling_review: self.base.controlling_review.clone(),
+            docket: self.base.docket.clone(),
+            human_verifier: self.base.human_verifier.clone(),
+            intervention_ingress: self.base.intervention_ingress.clone(),
+        }
+    }
+}
+
 impl GovernedRuntimeProfileV1 {
     /// Validates and measures every genesis-bound component.
     pub fn verify_genesis(&self) -> Result<(), GovernedPortErrorV1> {
@@ -380,6 +494,117 @@ pub struct GovernedRuntimeProfileEnrollmentV1 {
     /// Optional intervention submitting-service enrollment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_ingress: Option<GovernedInterventionIngressEnrollmentV1>,
+}
+
+/// Deployment paths measured into the required V2 shared-admission member.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedSharedAdmissionEnrollmentV1 {
+    pub schema: String,
+    pub plan_binding_schema: String,
+    pub compiler_contract: String,
+    pub plan_validator: PathBuf,
+    pub plan_validator_config: PathBuf,
+    pub review_verifier: PathBuf,
+    pub review_requirement: PathBuf,
+}
+
+/// Explicit V2 enrollment. It cannot deserialize from or seal as V1.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedRuntimeProfileEnrollmentV2 {
+    pub schema: String,
+    #[serde(flatten)]
+    pub base: GovernedRuntimeProfileEnrollmentV1Fields,
+    pub shared_admission: GovernedSharedAdmissionEnrollmentV1,
+}
+
+/// Common enrollment fields serialized flat in V2.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedRuntimeProfileEnrollmentV1Fields {
+    pub profile_label: String,
+    pub observation_resolver: PathBuf,
+    pub observation_resolver_id: String,
+    pub standing_resolver: PathBuf,
+    pub standing_resolver_id: String,
+    pub max_standing_ttl_ms: u64,
+    pub exact_work_catalog: PathBuf,
+    pub controlling_review: Option<PathBuf>,
+    pub docket: GovernedDocketRootEnrollmentV1,
+    pub human_verifier: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intervention_ingress: Option<GovernedInterventionIngressEnrollmentV1>,
+}
+
+impl GovernedRuntimeProfileEnrollmentV2 {
+    /// Measures every V2 component and performs a second complete verification.
+    pub fn seal(self) -> Result<GovernedRuntimeProfileV2, GovernedPortErrorV1> {
+        if self.schema != GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V2
+            || self.shared_admission.schema != GOVERNED_SHARED_ADMISSION_SCHEMA_V1
+            || self.shared_admission.plan_binding_schema
+                != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
+        {
+            return Err(GovernedPortErrorV1::InvalidConfiguration(
+                "invalid governed runtime profile enrollment v2",
+            ));
+        }
+        let shared = GovernedSharedAdmissionV1 {
+            schema: self.shared_admission.schema,
+            plan_binding_schema: self.shared_admission.plan_binding_schema,
+            compiler_contract: self.shared_admission.compiler_contract,
+            plan_validator: PinnedDeploymentFileV1::measure(
+                self.shared_admission.plan_validator,
+                true,
+            )?,
+            plan_validator_config: PinnedDeploymentFileV1::measure(
+                self.shared_admission.plan_validator_config,
+                false,
+            )?,
+            review_verifier: PinnedDeploymentFileV1::measure(
+                self.shared_admission.review_verifier,
+                true,
+            )?,
+            review_requirement: PinnedDeploymentFileV1::measure(
+                self.shared_admission.review_requirement,
+                false,
+            )?,
+        };
+        let legacy = GovernedRuntimeProfileEnrollmentV1 {
+            schema: GOVERNED_RUNTIME_PROFILE_ENROLLMENT_SCHEMA_V1.to_owned(),
+            profile_label: self.base.profile_label,
+            observation_resolver: self.base.observation_resolver,
+            observation_resolver_id: self.base.observation_resolver_id,
+            standing_resolver: self.base.standing_resolver,
+            standing_resolver_id: self.base.standing_resolver_id,
+            max_standing_ttl_ms: self.base.max_standing_ttl_ms,
+            exact_work_catalog: self.base.exact_work_catalog,
+            controlling_review: self.base.controlling_review,
+            docket: self.base.docket,
+            human_verifier: self.base.human_verifier,
+            intervention_ingress: self.base.intervention_ingress,
+        }
+        .seal()?;
+        let profile = GovernedRuntimeProfileV2 {
+            schema: GOVERNED_RUNTIME_PROFILE_SCHEMA_V2.to_owned(),
+            base: GovernedRuntimeProfileV1Fields {
+                profile_label: legacy.profile_label,
+                observation_resolver: legacy.observation_resolver,
+                observation_resolver_id: legacy.observation_resolver_id,
+                standing_resolver: legacy.standing_resolver,
+                standing_resolver_id: legacy.standing_resolver_id,
+                max_standing_ttl_ms: legacy.max_standing_ttl_ms,
+                exact_work_catalog: legacy.exact_work_catalog,
+                controlling_review: legacy.controlling_review,
+                docket: legacy.docket,
+                human_verifier: legacy.human_verifier,
+                intervention_ingress: legacy.intervention_ingress,
+            },
+            shared_admission: shared,
+        };
+        profile.verify_genesis()?;
+        Ok(profile)
+    }
 }
 
 /// Deployment input for one authenticated non-browser intervention submitter.
@@ -1018,7 +1243,7 @@ pub enum GovernedPortErrorV1 {
     MalformedResponse(String),
 }
 
-fn run_json_program<I, O>(
+pub(crate) fn run_json_program<I, O>(
     program: &Path,
     arguments: &[String],
     input: &I,
