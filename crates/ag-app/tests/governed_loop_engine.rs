@@ -3106,34 +3106,68 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
             NOW + 4,
         )
         .unwrap();
-    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    assert_eq!(
+        authorized.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 
-    for case in ["type", "profile", "occurrence", "observation", "subject", "resolver", "stale"] {
+    for case in [
+        "type",
+        "profile",
+        "occurrence",
+        "observation",
+        "subject",
+        "resolver",
+        "stale",
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let mut engine = create_engine(&directory, ResidualSetV1::default());
         let mut boundary = RepositoryQualificationBoundary::current(expected.clone());
         let mut standing = StandingBoundary::current();
         advance_repository_specimen(&mut engine, &mut boundary);
         match case {
-            "type" => boundary.basis = TypedOpaqueObservationBasisV1::new(
-                "worker.asserted-qualified/v1".to_owned(), expected.basis_identity.clone()).unwrap(),
-            "profile" => boundary.basis = TypedOpaqueObservationBasisV1::new(
-                REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
-                digest("substituted-applicability-profile")).unwrap(),
+            "type" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    "worker.asserted-qualified/v1".to_owned(),
+                    expected.basis_identity.clone(),
+                )
+                .unwrap()
+            }
+            "profile" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
+                    digest("substituted-applicability-profile"),
+                )
+                .unwrap()
+            }
             "occurrence" => boundary.substitute_occurrence = Some(occurrence(99)),
-            "observation" => boundary.substitute_observation = Some(
-                ObservationRefV1::from_digest(digest("worker-self-asserted-observation"))),
+            "observation" => {
+                boundary.substitute_observation = Some(ObservationRefV1::from_digest(digest(
+                    "worker-self-asserted-observation",
+                )))
+            }
             "subject" => boundary.substitute_subject = Some(digest("other-subject")),
             "resolver" => boundary.resolver_id = "controller.self-qualification/v1".to_owned(),
             "stale" => boundary.status = TypedObservationStatusV1::Stale,
             _ => unreachable!(),
         }
         let before = engine.current().unwrap();
-        assert!(engine.decide_with_catalog_v2(
-            &mut boundary, &mut standing, &catalog, None,
-            REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-            MAX_STANDING_TTL_MS, NOW + 3).is_err(), "{case}");
+        assert!(
+            engine
+                .decide_with_catalog_v2(
+                    &mut boundary,
+                    &mut standing,
+                    &catalog,
+                    None,
+                    REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                    STANDING_RESOLVER_ID,
+                    MAX_STANDING_TTL_MS,
+                    NOW + 3
+                )
+                .is_err(),
+            "{case}"
+        );
         assert_eq!(engine.current().unwrap(), before, "{case}");
         assert_eq!(engine.replay().unwrap().ag_spends, 0, "{case}");
     }
@@ -3141,15 +3175,30 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
     let directory = tempfile::tempdir().unwrap();
     let mut engine = create_engine(&directory, ResidualSetV1::default());
     let mut boundary = RepositoryQualificationBoundary::current(expected);
-    assert!(engine.record_proposal(
-        ObservationRefV1::from_digest(digest("repository-qualification-observation")),
-        proposal("worker-substituted-work"), ProposalClassV1::Initial, &mut boundary,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, NOW + 1).is_err());
+    assert!(
+        engine
+            .record_proposal(
+                ObservationRefV1::from_digest(digest("repository-qualification-observation")),
+                proposal("worker-substituted-work"),
+                ProposalClassV1::Initial,
+                &mut boundary,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                NOW + 1
+            )
+            .is_err()
+    );
     assert_eq!(boundary.calls, 0);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 
-    for source in [include_str!("../src/governed_loop.rs"), include_str!("../../ag-campaign/src/governed.rs")] {
-        for forbidden in ["nq.campaign-stage-qualification", "NqQualificationStatus", "ordered_gates"] {
+    for source in [
+        include_str!("../src/governed_loop.rs"),
+        include_str!("../../ag-campaign/src/governed.rs"),
+    ] {
+        for forbidden in [
+            "nq.campaign-stage-qualification",
+            "NqQualificationStatus",
+            "ordered_gates",
+        ] {
             assert!(!source.contains(forbidden));
         }
     }
@@ -3165,7 +3214,10 @@ fn external_nq_nightshift_resolution_authorizes_the_exact_catalog_entry() {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V3);
     assert_eq!(resolution.resolver_id, REPOSITORY_QUALIFICATION_RESOLVER_ID);
-    assert_eq!(resolution.basis.basis_type, REPOSITORY_QUALIFICATION_BASIS_TYPE);
+    assert_eq!(
+        resolution.basis.basis_type,
+        REPOSITORY_QUALIFICATION_BASIS_TYPE
+    );
     assert_eq!(resolution.key.campaign, campaign());
     assert_eq!(resolution.key.occurrence, occurrence(1));
     assert_eq!(resolution.subject, digest("subject"));
@@ -3177,19 +3229,45 @@ fn external_nq_nightshift_resolution_authorizes_the_exact_catalog_entry() {
     let mut engine = create_engine(&directory, ResidualSetV1::default());
     let mut observation = FixedRepositoryQualificationResolution(resolution);
     let mut standing = StandingBoundary::current();
-    engine.record_proposal(
-        observation_ref, proposal("work-1"), ProposalClassV1::Initial,
-        &mut observation, REPOSITORY_QUALIFICATION_RESOLVER_ID, NOW + 1).unwrap();
+    engine
+        .record_proposal(
+            observation_ref,
+            proposal("work-1"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap();
     engine.require_standing(NOW + 2).unwrap();
-    engine.decide_with_catalog_v2(
-        &mut observation, &mut standing, &catalog, None,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-        MAX_STANDING_TTL_MS, NOW + 3).unwrap();
-    let authorized = engine.authorize_with_catalog_v2(
-        &mut observation, &mut standing, &catalog, None,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-        MAX_STANDING_TTL_MS, NOW + 4).unwrap();
-    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    engine
+        .decide_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap();
+    let authorized = engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        authorized.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }
 
@@ -3244,9 +3322,34 @@ fn external_reservation_realization_authorizes_exactly_once() {
         )
         .unwrap();
     engine.require_standing(NOW + 2).unwrap();
-    engine.decide_with_catalog_v2(&mut observation, &mut standing, &catalog, None, REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID, MAX_STANDING_TTL_MS, NOW + 3).unwrap();
-    let authorized = engine.authorize_with_catalog_v2(&mut observation, &mut standing, &catalog, None, REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID, MAX_STANDING_TTL_MS, NOW + 4).unwrap();
-    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    engine
+        .decide_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap();
+    let authorized = engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        authorized.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }
 
@@ -3790,10 +3893,7 @@ fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
     let mut basis_identities = BTreeSet::new();
     for (index, resolution) in resolutions.into_iter().enumerate() {
         assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V3);
-        assert_eq!(
-            resolution.resolver_id,
-            REPOSITORY_QUALIFICATION_RESOLVER_ID
-        );
+        assert_eq!(resolution.resolver_id, REPOSITORY_QUALIFICATION_RESOLVER_ID);
         assert_eq!(
             resolution.basis.basis_type,
             REPOSITORY_QUALIFICATION_BASIS_TYPE
@@ -3850,11 +3950,6 @@ fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
             authorized.program_counter(),
             ProgramCounterV1::AuthorizationConsumed
         );
-        assert_eq!(
-            engine.replay().unwrap().ag_spends,
-            1,
-            "stage {}",
-            index + 1
-        );
+        assert_eq!(engine.replay().unwrap().ag_spends, 1, "stage {}", index + 1);
     }
 }
