@@ -3383,7 +3383,8 @@ fn verify_shared_runs(
                     "shared run continuation failed replay".to_owned(),
                 ));
             }
-            *tail.expect("V2 continuation checked above") = row.6.clone();
+            tail.expect("V2 continuation checked above")
+                .clone_from(&row.6);
             *next = next.saturating_add(1);
         }
         for tail in v2_tails.values() {
