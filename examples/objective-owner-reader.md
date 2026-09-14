@@ -1,8 +1,9 @@
 # Read one application-owned objective criterion from NQ
 
-Status: public generic example. The reader and its component-only substitution
-controls are implemented. Actual NQ-to-AG integration qualification is pending
-the root-owned qualification gate.
+Status: public generic example with 18 bounded reader controls and an actual
+Maude/Monitor/Nightshift/NQ/Phosphor read-path check. The check preserved a fresh
+failed assessment separately from stale evidence and an overrun maintenance
+window. A public-only composed recipe and release are not yet qualified.
 
 `phosphor-objective-owner-reader` projects one caller-authored objective
 criterion from an existing NQ `saved-check condition` record. It does not read

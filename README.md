@@ -77,6 +77,10 @@ exact Maude-authored goal to owner-linked runs without inferring completion.
 The [NQ condition reader example](examples/objective-owner-reader.md) shows how
 an application can attach an exact saved-check result to one authored criterion,
 keeping currentness and maintenance separate from the result and permission.
+The [composed read example](examples/objective-owner-composed.md) adds real
+Maude authoring, finite Monitor/Nightshift/NQ acquisition and a Phosphor read,
+then inspects the same result after its freshness window expires. It remains a
+development example until its separately pinned public profile is qualified.
 Authenticated operator intent is represented by several exact, narrow request
 classes—never a generic retry—and is specified in
 [`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).
