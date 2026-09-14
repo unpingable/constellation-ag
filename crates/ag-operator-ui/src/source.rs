@@ -1486,14 +1486,9 @@ pub fn assemble_objective_detail(
             .into_iter()
             .map(
                 |(
-                    campaign_id,
-                    occurrence_id,
-                    proposal_id,
-                    exact_work_id,
-                    maude_plan_ref,
-                    token,
-                ),
-                 detail| {
+                    (campaign_id, occurrence_id, proposal_id, exact_work_id, maude_plan_ref, token),
+                    detail,
+                )| {
                     ObjectiveOccurrenceLinkV1 {
                         campaign_id,
                         occurrence_id,

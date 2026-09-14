@@ -1,6 +1,5 @@
 //! Loopback-only HTTP transport for the read-only operator projection.
 
-use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -396,6 +395,7 @@ pub fn validate_bind_ip(ip: IpAddr) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::source::OperatorSourceConfigV1;
+    use std::collections::BTreeSet;
 
     #[test]
     fn routes_have_no_mutation_method() {

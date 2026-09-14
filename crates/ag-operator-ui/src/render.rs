@@ -432,7 +432,11 @@ pub fn public_objective_projection(model: &PublicObjectiveProjectionV1) -> Strin
         );
     }
     body.push_str("</section>");
-    page_with_mode("separately approved public artifact", &body)
+    page_with_mode(
+        "Objective summary · public artifact",
+        &body,
+        "separately approved public artifact",
+    )
 }
 
 fn campaign_detail_selection(
