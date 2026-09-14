@@ -104,5 +104,5 @@ This qualifies a local read path, not a reproducible suite release or a full
 application migration. External applications still own their presentation
 schema, domain interpretation and deployment. Automatic condition assessment,
 prerequisite assembly and cross-repository objective discovery are not supplied
-by this contract. See the [Integration guide](https://unpingable.com/constellation/integration/)
+by this contract. See the [Integration guide](https://unpingable.com/constellation/integration.html)
 for separately qualified compositions and public prerequisites.
