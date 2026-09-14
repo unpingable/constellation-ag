@@ -1,5 +1,6 @@
 //! Loopback-only HTTP transport for the read-only operator projection.
 
+use std::collections::BTreeSet;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -178,8 +179,70 @@ fn route(target: &str, reader: &OperatorReaderV1) -> ResponseV1 {
             content_type: "text/css; charset=utf-8",
             body: render::STYLE.as_bytes().to_vec(),
         },
-        _ => campaign_route(path, reader),
+        _ => public_objective_route(path, reader)
+            .or_else(|| objective_route(path, reader))
+            .unwrap_or_else(|| campaign_route(path, reader)),
     }
+}
+
+/// Serves a static, separately approved public-safe artifact through the
+/// existing loopback-only GET/HEAD server. No bind or mutation behavior changes.
+fn public_objective_route(path: &str, reader: &OperatorReaderV1) -> Option<ResponseV1> {
+    let (token, json) = if let Some(token) = path.strip_prefix("/public/objectives/") {
+        (token, false)
+    } else if let Some(token) = path.strip_prefix("/api/v1/public/objectives/") {
+        (token, true)
+    } else {
+        return None;
+    };
+    if !valid_token(token) {
+        return Some(ResponseV1::plain(404, "not found".to_owned()));
+    }
+    Some(match reader.public_objective_projection(token) {
+        Ok(model) if json => ResponseV1::json(200, &model),
+        Ok(model) => ResponseV1::html(200, render::public_objective_projection(&model)),
+        Err(error) if json => ResponseV1::json(
+            404,
+            &ApiErrorV1 {
+                schema: "ag.operator-ui.error/v1",
+                error: &error,
+            },
+        ),
+        Err(error) => ResponseV1::html(
+            404,
+            visible_html_error("Approved public objective unavailable", &error),
+        ),
+    })
+}
+
+/// Objective records are an additive read projection. They reuse the existing
+/// loopback GET/HEAD transport and have no mutation or publication route.
+fn objective_route(path: &str, reader: &OperatorReaderV1) -> Option<ResponseV1> {
+    let (token, json) = if let Some(token) = path.strip_prefix("/objective/") {
+        (token, false)
+    } else if let Some(token) = path.strip_prefix("/api/v1/objectives/") {
+        (token, true)
+    } else {
+        return None;
+    };
+    if !valid_token(token) {
+        return Some(ResponseV1::plain(404, "not found".to_owned()));
+    }
+    Some(match reader.objective_detail(token) {
+        Ok(model) if json => ResponseV1::json(200, &model),
+        Ok(model) => ResponseV1::html(
+            200,
+            render::objective_detail_with_context(&model, reader.mode_label()),
+        ),
+        Err(error) if json => ResponseV1::json(
+            404,
+            &ApiErrorV1 {
+                schema: "ag.operator-ui.error/v1",
+                error: &error,
+            },
+        ),
+        Err(error) => ResponseV1::html(404, visible_html_error("Objective unavailable", &error)),
+    })
 }
 
 fn campaign_route(path: &str, reader: &OperatorReaderV1) -> ResponseV1 {
@@ -367,6 +430,9 @@ mod tests {
             nightshift: None,
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let page = route("/", &reader);
@@ -399,6 +465,9 @@ mod tests {
             nightshift: None,
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let response = route(

@@ -12,7 +12,8 @@ use serde_json::Value;
 use crate::links::GovernedRuntimeLinkV1;
 use crate::model::{
     AgInspectV1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1, DocketInspectionV1,
-    DocketRecordStatusV1, ProjectionCorrespondenceV1, RelatedSourceV1, SourceResultV1,
+    DocketRecordStatusV1, MaudeObjectiveAvailabilityV1, ObjectiveDetailV1,
+    ProjectionCorrespondenceV1, PublicObjectiveProjectionV1, RelatedSourceV1, SourceResultV1,
 };
 use crate::source::selected_snapshot;
 
@@ -321,6 +322,119 @@ pub fn campaign_detail_for_link_with_context(
     campaign_detail_selection(model, source_mode, Some(link))
 }
 
+/// Renders an additive objective projection. This is an operator read view:
+/// it does not publish Maude content and never derives completion from links.
+#[must_use]
+pub fn objective_detail_with_context(model: &ObjectiveDetailV1, source_mode: &str) -> String {
+    let mut body = String::new();
+    let objective = &model.objective;
+    let availability = match objective.availability {
+        MaudeObjectiveAvailabilityV1::Available => "available",
+        MaudeObjectiveAvailabilityV1::Unavailable => "unavailable",
+        MaudeObjectiveAvailabilityV1::Conflicting => "conflicting",
+    };
+    let _ = write!(
+        body,
+        "<div class=eyebrow>Phosphor / objective projection</div><h1>Objective projection</h1><p class=lede><span class=projection>read-only assembly</span> Maude authored content, Nightshift lineage, and governed occurrence records remain separate. Occurrence outcome never establishes objective completion.</p><section class=panel wide><h2>Maude source</h2><div class=kv><div class=k>availability</div><div class=v><span class=unknown>{}</span></div><div class=k>publication</div><div class=v>{}</div><div class=k>captured</div><div class=v>{}</div></div></section>",
+        escape(availability),
+        escape(&objective.publication),
+        objective.captured_at_unix_ms,
+    );
+    if let (Some(goal), Some(digest)) = (&objective.goal, &objective.plan_digest) {
+        let _ = write!(
+            body,
+            "<section class=panel wide><h2>Authored objective</h2><p>{}</p><div class=kv><div class=k>exact plan digest</div><div class=v><code>{}</code></div></div></section>",
+            escape(goal),
+            escape(digest)
+        );
+    } else if let Some(error) = &objective.error_code {
+        let _ = write!(
+            body,
+            "<section class=panel attention><h2>Objective source unavailable</h2><p><span class=unknown>{}</span> No authored fields were supplied.</p></section>",
+            escape(error)
+        );
+    }
+    body.push_str("<section class=panel wide><h2>Completion conditions</h2>");
+    if model.conditions.is_empty() {
+        body.push_str(
+            "<p class=empty>No available authored conditions. Completion is unknown.</p>",
+        );
+    }
+    for condition in &model.conditions {
+        let _ = write!(
+            body,
+            "<div class=residual><span class=unknown>unknown</span> <code>{}</code> {}</div>",
+            escape(&condition.condition_id),
+            escape(&condition.criterion)
+        );
+    }
+    body.push_str("</section><section class=panel wide><h2>Exact governed occurrence links</h2>");
+    if model.occurrences.is_empty() {
+        body.push_str(
+            "<p class=empty>No exact Nightshift authoring lineage matched this plan revision.</p>",
+        );
+    }
+    for link in &model.occurrences {
+        let locator = link
+            .detail_locator_token
+            .as_ref()
+            .map(|token| {
+                format!(
+                    "<a href=\"/campaign/{}\">open operator detail</a>",
+                    escape(token)
+                )
+            })
+            .unwrap_or_else(|| "operator detail unavailable".to_owned());
+        let _ = write!(
+            body,
+            "<div class=residual><code>{}</code> / <code>{}</code> · proposal <code>{}</code> · work <code>{}</code> · {}</div>",
+            escape(&link.campaign_id),
+            escape(&link.occurrence_id),
+            escape(&link.proposal_id),
+            escape(&link.exact_work_id),
+            locator
+        );
+    }
+    body.push_str("</section><section class=panel wide><h2>Causal prerequisites</h2><p><span class=unknown>unknown</span> No owner-supplied prerequisite relation is available; an empty occurrence list does not establish absence.</p></section>");
+    if !model.causal_unavailable.is_empty() {
+        body.push_str("<section class=panel attention><h2>Unresolved causal candidates</h2>");
+        for unavailable in &model.causal_unavailable {
+            let _ = write!(
+                body,
+                "<div class=residual><code>{}</code> {}</div>",
+                escape(&unavailable.locator_token),
+                escape(&unavailable.detail)
+            );
+        }
+        body.push_str("</section>");
+    }
+    page_with_mode("Objective · read-only assembly", &body, source_mode)
+}
+
+/// Renders only the separately approved public-safe artifact. It cannot reach
+/// the operator objective, Maude source result, owner diagnostics, or links.
+#[must_use]
+pub fn public_objective_projection(model: &PublicObjectiveProjectionV1) -> String {
+    let mut body = String::new();
+    let _ = write!(
+        body,
+        "<div class=eyebrow>Phosphor / approved public projection</div><h1>Objective summary</h1><p class=lede>{}</p><section class=panel wide><h2>Approved receipts</h2>",
+        escape(&model.approved_summary)
+    );
+    if model.approved_receipt_urls.is_empty() {
+        body.push_str("<p class=empty>No public receipt URLs were approved.</p>");
+    }
+    for url in &model.approved_receipt_urls {
+        let _ = write!(
+            body,
+            "<div class=residual><a href=\"{}\">approved public receipt</a></div>",
+            escape(url)
+        );
+    }
+    body.push_str("</section>");
+    page_with_mode("separately approved public artifact", &body)
+}
+
 fn campaign_detail_selection(
     model: &CampaignDetailV1,
     source_mode: &str,
@@ -612,7 +726,9 @@ fn timeline(
             .iter()
             .map(|transition| transition.successor.key().occurrence.to_string())
             .collect::<BTreeSet<_>>();
-        body.push_str("<nav class=occurrence-jumps aria-label=\"Run jumps\"><span class=eyebrow>Runs</span>");
+        body.push_str(
+            "<nav class=occurrence-jumps aria-label=\"Run jumps\"><span class=eyebrow>Runs</span>",
+        );
         for occurrence in &occurrences {
             let _ = write!(
                 body,
@@ -1506,7 +1622,9 @@ fn execution(
                 if let Some(record) = &value.record {
                     let status = match record.status {
                         DocketRecordStatusV1::Accepted => "accepted — outcome unknown",
-                        DocketRecordStatusV1::Settled => "settled — outcome recorded (not necessarily success)",
+                        DocketRecordStatusV1::Settled => {
+                            "settled — outcome recorded (not necessarily success)"
+                        }
                         DocketRecordStatusV1::Indeterminate => {
                             "indeterminate — reconciliation required"
                         }

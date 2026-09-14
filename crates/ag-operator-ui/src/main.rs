@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use ag_operator_ui::server::{serve, validate_bind_ip};
 use ag_operator_ui::source::{
-    DocketReadSourceV1, MaudeAcquisitionReadSourceV1, NightshiftReadSourceV1, OperatorReaderV1,
-    OperatorSourceConfigV1,
+    DocketReadSourceV1, MaudeAcquisitionReadSourceV1, MaudeObjectiveReadSourceV1,
+    NightshiftReadSourceV1, OperatorReaderV1, OperatorSourceConfigV1,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -26,7 +26,7 @@ struct Args {
     ag_loopctl: Option<PathBuf>,
 
     /// Deterministic captured corpus for presentation qualification only.
-    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state", "maude_acquisition_bin", "maude_acquisition_ledger"])]
+    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state", "maude_acquisition_bin", "maude_acquisition_ledger", "maude_objective_bin", "maude_objective_plan", "maude_objective_expected_plan_digest", "public_objective_projection"])]
     demo_corpus: Option<PathBuf>,
 
     /// Absolute path to the canonical `nightshift` executable.
@@ -52,6 +52,26 @@ struct Args {
     /// Existing Maude acquisition trigger/request/event ledger.
     #[arg(long, requires = "maude_acquisition_bin")]
     maude_acquisition_ledger: Option<PathBuf>,
+
+    /// Absolute path to the closed Maude PlanDocument reader.
+    #[arg(long, requires_all = ["maude_objective_plan", "maude_objective_expected_plan_digest"])]
+    maude_objective_bin: Option<PathBuf>,
+
+    /// Existing PlanDocument file consulted by the bounded Maude reader.
+    #[arg(long, requires_all = ["maude_objective_bin", "maude_objective_expected_plan_digest"])]
+    maude_objective_plan: Option<PathBuf>,
+
+    /// Exact expected `sha256:` PlanDocument digest for the objective read.
+    #[arg(long, requires_all = ["maude_objective_bin", "maude_objective_plan"])]
+    maude_objective_expected_plan_digest: Option<String>,
+
+    /// Separately approved public-safe objective projection artifact.
+    #[arg(long)]
+    public_objective_projection: Option<PathBuf>,
+
+    /// Explicit approved public receipt URL; repeat for each allowed URL.
+    #[arg(long = "public-approved-receipt-url")]
+    public_approved_receipt_urls: Vec<String>,
 
     /// Loopback address for the local HTTP listener.
     #[arg(long, default_value = "127.0.0.1:8417")]
@@ -81,6 +101,23 @@ fn main() -> Result<()> {
             (None, None) => None,
             _ => bail!("Maude acquisition binary and ledger must be configured together"),
         };
+        let maude_objective = match (
+            args.maude_objective_bin,
+            args.maude_objective_plan,
+            args.maude_objective_expected_plan_digest,
+        ) {
+            (Some(program), Some(plan), Some(expected_plan_digest)) => {
+                Some(MaudeObjectiveReadSourceV1 {
+                    program,
+                    plan,
+                    expected_plan_digest,
+                })
+            }
+            (None, None, None) => None,
+            _ => bail!(
+                "Maude objective binary, plan, and expected digest must be configured together"
+            ),
+        };
         OperatorReaderV1::new(OperatorSourceConfigV1 {
             campaign_root: args
                 .campaign_root
@@ -91,6 +128,9 @@ fn main() -> Result<()> {
             nightshift,
             docket,
             maude_acquisition,
+            maude_objective,
+            public_objective_projection: args.public_objective_projection,
+            public_approved_receipt_urls: args.public_approved_receipt_urls.into_iter().collect(),
         })
         .map_err(anyhow::Error::msg)
         .context("validate read-only operator sources")?

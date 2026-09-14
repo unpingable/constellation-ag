@@ -52,6 +52,13 @@ pub const MAUDE_ACQUISITION_HISTORY_SCHEMA_V1: &str =
     "maude.external-evidence-acquisition-history/v1";
 /// Exact supported Docket inspection schema.
 pub const DOCKET_INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
+/// Exact schema for an additive, read-only objective projection.
+pub const OBJECTIVE_DETAIL_SCHEMA_V1: &str = "phosphor-ng.objective-detail/v1";
+/// Exact owner schema for the deliberately small Maude objective read result.
+pub const MAUDE_OBJECTIVE_READ_SCHEMA_V1: &str = "maude.objective-source/v1";
+/// Exact schema for a separately approved, public-safe objective projection.
+pub const PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1: &str =
+    "phosphor-ng.public-objective-projection/v1";
 /// Exact schema for a deterministic, read-only presentation corpus.
 pub const DEMO_CORPUS_SCHEMA_V1: &str = "ag.operator-ui.demo-corpus/v1";
 
@@ -638,6 +645,8 @@ pub enum ReadCommandNameV1 {
     NightshiftExportExternalObservation,
     /// Maude exact acquisition trigger/request/event history.
     MaudeExportObservationAcquisitions,
+    /// Maude exact authored objective source for one expected plan digest.
+    MaudeObjectiveRead,
     /// Docket exact persisted governed-loop record.
     DocketGovernedLoopInspect,
 }
@@ -824,6 +833,144 @@ pub struct CampaignDetailV1 {
     pub docket: Vec<RelatedSourceV1<DocketInspectionV1>>,
 }
 
+/// One disposition supplied by the owner of an authored completion condition.
+/// Phosphor retains `Unknown` rather than deriving a result from an occurrence.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveConditionDispositionV1 {
+    OwnerAttested,
+    Unknown,
+    Unavailable,
+}
+
+/// One authored criterion and its projection state. An occurrence does not
+/// change this state; missing owner assessment is explicitly unknown.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveConditionV1 {
+    /// Stable identifier from the owner result.
+    pub condition_id: String,
+    /// Operator-authored condition text.
+    pub criterion: String,
+    /// Owner result; this is never inferred from execution state.
+    pub disposition: ObjectiveConditionDispositionV1,
+    /// No owner assessment is available in this initial read contract.
+    pub owner_record_ref: Option<String>,
+}
+
+/// Exact availability result from Maude's bounded objective read.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaudeObjectiveAvailabilityV1 {
+    Available,
+    Unavailable,
+    Conflicting,
+}
+
+/// One Maude-authored acceptance criterion. The identifier is derived by
+/// Maude from the exact plan digest, criterion index, and text.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaudeAcceptanceCriterionV1 {
+    pub condition_id: String,
+    pub text: String,
+}
+
+/// Minimal Maude-owned authored objective material admitted to this
+/// projection. It intentionally excludes workspace, nodes, constraints,
+/// executable request, raw file location, and a completion assessment.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaudeObjectiveReadV1 {
+    /// Exact owner schema.
+    pub schema: String,
+    /// Exact source owner label.
+    pub source: String,
+    /// Maude's source availability, distinct from objective completion.
+    pub availability: MaudeObjectiveAvailabilityV1,
+    /// Local capture time, retained only as capture evidence.
+    pub captured_at_unix_ms: u64,
+    /// Exact PlanDocument schema.
+    pub plan_schema: Option<String>,
+    /// Content-derived identity of the canonical PlanDocument bytes.
+    pub plan_digest: Option<String>,
+    /// Operator-authored goal text.
+    pub goal: Option<String>,
+    /// Operator-authored completion conditions.
+    pub acceptance_criteria: Option<Vec<MaudeAcceptanceCriterionV1>>,
+    /// Bounded error code. No raw local path is exposed.
+    pub error_code: Option<String>,
+    /// Must remain `operator_only`; Phosphor owns any separate public allowlist.
+    pub publication: String,
+}
+
+/// A verified relation from one Maude plan identity to one governed occurrence.
+/// These values originate in Nightshift authoring lineage, not presentation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveOccurrenceLinkV1 {
+    pub campaign_id: String,
+    pub occurrence_id: String,
+    pub proposal_id: String,
+    pub exact_work_id: String,
+    pub maude_plan_ref: String,
+    /// Opaque local detail selector. It is omitted by the public projection.
+    pub detail_locator_token: Option<String>,
+    /// Existing independently captured AG/Nightshift/Docket source results for
+    /// this exact occurrence; Phosphor does not synthesize a combined status.
+    #[serde(default)]
+    pub detail: Option<CampaignDetailV1>,
+}
+
+/// An attempted causal candidate that could not be resolved. This prevents a
+/// transport failure from appearing as an empty, successfully evaluated join.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveCausalUnavailableV1 {
+    pub locator_token: String,
+    pub detail: String,
+}
+
+/// Prerequisites are unavailable until their owner supplies a causal record;
+/// an empty list is never interpreted as no prerequisites.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectivePrerequisitesV1 {
+    Unknown,
+}
+
+/// Additive assembled objective projection. An occurrence outcome is not an
+/// objective result; only `conditions` carries owner-supplied dispositions.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveDetailV1 {
+    pub schema: String,
+    pub objective: MaudeObjectiveReadV1,
+    /// Derived from available Maude criteria; all start as `unknown`.
+    pub conditions: Vec<ObjectiveConditionV1>,
+    /// Exact lineage joins or explicit absence. No time or label matching.
+    pub occurrences: Vec<ObjectiveOccurrenceLinkV1>,
+    /// Explicit failed causal reads, kept distinct from an unlinked result.
+    #[serde(default)]
+    pub causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
+    pub prerequisites: ObjectivePrerequisitesV1,
+}
+
+/// Separately authored public-safe objective artifact. This is deliberately
+/// not derived from Maude goal/criteria or any owner raw record at request
+/// time. It contains only an approved summary and HTTPS receipt URLs.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicObjectiveProjectionV1 {
+    pub schema: String,
+    /// Exact PlanDocument identity that scopes this approved summary.
+    pub plan_digest: String,
+    /// Explicitly approved public summary; never copied from authored goal.
+    pub approved_summary: String,
+    /// Explicitly approved public receipt URLs.
+    pub approved_receipt_urls: Vec<String>,
+}
+
 /// One bounded deterministic corpus produced from the same typed read model
 /// rendered in live mode. It is presentation evidence, never runtime state.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -839,6 +986,9 @@ pub struct DemoCorpusV1 {
     pub index: CampaignIndexV1,
     /// Exact detail projections addressed by their locator tokens.
     pub campaigns: Vec<CampaignDetailV1>,
+    /// Deterministic objective captures for presentation qualification only.
+    #[serde(default)]
+    pub objectives: Vec<ObjectiveDetailV1>,
     /// Fixture-only navigation selectors for semantic links when the corpus
     /// intentionally retains multiple captures of one campaign lifecycle.
     pub semantic_link_targets: Vec<DemoSemanticLinkTargetV1>,

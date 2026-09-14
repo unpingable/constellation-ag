@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -25,9 +26,13 @@ use crate::model::{
     CAMPAIGN_DETAIL_SCHEMA_V1, CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1, CampaignIndexEntryV1,
     CampaignIndexV1, DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1, DemoCorpusV1,
     DocketInspectionV1, ExternalObservationExportV1, InterventionSubmissionHistoryProjectionV1,
+    MAUDE_OBJECTIVE_READ_SCHEMA_V1, MaudeObjectiveAvailabilityV1, MaudeObjectiveReadV1,
     NightshiftAuthoringContextExportV1, NightshiftAuthoringContextQueryV1,
-    NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, ProjectionCheckV1,
-    ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1,
+    NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, OBJECTIVE_DETAIL_SCHEMA_V1,
+    ObjectiveCausalUnavailableV1, ObjectiveConditionDispositionV1, ObjectiveConditionV1,
+    ObjectiveDetailV1, ObjectiveOccurrenceLinkV1, ObjectivePrerequisitesV1,
+    PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1, ProjectionCheckV1, ProjectionCorrespondenceV1,
+    PublicObjectiveProjectionV1, ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1,
     SourceResultV1,
 };
 
@@ -68,6 +73,15 @@ pub struct MaudeAcquisitionReadSourceV1 {
     pub ledger: PathBuf,
 }
 
+/// Optional bounded Maude authored-objective read source. Maude owns bounded
+/// regular-file handling; Phosphor supplies only the exact expected digest.
+#[derive(Clone, Debug)]
+pub struct MaudeObjectiveReadSourceV1 {
+    pub program: PathBuf,
+    pub plan: PathBuf,
+    pub expected_plan_digest: String,
+}
+
 /// Closed local operator backend configuration.
 #[derive(Clone, Debug)]
 pub struct OperatorSourceConfigV1 {
@@ -81,6 +95,12 @@ pub struct OperatorSourceConfigV1 {
     pub docket: Option<DocketReadSourceV1>,
     /// Optional Maude acquisition mechanics provenance.
     pub maude_acquisition: Option<MaudeAcquisitionReadSourceV1>,
+    /// Optional Maude authored objective source.
+    pub maude_objective: Option<MaudeObjectiveReadSourceV1>,
+    /// Optional separately approved public-safe objective artifact.
+    pub public_objective_projection: Option<PathBuf>,
+    /// Deployment-approved public receipt URL allowlist; HTTPS alone is not approval.
+    pub public_approved_receipt_urls: BTreeSet<String>,
 }
 
 impl OperatorSourceConfigV1 {
@@ -106,6 +126,12 @@ impl OperatorSourceConfigV1 {
         }
         if let Some(source) = &self.maude_acquisition {
             require_program_name(&source.program, "maude-observation-acquisition")?;
+        }
+        if let Some(source) = &self.maude_objective {
+            require_program_name(&source.program, "maude-plan")?;
+            if !is_sha256_digest(&source.expected_plan_digest) {
+                return Err("Maude objective expected digest is not sha256".to_owned());
+            }
         }
         Ok(())
     }
@@ -141,6 +167,7 @@ enum CanonicalReadRequestV1 {
         campaign: String,
         occurrence: String,
     },
+    MaudeObjectiveRead,
     DocketInspect(String),
 }
 
@@ -166,6 +193,7 @@ impl CanonicalReadRequestV1 {
             Self::MaudeExportObservationAcquisitions { .. } => {
                 ReadCommandNameV1::MaudeExportObservationAcquisitions
             }
+            Self::MaudeObjectiveRead => ReadCommandNameV1::MaudeObjectiveRead,
             Self::DocketInspect(_) => ReadCommandNameV1::DocketGovernedLoopInspect,
         }
     }
@@ -369,6 +397,94 @@ impl OperatorReaderV1 {
             observation_acquisitions,
             docket,
         })
+    }
+
+    /// Returns one objective projection selected by its exact plan digest.
+    pub fn objective_detail(&self, objective_id: &str) -> Result<ObjectiveDetailV1, String> {
+        match &self.backend {
+            OperatorReaderBackendV1::Demo(corpus) => {
+                let expected_plan_digest = format!("sha256:{objective_id}");
+                corpus
+                    .objectives
+                    .iter()
+                    .find(|objective| {
+                        objective.objective.plan_digest.as_deref()
+                            == Some(expected_plan_digest.as_str())
+                    })
+                    .cloned()
+                    .ok_or_else(|| "nonexistent demo objective locator".to_owned())
+            }
+            OperatorReaderBackendV1::Canonical(_) => {
+                let expected_plan_digest = format!("sha256:{objective_id}");
+                let source = self
+                    .canonical_config()?
+                    .maude_objective
+                    .as_ref()
+                    .ok_or_else(|| "Maude objective read source is not configured".to_owned())?;
+                if source.expected_plan_digest != expected_plan_digest {
+                    return Err(
+                        "objective selector does not match configured exact plan digest".to_owned(),
+                    );
+                }
+                let owner = self.maude_objective_read();
+                let objective = owner
+                    .value()
+                    .cloned()
+                    .ok_or_else(|| "Maude objective source unavailable".to_owned())?;
+                if objective.plan_digest.as_deref() != Some(expected_plan_digest.as_str()) {
+                    return Err(
+                        "Maude objective result did not bind configured exact plan digest"
+                            .to_owned(),
+                    );
+                }
+                let mut campaigns = Vec::new();
+                let mut causal_unavailable = Vec::new();
+                for entry in self.campaign_index()?.campaigns {
+                    match self.campaign_detail(&entry.locator_token) {
+                        Ok(detail) => campaigns.push(detail),
+                        Err(detail) => causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                            locator_token: entry.locator_token,
+                            detail,
+                        }),
+                    }
+                }
+                Ok(assemble_objective_detail(
+                    objective,
+                    &campaigns,
+                    causal_unavailable,
+                ))
+            }
+        }
+    }
+
+    /// Reads one separately approved public-safe projection. It never derives
+    /// fields from the operator objective view and remains loopback-served.
+    pub fn public_objective_projection(
+        &self,
+        objective_id: &str,
+    ) -> Result<PublicObjectiveProjectionV1, String> {
+        let expected_plan_digest = format!("sha256:{objective_id}");
+        let path = self
+            .canonical_config()?
+            .public_objective_projection
+            .as_ref()
+            .ok_or_else(|| "public objective projection is not configured".to_owned())?;
+        let bytes = read_bounded_public_projection(path)?;
+        let projection = serde_json::from_slice::<PublicObjectiveProjectionV1>(&bytes)
+            .map_err(|error| format!("parse public objective projection: {error}"))?;
+        validate_public_objective_projection(&projection)?;
+        let approved_urls = &self.canonical_config()?.public_approved_receipt_urls;
+        if projection
+            .approved_receipt_urls
+            .iter()
+            .any(|url| !approved_urls.contains(url))
+        {
+            return Err("public objective receipt URL is not explicitly allowlisted".to_owned());
+        }
+        if projection.plan_digest != expected_plan_digest {
+            return Err("public objective selector does not match approved plan digest".to_owned());
+        }
+        Ok(projection)
     }
 
     fn collect_nightshift_sources(
@@ -841,6 +957,27 @@ impl OperatorReaderV1 {
         )
     }
 
+    fn maude_objective_read(&self) -> SourceResultV1<MaudeObjectiveReadV1> {
+        let Some(_) = self
+            .canonical_config()
+            .ok()
+            .and_then(|value| value.maude_objective.as_ref())
+        else {
+            return unavailable(
+                "Maude",
+                ReadCommandNameV1::MaudeObjectiveRead,
+                SourceErrorKindV1::NotConfigured,
+                "Maude objective source is not configured".to_owned(),
+                None,
+            );
+        };
+        self.capture_typed(
+            "Maude",
+            &CanonicalReadRequestV1::MaudeObjectiveRead,
+            validate_maude_objective_read,
+        )
+    }
+
     fn capture_typed<T>(
         &self,
         source: &str,
@@ -925,6 +1062,38 @@ impl OperatorReaderV1 {
             }
         }
     }
+}
+
+fn read_bounded_public_projection(path: &Path) -> Result<Vec<u8>, String> {
+    // Linux O_NOFOLLOW. The service is Linux-only and this protects the final
+    // component while the descriptor, not the pathname, is checked and read.
+    const O_NOFOLLOW: i32 = 0o400000;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("public objective projection unavailable: {error}"))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("stat public objective projection: {error}"))?;
+    if !before.is_file() || before.len() > MAX_DEMO_CORPUS_BYTES {
+        return Err("public objective projection is not a bounded regular file".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    file.by_ref()
+        .take(MAX_DEMO_CORPUS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read public objective projection: {error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("restat public objective projection: {error}"))?;
+    if bytes.len() as u64 > MAX_DEMO_CORPUS_BYTES
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err("public objective projection changed during bounded read".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn canonical_command(
@@ -1020,6 +1189,7 @@ fn canonical_command(
             campaign,
             occurrence,
         } => maude_acquisition_command(config, campaign, occurrence)?,
+        CanonicalReadRequestV1::MaudeObjectiveRead => maude_objective_command(config)?,
     };
     Ok(command)
 }
@@ -1062,6 +1232,23 @@ fn maude_acquisition_command(
     Ok(command)
 }
 
+fn maude_objective_command(config: &OperatorSourceConfigV1) -> Result<Command, CaptureFailureV1> {
+    let source = config
+        .maude_objective
+        .as_ref()
+        .ok_or_else(|| CaptureFailureV1 {
+            kind: SourceErrorKindV1::NotConfigured,
+            detail: "Maude objective source is not configured".to_owned(),
+            exit_status: None,
+        })?;
+    let mut command = Command::new(&source.program);
+    command
+        .args(["objective-read", "--plan"])
+        .arg(&source.plan)
+        .args(["--expected-plan-digest", &source.expected_plan_digest]);
+    Ok(command)
+}
+
 fn require_nightshift_source(
     config: &OperatorSourceConfigV1,
 ) -> Result<&NightshiftReadSourceV1, CaptureFailureV1> {
@@ -1097,6 +1284,20 @@ fn validate_demo_corpus(corpus: &DemoCorpusV1) -> Result<(), String> {
     for detail in &corpus.campaigns {
         validate_demo_detail(detail)?;
     }
+    let mut objective_plan_digests = BTreeSet::new();
+    for objective in &corpus.objectives {
+        validate_objective_detail(objective)?;
+        if !objective_plan_digests.insert(objective.objective.plan_digest.as_deref()) {
+            return Err("duplicate demo objective plan digest".to_owned());
+        }
+        if objective
+            .occurrences
+            .iter()
+            .any(|link| !demo_objective_link_has_lineage(link, &corpus.campaigns))
+        {
+            return Err("demo objective link lacks matching Nightshift owner lineage".to_owned());
+        }
+    }
     let mut semantic_keys = BTreeSet::new();
     for target in &corpus.semantic_link_targets {
         let key = (
@@ -1126,6 +1327,435 @@ fn validate_demo_corpus(corpus: &DemoCorpusV1) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn demo_objective_link_has_lineage(
+    link: &ObjectiveOccurrenceLinkV1,
+    campaigns: &[CampaignDetailV1],
+) -> bool {
+    campaigns.iter().any(|detail| {
+        let Some(inspect) = detail.inspect.value() else {
+            return false;
+        };
+        link.detail_locator_token.as_deref() == Some(detail.locator_token.as_str())
+            && inspect.current.key().campaign.to_string() == link.campaign_id
+            && inspect.current.key().occurrence.to_string() == link.occurrence_id
+            && detail.authoring_contexts.iter().any(|related| {
+                related.result.value().is_some_and(|export| {
+                    export.matches.iter().any(|relation| {
+                        relation.campaign_id == link.campaign_id
+                            && relation.occurrence_id == link.occurrence_id
+                            && relation.proposal_id == link.proposal_id
+                            && relation.exact_work_id == link.exact_work_id
+                            && relation.maude_plan_ref == link.maude_plan_ref
+                    })
+                })
+            })
+    })
+}
+
+/// Assembles exact objective-to-occurrence links from Maude's approved plan
+/// digest and Nightshift's already-validated authoring lineage. It accepts no
+/// timestamp, label, filename, or summary as a join key. A campaign whose
+/// current identity does not agree with the lineage record is omitted.
+#[must_use]
+pub fn assemble_objective_detail(
+    objective: MaudeObjectiveReadV1,
+    campaigns: &[CampaignDetailV1],
+    causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
+) -> ObjectiveDetailV1 {
+    let mut links = BTreeSet::new();
+    let plan_digest = objective.plan_digest.clone();
+    if objective.availability != MaudeObjectiveAvailabilityV1::Available {
+        return ObjectiveDetailV1 {
+            schema: OBJECTIVE_DETAIL_SCHEMA_V1.to_owned(),
+            objective,
+            conditions: Vec::new(),
+            occurrences: Vec::new(),
+            causal_unavailable,
+            prerequisites: ObjectivePrerequisitesV1::Unknown,
+        };
+    }
+    let Some(plan_digest) = plan_digest else {
+        return ObjectiveDetailV1 {
+            schema: OBJECTIVE_DETAIL_SCHEMA_V1.to_owned(),
+            objective,
+            conditions: Vec::new(),
+            occurrences: Vec::new(),
+            causal_unavailable,
+            prerequisites: ObjectivePrerequisitesV1::Unknown,
+        };
+    };
+    for detail in campaigns {
+        let Some(inspect) = detail.inspect.value() else {
+            continue;
+        };
+        for related in &detail.authoring_contexts {
+            let Some(export) = related.result.value() else {
+                continue;
+            };
+            for relation in &export.matches {
+                let snapshot =
+                    if inspect.current.key().occurrence.to_string() == relation.occurrence_id {
+                        Some(&inspect.current)
+                    } else {
+                        detail.history.value().and_then(|history| {
+                            history
+                                .transitions
+                                .iter()
+                                .rev()
+                                .map(|transition| &transition.successor)
+                                .find(|snapshot| {
+                                    snapshot.key().occurrence.to_string() == relation.occurrence_id
+                                })
+                        })
+                    };
+                let Some(snapshot) = snapshot else {
+                    continue;
+                };
+                if relation.maude_plan_ref != plan_digest
+                    || snapshot.key().campaign.to_string() != relation.campaign_id
+                    || snapshot.proposal().is_none_or(|proposal| {
+                        proposal.reference().as_digest().to_string() != relation.proposal_id
+                    })
+                {
+                    continue;
+                }
+                links.insert((
+                    relation.campaign_id.clone(),
+                    relation.occurrence_id.clone(),
+                    relation.proposal_id.clone(),
+                    relation.exact_work_id.clone(),
+                    relation.maude_plan_ref.clone(),
+                    detail.locator_token.clone(),
+                    detail.clone(),
+                ));
+            }
+        }
+    }
+    ObjectiveDetailV1 {
+        schema: OBJECTIVE_DETAIL_SCHEMA_V1.to_owned(),
+        conditions: objective
+            .acceptance_criteria
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|criterion| ObjectiveConditionV1 {
+                condition_id: criterion.condition_id.clone(),
+                criterion: criterion.text.clone(),
+                disposition: ObjectiveConditionDispositionV1::Unknown,
+                owner_record_ref: None,
+            })
+            .collect(),
+        objective,
+        occurrences: links
+            .into_iter()
+            .map(
+                |(
+                    campaign_id,
+                    occurrence_id,
+                    proposal_id,
+                    exact_work_id,
+                    maude_plan_ref,
+                    token,
+                    detail,
+                )| {
+                    ObjectiveOccurrenceLinkV1 {
+                        campaign_id,
+                        occurrence_id,
+                        proposal_id,
+                        exact_work_id,
+                        maude_plan_ref,
+                        detail_locator_token: Some(token),
+                        detail: Some(detail),
+                    }
+                },
+            )
+            .collect(),
+        causal_unavailable,
+        prerequisites: ObjectivePrerequisitesV1::Unknown,
+    }
+}
+
+fn validate_objective_detail(detail: &ObjectiveDetailV1) -> Result<(), String> {
+    if detail.schema != OBJECTIVE_DETAIL_SCHEMA_V1 {
+        return Err("unsupported objective-detail schema".to_owned());
+    }
+    let objective = &detail.objective;
+    if objective.schema != MAUDE_OBJECTIVE_READ_SCHEMA_V1 || objective.source != "maude" {
+        return Err("unsupported Maude objective-read schema".to_owned());
+    }
+    if objective.publication != "operator_only" {
+        return Err("objective owner result is missing its read boundary".to_owned());
+    }
+    let available = objective.availability == MaudeObjectiveAvailabilityV1::Available;
+    if available
+        != (objective.plan_schema.as_deref() == Some("maude.plan-document/v1")
+            && objective
+                .plan_digest
+                .as_ref()
+                .is_some_and(|value| is_sha256_digest(value))
+            && objective
+                .goal
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            && objective.acceptance_criteria.is_some()
+            && objective.error_code.is_none())
+    {
+        return Err("objective availability and authored material disagree".to_owned());
+    }
+    if !available
+        && (objective.plan_schema.as_deref() != Some("maude.plan-document/v1")
+            || objective
+                .plan_digest
+                .as_ref()
+                .is_none_or(|value| !is_sha256_digest(value))
+            || objective.goal.is_some()
+            || objective.acceptance_criteria.is_some()
+            || objective.error_code.as_ref().is_none_or(String::is_empty))
+    {
+        return Err(
+            "unavailable objective exposed authored material or lacks an error code".to_owned(),
+        );
+    }
+    let criteria = objective
+        .acceptance_criteria
+        .as_ref()
+        .map(|criteria| {
+            criteria
+                .iter()
+                .map(|criterion| &criterion.text)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut condition_ids = BTreeSet::new();
+    for condition in &detail.conditions {
+        if condition.condition_id.is_empty()
+            || !criteria.contains(&condition.criterion)
+            || !condition_ids.insert(condition.condition_id.as_str())
+            || condition.disposition != ObjectiveConditionDispositionV1::Unknown
+            || condition.owner_record_ref.is_some()
+        {
+            return Err("objective condition is outside the approved public contract".to_owned());
+        }
+    }
+    for link in &detail.occurrences {
+        if link.campaign_id.is_empty()
+            || link.occurrence_id.is_empty()
+            || link.proposal_id.is_empty()
+            || link.exact_work_id.is_empty()
+            || objective.plan_digest.as_ref() != Some(&link.maude_plan_ref)
+        {
+            return Err("objective occurrence link lacks an exact matching lineage".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_maude_objective_read(objective: &MaudeObjectiveReadV1) -> Result<(), String> {
+    if objective.schema != MAUDE_OBJECTIVE_READ_SCHEMA_V1
+        || objective.source != "maude"
+        || objective.publication != "operator_only"
+    {
+        return Err("unsupported Maude objective source boundary".to_owned());
+    }
+    let available = objective.availability == MaudeObjectiveAvailabilityV1::Available;
+    if available
+        != (objective.plan_schema.as_deref() == Some("maude.plan-document/v1")
+            && objective
+                .plan_digest
+                .as_ref()
+                .is_some_and(|value| is_sha256_digest(value))
+            && objective
+                .goal
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+            && objective.acceptance_criteria.is_some()
+            && objective.error_code.is_none())
+    {
+        return Err("Maude objective availability and authored material disagree".to_owned());
+    }
+    if !available
+        && (objective.plan_schema.as_deref() != Some("maude.plan-document/v1")
+            || objective
+                .plan_digest
+                .as_ref()
+                .is_none_or(|value| !is_sha256_digest(value))
+            || objective.goal.is_some()
+            || objective.acceptance_criteria.is_some()
+            || objective.error_code.as_ref().is_none_or(String::is_empty))
+    {
+        return Err("unavailable Maude objective exposed authored material".to_owned());
+    }
+    if let Some(criteria) = &objective.acceptance_criteria {
+        let mut ids = BTreeSet::new();
+        if criteria.iter().any(|criterion| {
+            criterion.condition_id.is_empty()
+                || criterion.text.is_empty()
+                || !ids.insert(criterion.condition_id.as_str())
+        }) {
+            return Err("Maude objective criteria are not a unique nonempty set".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_objective_projection(
+    projection: &PublicObjectiveProjectionV1,
+) -> Result<(), String> {
+    if projection.schema != PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1
+        || !is_sha256_digest(&projection.plan_digest)
+        || projection.approved_summary.is_empty()
+        || projection.approved_summary.len() > 8 * 1024
+        || ["/data/", "/tmp/", "file://", ".sqlite"]
+            .iter()
+            .any(|marker| projection.approved_summary.contains(marker))
+        || projection
+            .approved_receipt_urls
+            .iter()
+            .any(|url| !url.starts_with("https://") || url.len() > 2 * 1024 || url.contains('\n'))
+    {
+        return Err(
+            "public objective projection is outside the explicit allowlist contract".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == "sha256:".len() + 64
+        && value
+            .strip_prefix("sha256:")
+            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+#[cfg(test)]
+mod objective_projection_tests {
+    use super::*;
+    use crate::model::{MaudeAcceptanceCriterionV1, MaudeObjectiveAvailabilityV1};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn available() -> ObjectiveDetailV1 {
+        ObjectiveDetailV1 {
+            schema: OBJECTIVE_DETAIL_SCHEMA_V1.to_owned(),
+            objective: MaudeObjectiveReadV1 {
+                schema: MAUDE_OBJECTIVE_READ_SCHEMA_V1.to_owned(),
+                source: "maude".to_owned(),
+                availability: MaudeObjectiveAvailabilityV1::Available,
+                captured_at_unix_ms: 7,
+                plan_schema: Some("maude.plan-document/v1".to_owned()),
+                plan_digest: Some(format!("sha256:{}", "b".repeat(64))),
+                goal: Some("Preserve the exact authored objective".to_owned()),
+                acceptance_criteria: Some(vec![MaudeAcceptanceCriterionV1 {
+                    condition_id: format!("sha256:{}", "c".repeat(64)),
+                    text: "A real owner assessment is present".to_owned(),
+                }]),
+                error_code: None,
+                publication: "operator_only".to_owned(),
+            },
+            conditions: vec![ObjectiveConditionV1 {
+                condition_id: format!("sha256:{}", "c".repeat(64)),
+                criterion: "A real owner assessment is present".to_owned(),
+                disposition: ObjectiveConditionDispositionV1::Unknown,
+                owner_record_ref: None,
+            }],
+            occurrences: Vec::new(),
+            causal_unavailable: Vec::new(),
+            prerequisites: ObjectivePrerequisitesV1::Unknown,
+        }
+    }
+
+    #[test]
+    fn objective_conditions_remain_unknown_without_owner_assessment() {
+        assert!(validate_objective_detail(&available()).is_ok());
+    }
+
+    #[test]
+    fn objective_refuses_occurrence_completion_substitution() {
+        let mut detail = available();
+        detail.conditions[0].disposition = ObjectiveConditionDispositionV1::OwnerAttested;
+        detail.conditions[0].owner_record_ref = Some("occurrence outcome".to_owned());
+        assert!(validate_objective_detail(&detail).is_err());
+    }
+
+    #[test]
+    fn unavailable_maude_result_keeps_only_exact_identity_and_error() {
+        let mut detail = available();
+        detail.objective.availability = MaudeObjectiveAvailabilityV1::Unavailable;
+        detail.objective.error_code = Some("missing_plan".to_owned());
+        detail.objective.goal = None;
+        detail.objective.acceptance_criteria = None;
+        detail.conditions.clear();
+        assert!(validate_objective_detail(&detail).is_ok());
+        detail.objective.goal = Some("must not be present".to_owned());
+        assert!(validate_objective_detail(&detail).is_err());
+    }
+
+    #[test]
+    fn maude_objective_uses_only_the_closed_exact_digest_read() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("maude-plan");
+        let arguments = root.path().join("arguments");
+        let plan = root.path().join("plan.json");
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let output = format!(
+            "{{\"schema\":\"maude.objective-source/v1\",\"source\":\"maude\",\"availability\":\"available\",\"captured_at_unix_ms\":1,\"plan_schema\":\"maude.plan-document/v1\",\"plan_digest\":\"{digest}\",\"goal\":\"Goal\",\"acceptance_criteria\":[],\"error_code\":null,\"publication\":\"operator_only\"}}"
+        );
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+                arguments.display(),
+                output
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: root.path().join("ag-loopctl"),
+            nightshift: None,
+            docket: None,
+            maude_acquisition: None,
+            maude_objective: Some(MaudeObjectiveReadSourceV1 {
+                program,
+                plan: plan.clone(),
+                expected_plan_digest: digest.clone(),
+            }),
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(matches!(
+            reader.maude_objective_read(),
+            SourceResultV1::Available { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            format!(
+                "objective-read\n--plan\n{}\n--expected-plan-digest\n{}\n",
+                plan.display(),
+                digest
+            )
+        );
+    }
+
+    #[test]
+    fn public_projection_is_an_explicit_summary_and_https_url_allowlist() {
+        let valid = PublicObjectiveProjectionV1 {
+            schema: PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1.to_owned(),
+            plan_digest: format!("sha256:{}", "d".repeat(64)),
+            approved_summary: "A separately approved public summary.".to_owned(),
+            approved_receipt_urls: vec!["https://public.example/receipt".to_owned()],
+        };
+        assert!(validate_public_objective_projection(&valid).is_ok());
+        let mut private_path = valid.clone();
+        private_path.approved_summary = "copied from /data/private/source".to_owned();
+        assert!(validate_public_objective_projection(&private_path).is_err());
+        let mut non_https = valid;
+        non_https.approved_receipt_urls = vec!["file:///private/receipt".to_owned()];
+        assert!(validate_public_objective_projection(&non_https).is_err());
+    }
 }
 
 fn demo_target_matches(
@@ -1665,6 +2295,9 @@ mod tests {
             nightshift: None,
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let index = reader.campaign_index().unwrap();
@@ -1738,6 +2371,9 @@ mod tests {
             }),
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_authoring_export(&campaign, occurrence);
@@ -1799,6 +2435,9 @@ mod tests {
             }),
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_authoring_custody_export(&campaign, occurrence);
@@ -1860,6 +2499,9 @@ mod tests {
             }),
             docket: None,
             maude_acquisition: None,
+            maude_objective: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_external_observation_export(&campaign, occurrence);
@@ -1918,6 +2560,8 @@ mod tests {
                 program,
                 ledger: root.path().join("acquisition.sqlite"),
             }),
+            maude_objective: None,
+            public_objective_projection: None,
         })
         .unwrap();
         let result = reader.maude_acquisition_export(&campaign, occurrence);
@@ -1953,6 +2597,7 @@ mod tests {
                 campaigns: Vec::new(),
             },
             campaigns: Vec::new(),
+            objectives: Vec::new(),
             semantic_link_targets: Vec::new(),
         };
         std::fs::write(&path, serde_json::to_vec(&corpus).unwrap()).unwrap();
@@ -1972,6 +2617,7 @@ mod tests {
                 campaigns: Vec::new(),
             },
             campaigns: vec![],
+            objectives: Vec::new(),
             semantic_link_targets: Vec::new(),
         };
         let mut drifted = corpus;
