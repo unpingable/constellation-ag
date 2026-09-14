@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Project one caller-owned objective criterion from retained NQ custody."""
+import argparse, datetime as dt, fcntl, hashlib, json, os, re, selectors, stat, subprocess, sys, time
+from pathlib import Path
+
+MAX_CONFIG=32768
+MAX_OUTPUT=1048576
+MAX_PROGRAM=134217728
+DIGEST_PREFIX="sha256:"
+
+class ReaderError(Exception): pass
+
+def fail(msg="invalid input"): raise ReaderError(msg)
+def digest(b): return DIGEST_PREFIX+hashlib.sha256(b).hexdigest()
+def is_digest(v): return isinstance(v,str) and len(v)==71 and v.startswith(DIGEST_PREFIX) and all(c in "0123456789abcdef" for c in v[7:])
+def pairs(items):
+    out={}
+    for k,v in items:
+        if k in out: fail()
+        out[k]=v
+    return out
+def exact_keys(v, keys):
+    if not isinstance(v,dict) or set(v)!=set(keys): fail()
+def ascii_tree(v):
+    if isinstance(v,float): fail()
+    if isinstance(v,str):
+        try: v.encode("ascii")
+        except UnicodeEncodeError: fail()
+    elif isinstance(v,list):
+        for x in v: ascii_tree(x)
+    elif isinstance(v,dict):
+        for k,x in v.items(): ascii_tree(k); ascii_tree(x)
+    elif v is not None and not isinstance(v,(bool,int)): fail()
+def text(v):
+    if not isinstance(v,str) or not v or any(ord(c)<32 or ord(c)>126 for c in v): fail()
+    return v
+def read_regular(path, limit, executable=False):
+    try:
+        if not path.is_absolute(): fail()
+        fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size<1 or info.st_size>limit or executable and not info.st_mode&0o111: fail()
+            chunks=[]; size=0
+            while size<=limit:
+                chunk=os.read(fd,min(65536,limit+1-size))
+                if not chunk: break
+                chunks.append(chunk); size+=len(chunk)
+            if size>limit: fail()
+            return b"".join(chunks)
+        finally: os.close(fd)
+    except ReaderError: raise
+    except OSError: fail()
+def load_config(path):
+    try:
+        raw=read_regular(path,MAX_CONFIG)
+        cfg=json.loads(raw,object_pairs_hook=pairs)
+        ascii_tree(cfg)
+        return cfg,raw
+    except ReaderError: raise
+    except Exception: fail()
+def hash_regular(path, limit, executable=False):
+    try:
+        if not path.is_absolute(): fail()
+        fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size<1 or info.st_size>limit or executable and not info.st_mode&0o111: fail()
+            h=hashlib.sha256(); size=0
+            while True:
+                chunk=os.read(fd,65536)
+                if not chunk: break
+                size+=len(chunk)
+                if size>limit: fail()
+                h.update(chunk)
+            return DIGEST_PREFIX+h.hexdigest()
+        finally: os.close(fd)
+    except ReaderError: raise
+    except OSError: fail()
+def pinned_file(path_value, expected_digest, limit, executable=False):
+    p=Path(path_value)
+    if hash_regular(p,limit,executable)!=expected_digest: fail()
+    return p
+def now(): return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def timestamp(v):
+    if not isinstance(v,str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",v): return False
+    try: parsed=dt.datetime.fromisoformat(v.replace("Z","+00:00"))
+    except ValueError: return False
+    return parsed.tzinfo is not None
+def currentness(observed, projected, seconds):
+    if not timestamp(observed) or not timestamp(projected) or not isinstance(seconds,int) or isinstance(seconds,bool) or seconds<0: return None
+    a=dt.datetime.fromisoformat(observed.replace("Z","+00:00")); b=dt.datetime.fromisoformat(projected.replace("Z","+00:00"))
+    if b<a: return "future"
+    return "stale" if (b-a).total_seconds()>seconds else "fresh"
+
+def invoke(argv, pass_fds=()):
+    try:
+        p=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+            env={"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"},pass_fds=pass_fds)
+    except OSError: fail("owner unavailable")
+    # This exact NQ read opens its local store and does not dispatch helpers.
+    # Stay in Phosphor's source process group so its outer boundary can reap us;
+    # the shorter inner deadline normally lets us close NQ before that boundary.
+    streams={p.stdout:"stdout",p.stderr:"stderr"}; data={"stdout":bytearray(),"stderr":bytearray()}; deadline=time.monotonic()+3
+    try:
+        with selectors.DefaultSelector() as sel:
+            for stream,name in streams.items(): sel.register(stream,selectors.EVENT_READ,name)
+            while sel.get_map():
+                if time.monotonic()>=deadline: fail("owner unavailable")
+                for key,_ in sel.select(.05):
+                    chunk=os.read(key.fileobj.fileno(),8192)
+                    if not chunk: sel.unregister(key.fileobj); continue
+                    if sum(map(len,data.values()))+len(chunk)>MAX_OUTPUT: fail("owner unavailable")
+                    data[key.data].extend(chunk)
+        p.wait(timeout=max(.01,deadline-time.monotonic()))
+    except BaseException:
+        try: p.kill()
+        except ProcessLookupError: pass
+        p.wait(); raise
+    finally:
+        p.stdout.close(); p.stderr.close()
+    if p.returncode!=0: fail("owner unavailable")
+    captured=bytes(data["stdout"])
+    raw=captured
+    if raw.endswith(b"\n"): raw=raw[:-1]
+    if not raw or raw.endswith(b"\n"): fail("owner unavailable")
+    try: value=json.loads(raw,object_pairs_hook=pairs); ascii_tree(value)
+    except Exception: fail("owner unavailable")
+    # Record identity covers exact stdout, including the owner's final newline;
+    # JSON framing validation must not silently change evidence identity.
+    return value,captured
+
+def validate_config(cfg, cli_plan):
+    exact_keys(cfg,["schema","plan_digest","owner_id","owner_capability","owner_source_revision","nq_program","nq_program_sha256","nq_config","nq_config_sha256","criterion","definition_prerequisite"])
+    if cfg["schema"]!="phosphor-ng.objective-owner-reader-config/v1": fail()
+    for k in ("owner_id","owner_capability","owner_source_revision"): text(cfg[k])
+    if cfg["owner_capability"]!="nq.saved-check-condition/v1": fail()
+    for k in ("nq_program_sha256","nq_config_sha256"):
+        if not is_digest(cfg[k]): fail()
+    if not is_digest(cfg["plan_digest"]) or cfg["plan_digest"]!=cli_plan: fail()
+    program=pinned_file(cfg["nq_program"],cfg["nq_program_sha256"],MAX_PROGRAM,True)
+    nqcfg=Path(cfg["nq_config"]); nqcfg_bytes=read_regular(nqcfg,MAX_CONFIG)
+    if digest(nqcfg_bytes)!=cfg["nq_config_sha256"]: fail()
+    c=cfg["criterion"]
+    exact_keys(c,["condition_id","definition_id","definition_reference","definition_digest","evaluation_id","source_identity","required_outcome","component","kind","subject"])
+    for k in ("condition_id","definition_id","definition_reference","evaluation_id","source_identity","component","kind","subject"): text(c[k])
+    if not is_digest(c["condition_id"]) or not is_digest(c["definition_digest"]) or not is_digest(c["evaluation_id"]) or c["required_outcome"] not in ("passed","failed"): fail()
+    pre=cfg["definition_prerequisite"]
+    if pre is not None:
+        exact_keys(pre,["prerequisite_id","relation","owner_record_ref","owner_record_digest"])
+        for k in ("prerequisite_id","relation","owner_record_ref"): text(pre[k])
+        if not is_digest(pre["owner_record_digest"]) or pre["owner_record_digest"]!=c["definition_digest"]: fail()
+    return program,nqcfg_bytes,c
+
+def maintenance_label(value):
+    if not isinstance(value,dict): return None
+    state=value.get("state")
+    if state in ("covered","overrun"):
+        if set(value)!={"state","maintenance_id","declaration_digest","declared_at"} or not is_digest(value.get("declaration_digest")) or not timestamp(value.get("declared_at")): return None
+    elif state=="uncovered":
+        if set(value)!={"state"}: return None
+    elif state=="unavailable":
+        if set(value)!={"state","reason"} or not isinstance(value.get("reason"),str) or not value["reason"]: return None
+    else: return None
+    return state
+
+def sealed_config(contents):
+    try:
+        fd=os.memfd_create("nq-reader-config",os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+        os.write(fd,contents); os.lseek(fd,0,os.SEEK_SET)
+        fcntl.fcntl(fd,fcntl.F_ADD_SEALS,fcntl.F_SEAL_SEAL|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_GROW|fcntl.F_SEAL_WRITE)
+        return fd
+    except OSError: fail("owner unavailable")
+
+def project(cfg,plan):
+    program,nqcfg_bytes,c=validate_config(cfg,plan); projected=now(); fd=sealed_config(nqcfg_bytes)
+    try:
+        argv=[str(program),"--config",f"/proc/self/fd/{fd}","--json","saved-check","condition","--evaluation-id",c["evaluation_id"],"--component",c["component"],"--kind",c["kind"],"--subject",c["subject"],"--at",projected]
+        record,raw=invoke(argv,(fd,))
+    finally: os.close(fd)
+    fully_validated=False; assessment="unavailable"; reason="owner_record_unavailable"; evidence=[]; ref=None; rd=None; definition=None
+    terminal_keys={"schema","projection_state","evaluation_id","definition_identity","original_result","source_assertion","read_attempt","maintenance","caller_mapping","authority","automatic_nightshift_integration","limitations"}
+    refusal_keys={"schema","projection_state","refusal_reason","evaluation_id","caller_mapping","maintenance","authority","automatic_nightshift_integration"}
+    closed_terminal=set(record)==terminal_keys and record.get("automatic_nightshift_integration") is False and isinstance(record.get("limitations"),list) and all(isinstance(x,str) for x in record.get("limitations",[])) if isinstance(record,dict) else False
+    closed_refusal=set(record)==refusal_keys and record.get("automatic_nightshift_integration") is False and record.get("projection_state")=="refused" and isinstance(record.get("refusal_reason"),str) and bool(record.get("refusal_reason")) and maintenance_label(record.get("maintenance"))=="unavailable" if isinstance(record,dict) else False
+    if isinstance(record,dict) and (closed_terminal or closed_refusal) and record.get("schema")=="nq.saved-check-condition/v1" and record.get("authority")=="none" and record.get("evaluation_id")==c["evaluation_id"]:
+        mapping=record.get("caller_mapping"); definition=record.get("definition_identity"); source=record.get("source_assertion"); original=record.get("original_result"); read=record.get("read_attempt"); maintenance=record.get("maintenance")
+        mapping_ok=isinstance(mapping,dict) and mapping=={"component":c["component"],"kind":c["kind"],"subject":c["subject"],"at":projected,"mapping_owner":"caller"}
+        binding_ok=isinstance(definition,dict) and set(definition)=={"id","reference","digest","installed_at"} and definition.get("id")==c["definition_id"] and definition.get("reference")==c["definition_reference"] and definition.get("digest")==c["definition_digest"] and timestamp(definition.get("installed_at")) and isinstance(source,dict) and set(source)=={"identity","observed_at","currentness_seconds","state"} and source.get("identity")==c["source_identity"]
+        if mapping_ok and binding_ok and isinstance(original,dict) and isinstance(read,dict) and isinstance(maintenance,dict):
+            outcome=original.get("outcome"); current=source.get("state"); pstate=record.get("projection_state"); mstate=maintenance.get("state")
+            detail=original.get("detail"); binding=detail.get("binding") if isinstance(detail,dict) else None
+            coherent=set(original)=={"state","outcome","detail"} and isinstance(binding,dict) and set(binding)=={"definition_digest","target_reference","source_identity","source_observed_at_assertion","currentness_seconds"} and binding.get("definition_digest")==c["definition_digest"] and binding.get("source_identity")==c["source_identity"] and binding.get("source_observed_at_assertion")==source.get("observed_at") and isinstance(binding.get("target_reference"),str) and bool(binding.get("target_reference")) and isinstance(binding.get("currentness_seconds"),int) and not isinstance(binding.get("currentness_seconds"),bool) and binding.get("currentness_seconds")==source.get("currentness_seconds") and currentness(source.get("observed_at"),projected,source.get("currentness_seconds"))==current and maintenance_label(maintenance)==mstate
+            terminal=outcome in ("passed","failed") and original.get("state")==outcome and pstate=="available" and set(detail)=={"binding","read_attempted_at","refusal_reason"} and detail.get("refusal_reason") is None and set(read)=={"state","at","scope"} and read.get("state")=="recorded" and read.get("scope")=="retained_local_read_evidence" and read.get("at")==detail.get("read_attempted_at") and timestamp(read.get("at"))
+            claimed=outcome=="claimed" and original.get("state")=="indeterminate" and pstate=="indeterminate" and set(detail)=={"binding"} and set(read)=={"state","at","scope"} and read.get("state")=="indeterminate" and read.get("at") is None and read.get("scope")=="retained_local_read_evidence"
+            fully_validated=coherent and (terminal or claimed) and current in ("fresh","stale","future")
+            if fully_validated:
+                # The shared record reference is the owner's actual query ID,
+                # not a newly invented locator distinct from evidence identity.
+                ref=c["evaluation_id"]; rd=digest(raw)
+                ev={"owner_schema":record["schema"],"owner_record_id":c["evaluation_id"],"owner_record_digest":rd,"source_observed_at":source.get("observed_at"),"read_attempted_at":read.get("at"),"projected_at":projected,"source_currentness":current,"owner_outcome":outcome,"maintenance_annotation":mstate}
+                if timestamp(ev["source_observed_at"]) and (ev["read_attempted_at"] is None or timestamp(ev["read_attempted_at"])) and timestamp(ev["projected_at"]): evidence=[ev]
+                if terminal and current=="fresh" and evidence:
+                    assessment="satisfied" if outcome==c["required_outcome"] else "not_satisfied"; reason=None
+                elif claimed or current in ("stale","future"):
+                    assessment="indeterminate"; reason="owner_record_not_decisive"
+                else: ref=None; rd=None; evidence=[]
+    condition={"condition_id":c["condition_id"],"assessment":assessment,"owner_record_ref":ref,"owner_record_digest":rd,"evidence":evidence,"reason":reason}
+    pre=cfg["definition_prerequisite"]
+    prerequisites={"availability":"unavailable","coverage":None,"items":[],"reason":"caller_did_not_declare_complete_prerequisites"}
+    expected_pre_ref="application:nq-definition:"+c["definition_id"]+":"+c["definition_reference"]
+    if pre is not None and fully_validated and pre["owner_record_ref"]==expected_pre_ref:
+        prerequisites={"availability":"available","coverage":"owner_asserted_complete","items":[pre],"reason":None}
+    out={"schema":"phosphor-ng.objective-owner-projection/v1","projection_id":"","plan_digest":plan,"owner_id":cfg["owner_id"],"owner_capability":cfg["owner_capability"],"owner_source_revision":cfg["owner_source_revision"],"projected_at":projected,"conditions":[condition],"prerequisites":prerequisites,"authority":"none"}
+    out["projection_id"]=digest(json.dumps(out,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode("ascii"))
+    return out
+
+def main(argv=None):
+    ap=argparse.ArgumentParser(prog="phosphor-objective-owner-reader")
+    ap.add_argument("--config",type=Path,required=True); sub=ap.add_subparsers(dest="command",required=True)
+    op=sub.add_parser("objective-projection"); op.add_argument("--plan-digest",required=True)
+    ns=ap.parse_args(argv)
+    cfg,_=load_config(ns.config); print(json.dumps(project(cfg,ns.plan_digest),sort_keys=True,separators=(",",":"),ensure_ascii=True))
+if __name__=="__main__":
+    try: main()
+    except ReaderError as e: print("reader error: "+str(e),file=sys.stderr); raise SystemExit(1)

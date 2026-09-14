@@ -431,6 +431,7 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
@@ -466,6 +467,7 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })

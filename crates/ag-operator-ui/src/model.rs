@@ -54,8 +54,12 @@ pub const MAUDE_ACQUISITION_HISTORY_SCHEMA_V1: &str =
 pub const DOCKET_INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
 /// Exact schema for an additive, read-only objective projection.
 pub const OBJECTIVE_DETAIL_SCHEMA_V1: &str = "phosphor-ng.objective-detail/v1";
+/// Opt-in objective projection carrying application-owner assertions.
+pub const OBJECTIVE_DETAIL_SCHEMA_V2: &str = "phosphor-ng.objective-detail/v2";
 /// Exact owner schema for the deliberately small Maude objective read result.
 pub const MAUDE_OBJECTIVE_READ_SCHEMA_V1: &str = "maude.objective-source/v1";
+/// Exact application-owner assertion source accepted by the objective view.
+pub const OBJECTIVE_OWNER_PROJECTION_SCHEMA_V1: &str = "phosphor-ng.objective-owner-projection/v1";
 /// Exact schema for a separately approved, public-safe objective projection.
 pub const PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1: &str =
     "phosphor-ng.public-objective-projection/v1";
@@ -647,6 +651,8 @@ pub enum ReadCommandNameV1 {
     MaudeExportObservationAcquisitions,
     /// Maude exact authored objective source for one expected plan digest.
     MaudeObjectiveRead,
+    /// Application-owned objective interpretation and prerequisite projection.
+    ObjectiveOwnerProjection,
     /// Docket exact persisted governed-loop record.
     DocketGovernedLoopInspect,
 }
@@ -838,8 +844,17 @@ pub struct CampaignDetailV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveConditionDispositionV1 {
+    /// The application owner asserts that the authored condition is satisfied.
+    Satisfied,
+    /// The application owner asserts that the authored condition is not satisfied.
+    NotSatisfied,
+    /// The owner has a record but cannot make a current decisive assertion.
+    Indeterminate,
+    /// Legacy owner assertion decoded so validation can explicitly refuse it.
     OwnerAttested,
+    /// No owner assertion has been enrolled or supplied.
     Unknown,
+    /// The enrolled owner source was absent, refused, or malformed.
     Unavailable,
 }
 
@@ -854,16 +869,150 @@ pub struct ObjectiveConditionV1 {
     pub criterion: String,
     /// Owner result; this is never inferred from execution state.
     pub disposition: ObjectiveConditionDispositionV1,
-    /// No owner assessment is available in this initial read contract.
+    /// Exact owner-record reference when an enrolled `v2` source supplied one.
     pub owner_record_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Digest of the exact owner record associated with the reference.
+    pub owner_record_digest: Option<String>,
+    /// Independently retained source facts supporting the owner assertion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ObjectiveOwnerEvidenceV1>,
+    /// Application-owner reason for an indeterminate or unavailable assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Currentness classification declared by the application-owned reader.
+pub enum ObjectiveEvidenceCurrentnessV1 {
+    /// The source fact is within its declared currentness interval.
+    Fresh,
+    /// The source fact is older than its declared currentness interval.
+    Stale,
+    /// The source fact's observation coordinate is after the projection coordinate.
+    Future,
+    /// Currentness could not be decided from retained owner facts.
+    Indeterminate,
+    /// Currentness evidence was unavailable.
+    Unavailable,
+}
+
+/// One exact owner record and its separately retained timing and state labels.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveOwnerEvidenceV1 {
+    /// Closed schema of the application-owned source record.
+    pub owner_schema: String,
+    /// Stable identity supplied by that source owner.
+    pub owner_record_id: String,
+    /// Digest of the exact captured source response.
+    pub owner_record_digest: String,
+    /// Source owner's observation coordinate, when established.
+    pub source_observed_at: Option<String>,
+    /// Source owner's read-attempt coordinate, when established.
+    pub read_attempted_at: Option<String>,
+    /// Projection coordinate used by the owner reader, when established.
+    pub projected_at: Option<String>,
+    /// Currentness kept separate from the owner outcome.
+    pub source_currentness: ObjectiveEvidenceCurrentnessV1,
+    /// Exact factual outcome label retained from the enrolled owner source.
+    pub owner_outcome: Option<String>,
+    /// Exact maintenance annotation retained separately from the outcome.
+    pub maintenance_annotation: Option<String>,
+}
+
+/// Application-owner assertion for one exact Maude-authored condition.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveOwnerConditionV1 {
+    /// Exact Maude condition identity interpreted by the application.
+    pub condition_id: String,
+    /// Application-owned assertion; Phosphor does not independently derive it.
+    pub assessment: ObjectiveConditionDispositionV1,
+    /// Stable owner-record locator, absent when the source is unavailable.
+    pub owner_record_ref: Option<String>,
+    /// Exact captured owner-record digest, paired with the locator.
+    pub owner_record_digest: Option<String>,
+    /// Source facts retained separately from the assertion.
+    pub evidence: Vec<ObjectiveOwnerEvidenceV1>,
+    /// Required bounded explanation for indeterminate or unavailable assertions.
+    pub reason: Option<String>,
+}
+
+/// One prerequisite explicitly declared by the application owner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectivePrerequisiteV1 {
+    /// Stable prerequisite identity in the application's interpretation.
+    pub prerequisite_id: String,
+    /// Application-declared relationship to the objective.
+    pub relation: String,
+    /// Stable reference to the owner record supporting this prerequisite.
+    pub owner_record_ref: String,
+    /// Digest of that exact owner record.
+    pub owner_record_digest: String,
+}
+
+/// Whether the application owner established prerequisite coverage.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectivePrerequisiteAvailabilityV1 {
+    /// The owner explicitly asserted complete coverage.
+    Available,
+    /// Coverage was absent, refused, or invalid.
+    Unavailable,
+}
+
+/// Closed prerequisite projection supplied by the application owner.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveOwnerPrerequisitesV1 {
+    /// Availability of the owner's coverage assertion.
+    pub availability: ObjectivePrerequisiteAvailabilityV1,
+    /// Exact coverage vocabulary; `owner_asserted_complete` when available.
+    pub coverage: Option<String>,
+    /// Explicit owner-declared prerequisites; an empty covered set is meaningful.
+    pub items: Vec<ObjectivePrerequisiteV1>,
+    /// Required explanation when coverage is unavailable.
+    pub reason: Option<String>,
+}
+
+/// Application-owned interpretation of one exact Maude plan revision.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveOwnerProjectionV1 {
+    /// Exact closed projection schema.
+    pub schema: String,
+    /// JCS content identity computed with this field blank.
+    pub projection_id: String,
+    /// Exact Maude `PlanDocument` digest being interpreted.
+    pub plan_digest: String,
+    /// Deployment-enrolled application owner label.
+    pub owner_id: String,
+    /// Deployment-enrolled reader capability label.
+    pub owner_capability: String,
+    /// Declared source revision of the application-owned interpretation.
+    pub owner_source_revision: String,
+    /// Owner reader's RFC 3339 projection coordinate, retained without retiming.
+    pub projected_at: String,
+    /// Assertions keyed only by exact Maude condition identities.
+    pub conditions: Vec<ObjectiveOwnerConditionV1>,
+    /// Explicit prerequisite coverage or visible unavailability.
+    pub prerequisites: ObjectiveOwnerPrerequisitesV1,
+    /// Must be `none`; this projection carries no action authority.
+    pub authority: String,
 }
 
 /// Exact availability result from Maude's bounded objective read.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaudeObjectiveAvailabilityV1 {
+    /// Exact authored objective material was returned.
     Available,
+    /// The exact authored objective could not be read.
     Unavailable,
+    /// Conflicting authored material was detected.
     Conflicting,
 }
 
@@ -872,7 +1021,9 @@ pub enum MaudeObjectiveAvailabilityV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaudeAcceptanceCriterionV1 {
+    /// Content-bound criterion identity supplied by Maude.
     pub condition_id: String,
+    /// Exact authored criterion text.
     pub text: String,
 }
 
@@ -890,9 +1041,9 @@ pub struct MaudeObjectiveReadV1 {
     pub availability: MaudeObjectiveAvailabilityV1,
     /// Local capture time, retained only as capture evidence.
     pub captured_at_unix_ms: u64,
-    /// Exact PlanDocument schema.
+    /// Exact `PlanDocument` schema.
     pub plan_schema: Option<String>,
-    /// Content-derived identity of the canonical PlanDocument bytes.
+    /// Content-derived identity of the canonical `PlanDocument` bytes.
     pub plan_digest: Option<String>,
     /// Operator-authored goal text.
     pub goal: Option<String>,
@@ -909,10 +1060,15 @@ pub struct MaudeObjectiveReadV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveOccurrenceLinkV1 {
+    /// Exact AG campaign identity.
     pub campaign_id: String,
+    /// Exact governed occurrence identity.
     pub occurrence_id: String,
+    /// Exact proposal identity retained by the authoring lineage.
     pub proposal_id: String,
+    /// Exact executable-work identity retained by the authoring lineage.
     pub exact_work_id: String,
+    /// Exact Maude `PlanDocument` digest binding the occurrence.
     pub maude_plan_ref: String,
     /// Opaque local detail selector. It is omitted by the public projection.
     pub detail_locator_token: Option<String>,
@@ -927,16 +1083,28 @@ pub struct ObjectiveOccurrenceLinkV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveCausalUnavailableV1 {
+    /// Opaque local campaign selector whose causal read failed.
     pub locator_token: String,
+    /// Bounded explanation of the failed read.
     pub detail: String,
 }
 
 /// Prerequisites are unavailable until their owner supplies a causal record;
 /// an empty list is never interpreted as no prerequisites.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectivePrerequisitesV1 {
+    /// No application-owner prerequisite source was configured.
     Unknown,
+    /// The configured prerequisite source was unavailable or refused.
+    Unavailable,
+    /// Application owner explicitly asserted complete prerequisite coverage.
+    OwnerDeclared {
+        /// Exact owner coverage vocabulary.
+        coverage: String,
+        /// Explicit application-owner prerequisite records.
+        items: Vec<ObjectivePrerequisiteV1>,
+    },
 }
 
 /// Additive assembled objective projection. An occurrence outcome is not an
@@ -944,7 +1112,9 @@ pub enum ObjectivePrerequisitesV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectiveDetailV1 {
+    /// Strict `v1` schema, or opt-in owner-enriched `v2` schema.
     pub schema: String,
+    /// Exact Maude-owned authored objective read.
     pub objective: MaudeObjectiveReadV1,
     /// Derived from available Maude criteria; all start as `unknown`.
     pub conditions: Vec<ObjectiveConditionV1>,
@@ -953,7 +1123,11 @@ pub struct ObjectiveDetailV1 {
     /// Explicit failed causal reads, kept distinct from an unlinked result.
     #[serde(default)]
     pub causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
+    /// Unknown, unavailable, or explicit application-owner prerequisite coverage.
     pub prerequisites: ObjectivePrerequisitesV1,
+    /// Typed application-owner source result, present only in `v2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_projection: Option<SourceResultV1<ObjectiveOwnerProjectionV1>>,
 }
 
 /// Separately authored public-safe objective artifact. This is deliberately
@@ -962,8 +1136,9 @@ pub struct ObjectiveDetailV1 {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicObjectiveProjectionV1 {
+    /// Exact public-safe projection schema.
     pub schema: String,
-    /// Exact PlanDocument identity that scopes this approved summary.
+    /// Exact `PlanDocument` identity that scopes this approved summary.
     pub plan_digest: String,
     /// Explicitly approved public summary; never copied from authored goal.
     pub approved_summary: String,

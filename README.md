@@ -74,6 +74,9 @@ roles, vocabulary, semantic deep links, and legacy Phosphor disposition are in
 [`docs/operator-surface-convergence.md`](docs/operator-surface-convergence.md).
 The [objective read projection](docs/objective-read-projection.md) connects an
 exact Maude-authored goal to owner-linked runs without inferring completion.
+The [NQ condition reader example](examples/objective-owner-reader.md) shows how
+an application can attach an exact saved-check result to one authored criterion,
+keeping currentness and maintenance separate from the result and permission.
 Authenticated operator intent is represented by several exact, narrow request
 classes—never a generic retry—and is specified in
 [`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).

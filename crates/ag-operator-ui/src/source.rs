@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use ag_store::campaign::{
 };
 use serde::{Deserialize as _, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use crate::links::GovernedRuntimeLinkV1;
 use crate::model::{
@@ -29,8 +31,10 @@ use crate::model::{
     MAUDE_OBJECTIVE_READ_SCHEMA_V1, MaudeObjectiveAvailabilityV1, MaudeObjectiveReadV1,
     NightshiftAuthoringContextExportV1, NightshiftAuthoringContextQueryV1,
     NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, OBJECTIVE_DETAIL_SCHEMA_V1,
-    ObjectiveCausalUnavailableV1, ObjectiveConditionDispositionV1, ObjectiveConditionV1,
-    ObjectiveDetailV1, ObjectiveOccurrenceLinkV1, ObjectivePrerequisitesV1,
+    OBJECTIVE_DETAIL_SCHEMA_V2, OBJECTIVE_OWNER_PROJECTION_SCHEMA_V1, ObjectiveCausalUnavailableV1,
+    ObjectiveConditionDispositionV1, ObjectiveConditionV1, ObjectiveDetailV1,
+    ObjectiveEvidenceCurrentnessV1, ObjectiveOccurrenceLinkV1, ObjectiveOwnerProjectionV1,
+    ObjectivePrerequisiteAvailabilityV1, ObjectivePrerequisitesV1,
     PUBLIC_OBJECTIVE_PROJECTION_SCHEMA_V1, ProjectionCheckV1, ProjectionCorrespondenceV1,
     PublicObjectiveProjectionV1, ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1,
     SourceResultV1,
@@ -77,8 +81,28 @@ pub struct MaudeAcquisitionReadSourceV1 {
 /// regular-file handling; Phosphor supplies only the exact expected digest.
 #[derive(Clone, Debug)]
 pub struct MaudeObjectiveReadSourceV1 {
+    /// Fixed canonical Maude objective-reader executable.
     pub program: PathBuf,
+    /// Exact authored plan locator consumed by Maude.
     pub plan: PathBuf,
+    /// Expected canonical `PlanDocument` digest.
+    pub expected_plan_digest: String,
+}
+
+/// Optional fixed application-owner reader enrollment.
+#[derive(Clone, Debug)]
+pub struct ObjectiveOwnerProjectionSourceV1 {
+    /// Fixed reader executable with the required canonical basename.
+    pub program: PathBuf,
+    /// Absolute deployment-selected reader configuration.
+    pub config: PathBuf,
+    /// Expected application-owner identity.
+    pub expected_owner_id: String,
+    /// Expected declared reader capability.
+    pub expected_owner_capability: String,
+    /// Expected application-owned source revision.
+    pub expected_source_revision: String,
+    /// Exact Maude plan digest shared with the objective source.
     pub expected_plan_digest: String,
 }
 
@@ -97,6 +121,8 @@ pub struct OperatorSourceConfigV1 {
     pub maude_acquisition: Option<MaudeAcquisitionReadSourceV1>,
     /// Optional Maude authored objective source.
     pub maude_objective: Option<MaudeObjectiveReadSourceV1>,
+    /// Optional application-owned interpretation; never an authority source.
+    pub objective_owner_projection: Option<ObjectiveOwnerProjectionSourceV1>,
     /// Optional separately approved public-safe objective artifact.
     pub public_objective_projection: Option<PathBuf>,
     /// Deployment-approved public receipt URL allowlist; HTTPS alone is not approval.
@@ -133,6 +159,37 @@ impl OperatorSourceConfigV1 {
                 return Err("Maude objective expected digest is not sha256".to_owned());
             }
         }
+        if let Some(source) = &self.objective_owner_projection {
+            require_program_name(&source.program, "phosphor-objective-owner-reader")?;
+            if !source.config.is_absolute()
+                || !is_sha256_digest(&source.expected_plan_digest)
+                || source.expected_owner_id.is_empty()
+                || source.expected_owner_capability.is_empty()
+                || source.expected_source_revision.is_empty()
+            {
+                return Err("invalid objective owner projection enrollment".to_owned());
+            }
+            for value in [
+                &source.expected_owner_id,
+                &source.expected_owner_capability,
+                &source.expected_source_revision,
+            ] {
+                if value.len() > 256 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err(
+                        "objective owner enrollment labels must be bounded visible ASCII"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if let (Some(maude), Some(owner)) =
+            (&self.maude_objective, &self.objective_owner_projection)
+            && maude.expected_plan_digest != owner.expected_plan_digest
+        {
+            return Err(
+                "Maude and application-owner sources must bind the same plan digest".to_owned(),
+            );
+        }
         Ok(())
     }
 }
@@ -168,6 +225,7 @@ enum CanonicalReadRequestV1 {
         occurrence: String,
     },
     MaudeObjectiveRead,
+    ObjectiveOwnerProjection,
     DocketInspect(String),
 }
 
@@ -194,6 +252,7 @@ impl CanonicalReadRequestV1 {
                 ReadCommandNameV1::MaudeExportObservationAcquisitions
             }
             Self::MaudeObjectiveRead => ReadCommandNameV1::MaudeObjectiveRead,
+            Self::ObjectiveOwnerProjection => ReadCommandNameV1::ObjectiveOwnerProjection,
             Self::DocketInspect(_) => ReadCommandNameV1::DocketGovernedLoopInspect,
         }
     }
@@ -216,7 +275,7 @@ struct CapturedJsonV1 {
 /// coordinates and never opens a runtime database itself.
 #[derive(Clone, Debug)]
 enum OperatorReaderBackendV1 {
-    Canonical(OperatorSourceConfigV1),
+    Canonical(Box<OperatorSourceConfigV1>),
     Demo(Arc<DemoCorpusV1>),
 }
 
@@ -235,7 +294,7 @@ impl OperatorReaderV1 {
     pub fn new(config: OperatorSourceConfigV1) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
-            backend: OperatorReaderBackendV1::Canonical(config),
+            backend: OperatorReaderBackendV1::Canonical(Box::new(config)),
         })
     }
 
@@ -400,6 +459,11 @@ impl OperatorReaderV1 {
     }
 
     /// Returns one objective projection selected by its exact plan digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selector or an independently read owner does
+    /// not satisfy the closed objective read contract.
     pub fn objective_detail(&self, objective_id: &str) -> Result<ObjectiveDetailV1, String> {
         match &self.backend {
             OperatorReaderBackendV1::Demo(corpus) => {
@@ -448,17 +512,39 @@ impl OperatorReaderV1 {
                         }),
                     }
                 }
-                Ok(assemble_objective_detail(
+                let owner_projection = if objective.availability
+                    == MaudeObjectiveAvailabilityV1::Available
+                    && self
+                        .canonical_config()?
+                        .objective_owner_projection
+                        .is_some()
+                {
+                    Some(bind_owner_projection_to_objective(
+                        self.objective_owner_projection(),
+                        &objective,
+                    ))
+                } else {
+                    None
+                };
+                let detail = assemble_objective_detail(
                     objective,
                     &campaigns,
                     causal_unavailable,
-                ))
+                    owner_projection,
+                );
+                validate_objective_detail(&detail)?;
+                Ok(detail)
             }
         }
     }
 
     /// Reads one separately approved public-safe projection. It never derives
     /// fields from the operator objective view and remains loopback-served.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing, changed, oversized, malformed, or
+    /// non-allowlisted public projection artifact.
     pub fn public_objective_projection(
         &self,
         objective_id: &str,
@@ -980,6 +1066,27 @@ impl OperatorReaderV1 {
         )
     }
 
+    fn objective_owner_projection(&self) -> SourceResultV1<ObjectiveOwnerProjectionV1> {
+        let Some(source) = self
+            .canonical_config()
+            .ok()
+            .and_then(|value| value.objective_owner_projection.as_ref())
+        else {
+            return unavailable(
+                "application objective owner",
+                ReadCommandNameV1::ObjectiveOwnerProjection,
+                SourceErrorKindV1::NotConfigured,
+                "objective owner projection source is not configured".to_owned(),
+                None,
+            );
+        };
+        self.capture_typed(
+            "application objective owner",
+            &CanonicalReadRequestV1::ObjectiveOwnerProjection,
+            |value| validate_objective_owner_projection(value, source),
+        )
+    }
+
     fn capture_typed<T>(
         &self,
         source: &str,
@@ -1058,7 +1165,7 @@ impl OperatorReaderV1 {
 
     fn canonical_config(&self) -> Result<&OperatorSourceConfigV1, String> {
         match &self.backend {
-            OperatorReaderBackendV1::Canonical(config) => Ok(config),
+            OperatorReaderBackendV1::Canonical(config) => Ok(config.as_ref()),
             OperatorReaderBackendV1::Demo(_) => {
                 Err("demo corpus has no executable canonical source".to_owned())
             }
@@ -1069,7 +1176,7 @@ impl OperatorReaderV1 {
 fn read_bounded_public_projection(path: &Path) -> Result<Vec<u8>, String> {
     // Linux O_NOFOLLOW. The service is Linux-only and this protects the final
     // component while the descriptor, not the pathname, is checked and read.
-    const O_NOFOLLOW: i32 = 0o400000;
+    const O_NOFOLLOW: i32 = 0o400_000;
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
@@ -1192,6 +1299,9 @@ fn canonical_command(
             occurrence,
         } => maude_acquisition_command(config, campaign, occurrence)?,
         CanonicalReadRequestV1::MaudeObjectiveRead => maude_objective_command(config)?,
+        CanonicalReadRequestV1::ObjectiveOwnerProjection => {
+            objective_owner_projection_command(config)?
+        }
     };
     Ok(command)
 }
@@ -1248,6 +1358,26 @@ fn maude_objective_command(config: &OperatorSourceConfigV1) -> Result<Command, C
         .args(["objective-read", "--plan"])
         .arg(&source.plan)
         .args(["--expected-plan-digest", &source.expected_plan_digest]);
+    Ok(command)
+}
+
+fn objective_owner_projection_command(
+    config: &OperatorSourceConfigV1,
+) -> Result<Command, CaptureFailureV1> {
+    let source = config
+        .objective_owner_projection
+        .as_ref()
+        .ok_or_else(|| CaptureFailureV1 {
+            kind: SourceErrorKindV1::NotConfigured,
+            detail: "objective owner source is not configured".to_owned(),
+            exit_status: None,
+        })?;
+    let mut command = Command::new(&source.program);
+    command.arg("--config").arg(&source.config).args([
+        "objective-projection",
+        "--plan-digest",
+        &source.expected_plan_digest,
+    ]);
     Ok(command)
 }
 
@@ -1331,6 +1461,51 @@ fn validate_demo_corpus(corpus: &DemoCorpusV1) -> Result<(), String> {
     Ok(())
 }
 
+fn bind_owner_projection_to_objective(
+    result: SourceResultV1<ObjectiveOwnerProjectionV1>,
+    objective: &MaudeObjectiveReadV1,
+) -> SourceResultV1<ObjectiveOwnerProjectionV1> {
+    let SourceResultV1::Available {
+        source,
+        command,
+        captured_at_unix_ms,
+        raw,
+        value,
+    } = result
+    else {
+        return result;
+    };
+    let criteria = objective
+        .acceptance_criteria
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|criterion| criterion.condition_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let exact_plan = objective.plan_digest.as_ref() == Some(&value.plan_digest);
+    let exact_conditions = value
+        .conditions
+        .iter()
+        .all(|condition| criteria.contains(condition.condition_id.as_str()));
+    if !exact_plan || !exact_conditions {
+        return unavailable_at(
+            &source,
+            command,
+            captured_at_unix_ms,
+            SourceErrorKindV1::IncompatibleSchema,
+            "application-owner projection is outside the exact authored objective".to_owned(),
+            None,
+        );
+    }
+    SourceResultV1::Available {
+        source,
+        command,
+        captured_at_unix_ms,
+        raw,
+        value,
+    }
+}
+
 fn demo_objective_link_has_lineage(
     link: &ObjectiveOccurrenceLinkV1,
     campaigns: &[CampaignDetailV1],
@@ -1381,8 +1556,13 @@ pub fn assemble_objective_detail(
     objective: MaudeObjectiveReadV1,
     campaigns: &[CampaignDetailV1],
     mut causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
+    owner_projection: Option<SourceResultV1<ObjectiveOwnerProjectionV1>>,
 ) -> ObjectiveDetailV1 {
-    let mut links = BTreeMap::new();
+    let detail_schema = if owner_projection.is_some() {
+        OBJECTIVE_DETAIL_SCHEMA_V2
+    } else {
+        OBJECTIVE_DETAIL_SCHEMA_V1
+    };
     let plan_digest = objective.plan_digest.clone();
     if objective.availability != MaudeObjectiveAvailabilityV1::Available {
         return ObjectiveDetailV1 {
@@ -1392,6 +1572,7 @@ pub fn assemble_objective_detail(
             occurrences: Vec::new(),
             causal_unavailable,
             prerequisites: ObjectivePrerequisitesV1::Unknown,
+            owner_projection: None,
         };
     }
     let Some(plan_digest) = plan_digest else {
@@ -1402,8 +1583,43 @@ pub fn assemble_objective_detail(
             occurrences: Vec::new(),
             causal_unavailable,
             prerequisites: ObjectivePrerequisitesV1::Unknown,
+            owner_projection: None,
         };
     };
+    let occurrences = assemble_objective_links(&plan_digest, campaigns, &mut causal_unavailable);
+    let mut conditions = objective
+        .acceptance_criteria
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|criterion| ObjectiveConditionV1 {
+            condition_id: criterion.condition_id.clone(),
+            criterion: criterion.text.clone(),
+            disposition: ObjectiveConditionDispositionV1::Unknown,
+            owner_record_ref: None,
+            owner_record_digest: None,
+            evidence: Vec::new(),
+            reason: None,
+        })
+        .collect::<Vec<_>>();
+    let prerequisites = apply_owner_projection(&mut conditions, owner_projection.as_ref());
+    ObjectiveDetailV1 {
+        schema: detail_schema.to_owned(),
+        conditions,
+        objective,
+        occurrences,
+        causal_unavailable,
+        prerequisites,
+        owner_projection,
+    }
+}
+
+fn assemble_objective_links(
+    plan_digest: &str,
+    campaigns: &[CampaignDetailV1],
+    causal_unavailable: &mut Vec<ObjectiveCausalUnavailableV1>,
+) -> Vec<ObjectiveOccurrenceLinkV1> {
+    let mut links = BTreeMap::new();
     for detail in campaigns {
         let Some(inspect) = detail.inspect.value() else {
             causal_unavailable.push(ObjectiveCausalUnavailableV1 {
@@ -1467,48 +1683,109 @@ pub fn assemble_objective_detail(
             }
         }
     }
-    ObjectiveDetailV1 {
-        schema: OBJECTIVE_DETAIL_SCHEMA_V1.to_owned(),
-        conditions: objective
-            .acceptance_criteria
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .map(|criterion| ObjectiveConditionV1 {
-                condition_id: criterion.condition_id.clone(),
-                criterion: criterion.text.clone(),
-                disposition: ObjectiveConditionDispositionV1::Unknown,
-                owner_record_ref: None,
-            })
-            .collect(),
-        objective,
-        occurrences: links
-            .into_iter()
-            .map(
-                |(
-                    (campaign_id, occurrence_id, proposal_id, exact_work_id, maude_plan_ref, token),
-                    detail,
-                )| {
-                    ObjectiveOccurrenceLinkV1 {
-                        campaign_id,
-                        occurrence_id,
-                        proposal_id,
-                        exact_work_id,
-                        maude_plan_ref,
-                        detail_locator_token: Some(token),
-                        detail: Some(detail),
-                    }
-                },
-            )
-            .collect(),
-        causal_unavailable,
-        prerequisites: ObjectivePrerequisitesV1::Unknown,
+    links
+        .into_iter()
+        .map(
+            |(
+                (campaign_id, occurrence_id, proposal_id, exact_work_id, maude_plan_ref, token),
+                detail,
+            )| ObjectiveOccurrenceLinkV1 {
+                campaign_id,
+                occurrence_id,
+                proposal_id,
+                exact_work_id,
+                maude_plan_ref,
+                detail_locator_token: Some(token),
+                detail: Some(detail),
+            },
+        )
+        .collect()
+}
+
+fn apply_owner_projection(
+    conditions: &mut [ObjectiveConditionV1],
+    owner_projection: Option<&SourceResultV1<ObjectiveOwnerProjectionV1>>,
+) -> ObjectivePrerequisitesV1 {
+    let mut prerequisites = ObjectivePrerequisitesV1::Unknown;
+    if let Some(SourceResultV1::Available { value, .. }) = owner_projection {
+        for assessment in &value.conditions {
+            if let Some(condition) = conditions
+                .iter_mut()
+                .find(|item| item.condition_id == assessment.condition_id)
+            {
+                condition.disposition = assessment.assessment;
+                condition
+                    .owner_record_ref
+                    .clone_from(&assessment.owner_record_ref);
+                condition
+                    .owner_record_digest
+                    .clone_from(&assessment.owner_record_digest);
+                condition.evidence.clone_from(&assessment.evidence);
+                condition.reason.clone_from(&assessment.reason);
+            }
+        }
+        prerequisites = match value.prerequisites.availability {
+            ObjectivePrerequisiteAvailabilityV1::Available => {
+                ObjectivePrerequisitesV1::OwnerDeclared {
+                    coverage: value.prerequisites.coverage.clone().unwrap_or_default(),
+                    items: value.prerequisites.items.clone(),
+                }
+            }
+            ObjectivePrerequisiteAvailabilityV1::Unavailable => {
+                ObjectivePrerequisitesV1::Unavailable
+            }
+        };
+    } else if matches!(owner_projection, Some(SourceResultV1::Unavailable { .. })) {
+        prerequisites = ObjectivePrerequisitesV1::Unavailable;
     }
+    prerequisites
 }
 
 fn validate_objective_detail(detail: &ObjectiveDetailV1) -> Result<(), String> {
-    if detail.schema != OBJECTIVE_DETAIL_SCHEMA_V1 {
+    validate_objective_detail_header(detail)?;
+    let objective = &detail.objective;
+    let criteria = objective
+        .acceptance_criteria
+        .as_ref()
+        .map(|criteria| {
+            criteria
+                .iter()
+                .map(|criterion| (criterion.condition_id.as_str(), criterion.text.as_str()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    validate_objective_detail_bindings(detail, &criteria)?;
+    for link in &detail.occurrences {
+        if link.campaign_id.is_empty()
+            || link.occurrence_id.is_empty()
+            || link.proposal_id.is_empty()
+            || link.exact_work_id.is_empty()
+            || objective.plan_digest.as_ref() != Some(&link.maude_plan_ref)
+        {
+            return Err("objective occurrence link lacks an exact matching lineage".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_objective_detail_header(detail: &ObjectiveDetailV1) -> Result<(), String> {
+    let enriched = detail.schema == OBJECTIVE_DETAIL_SCHEMA_V2;
+    if detail.schema != OBJECTIVE_DETAIL_SCHEMA_V1 && !enriched {
         return Err("unsupported objective-detail schema".to_owned());
+    }
+    if enriched != detail.owner_projection.is_some() {
+        return Err("objective-detail schema does not match owner projection presence".to_owned());
+    }
+    if !enriched
+        && (detail.conditions.iter().any(|condition| {
+            condition.disposition != ObjectiveConditionDispositionV1::Unknown
+                || condition.owner_record_ref.is_some()
+                || condition.owner_record_digest.is_some()
+                || !condition.evidence.is_empty()
+                || condition.reason.is_some()
+        }) || detail.prerequisites != ObjectivePrerequisitesV1::Unknown)
+    {
+        return Err("objective-detail/v1 cannot carry application-owner assertions".to_owned());
     }
     let objective = &detail.objective;
     if objective.schema != MAUDE_OBJECTIVE_READ_SCHEMA_V1 || objective.source != "maude" {
@@ -1547,35 +1824,254 @@ fn validate_objective_detail(detail: &ObjectiveDetailV1) -> Result<(), String> {
             "unavailable objective exposed authored material or lacks an error code".to_owned(),
         );
     }
-    let criteria = objective
-        .acceptance_criteria
+    Ok(())
+}
+
+fn validate_objective_detail_bindings(
+    detail: &ObjectiveDetailV1,
+    criteria: &BTreeMap<&str, &str>,
+) -> Result<(), String> {
+    let objective = &detail.objective;
+    let owner = detail
+        .owner_projection
         .as_ref()
-        .map(|criteria| {
-            criteria
+        .and_then(SourceResultV1::value);
+    if let Some(projection) = owner {
+        validate_objective_owner_projection_shape(projection)?;
+    }
+    if owner.is_some_and(|projection| {
+        objective.plan_digest.as_ref() != Some(&projection.plan_digest)
+            || projection
+                .conditions
                 .iter()
-                .map(|criterion| &criterion.text)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+                .any(|assessment| !criteria.contains_key(assessment.condition_id.as_str()))
+    }) {
+        return Err("application owner projection is outside the authored objective".to_owned());
+    }
     let mut condition_ids = BTreeSet::new();
     for condition in &detail.conditions {
         if condition.condition_id.is_empty()
-            || !criteria.contains(&condition.criterion)
+            || criteria.get(condition.condition_id.as_str()) != Some(&condition.criterion.as_str())
             || !condition_ids.insert(condition.condition_id.as_str())
-            || condition.disposition != ObjectiveConditionDispositionV1::Unknown
-            || condition.owner_record_ref.is_some()
         {
             return Err("objective condition is outside the approved public contract".to_owned());
         }
+        let assessment = owner.and_then(|projection| {
+            projection
+                .conditions
+                .iter()
+                .find(|assessment| assessment.condition_id == condition.condition_id)
+        });
+        match assessment {
+            Some(assessment)
+                if assessment.assessment == condition.disposition
+                    && assessment.owner_record_ref == condition.owner_record_ref
+                    && assessment.owner_record_digest == condition.owner_record_digest
+                    && serde_jcs::to_vec(&assessment.evidence).ok()
+                        == serde_jcs::to_vec(&condition.evidence).ok()
+                    && assessment.reason == condition.reason => {}
+            None if condition.disposition == ObjectiveConditionDispositionV1::Unknown
+                && condition.owner_record_ref.is_none()
+                && condition.owner_record_digest.is_none()
+                && condition.evidence.is_empty()
+                && condition.reason.is_none() => {}
+            _ => {
+                return Err(
+                    "objective condition differs from its application-owner assertion".to_owned(),
+                );
+            }
+        }
     }
-    for link in &detail.occurrences {
-        if link.campaign_id.is_empty()
-            || link.occurrence_id.is_empty()
-            || link.proposal_id.is_empty()
-            || link.exact_work_id.is_empty()
-            || objective.plan_digest.as_ref() != Some(&link.maude_plan_ref)
+    match (&detail.owner_projection, &detail.prerequisites) {
+        (None, ObjectivePrerequisitesV1::Unknown)
+        | (Some(SourceResultV1::Unavailable { .. }), ObjectivePrerequisitesV1::Unavailable) => {}
+        (
+            Some(SourceResultV1::Available { value, .. }),
+            ObjectivePrerequisitesV1::OwnerDeclared { coverage, items },
+        ) if value.prerequisites.availability == ObjectivePrerequisiteAvailabilityV1::Available
+            && value.prerequisites.coverage.as_ref() == Some(coverage)
+            && serde_jcs::to_vec(&value.prerequisites.items).ok()
+                == serde_jcs::to_vec(items).ok() => {}
+        (Some(SourceResultV1::Available { value, .. }), ObjectivePrerequisitesV1::Unavailable)
+            if value.prerequisites.availability
+                == ObjectivePrerequisiteAvailabilityV1::Unavailable => {}
+        _ => {
+            return Err(
+                "objective prerequisites differ from the application-owner source".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_objective_owner_projection(
+    value: &ObjectiveOwnerProjectionV1,
+    expected: &ObjectiveOwnerProjectionSourceV1,
+) -> Result<(), String> {
+    validate_objective_owner_projection_shape(value)?;
+    if value.plan_digest != expected.expected_plan_digest
+        || value.owner_id != expected.expected_owner_id
+        || value.owner_capability != expected.expected_owner_capability
+        || value.owner_source_revision != expected.expected_source_revision
+    {
+        return Err("objective owner projection does not match its declared enrollment".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_objective_owner_projection_shape(
+    value: &ObjectiveOwnerProjectionV1,
+) -> Result<(), String> {
+    if value.schema != OBJECTIVE_OWNER_PROJECTION_SCHEMA_V1
+        || !is_sha256_digest(&value.plan_digest)
+        || value.owner_id.is_empty()
+        || value.owner_capability.is_empty()
+        || value.owner_source_revision.is_empty()
+        || value.authority != "none"
+        || !is_rfc3339_timestamp(&value.projected_at)
+    {
+        return Err("objective owner projection shape is invalid".to_owned());
+    }
+    let mut identity_material = value.clone();
+    identity_material.projection_id.clear();
+    let bytes = serde_jcs::to_vec(&identity_material)
+        .map_err(|error| format!("canonicalize objective owner projection: {error}"))?;
+    if value.projection_id != format!("sha256:{:x}", Sha256::digest(bytes)) {
+        return Err("objective owner projection identity mismatch".to_owned());
+    }
+    validate_owner_conditions(&value.conditions)?;
+    validate_owner_prerequisites(&value.prerequisites)
+}
+
+fn validate_owner_conditions(
+    conditions: &[crate::model::ObjectiveOwnerConditionV1],
+) -> Result<(), String> {
+    let mut condition_ids = BTreeSet::new();
+    for condition in conditions {
+        if condition.condition_id.is_empty() || !condition_ids.insert(&condition.condition_id) {
+            return Err("objective owner projection has an invalid condition identity".to_owned());
+        }
+        let paired = condition.owner_record_ref.as_ref().is_some()
+            == condition.owner_record_digest.as_ref().is_some();
+        if !paired
+            || condition
+                .owner_record_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256_digest(digest))
+            || condition.reason.as_ref().is_some_and(String::is_empty)
         {
-            return Err("objective occurrence link lacks an exact matching lineage".to_owned());
+            return Err("objective owner assessment record binding is invalid".to_owned());
+        }
+        match condition.assessment {
+            ObjectiveConditionDispositionV1::Satisfied
+            | ObjectiveConditionDispositionV1::NotSatisfied => {
+                if condition
+                    .owner_record_ref
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+                    || condition.evidence.is_empty()
+                    || condition.evidence.iter().any(|evidence| {
+                        evidence.source_currentness != ObjectiveEvidenceCurrentnessV1::Fresh
+                    })
+                    || condition.reason.is_some()
+                {
+                    return Err(
+                        "decisive application assessment lacks exact fresh evidence".to_owned()
+                    );
+                }
+            }
+            ObjectiveConditionDispositionV1::Indeterminate => {
+                if condition.reason.as_ref().is_none_or(String::is_empty) {
+                    return Err("indeterminate application assessment lacks a reason".to_owned());
+                }
+            }
+            ObjectiveConditionDispositionV1::Unavailable => {
+                if condition.owner_record_ref.is_some()
+                    || !condition.evidence.is_empty()
+                    || condition.reason.as_ref().is_none_or(String::is_empty)
+                {
+                    return Err(
+                        "unavailable application assessment carries contradictory custody"
+                            .to_owned(),
+                    );
+                }
+            }
+            ObjectiveConditionDispositionV1::OwnerAttested
+            | ObjectiveConditionDispositionV1::Unknown => {
+                return Err(
+                    "legacy or unknown disposition is not an owner projection assessment"
+                        .to_owned(),
+                );
+            }
+        }
+        for evidence in &condition.evidence {
+            if evidence.owner_schema.is_empty()
+                || evidence.owner_record_id.is_empty()
+                || !is_sha256_digest(&evidence.owner_record_digest)
+                || condition.owner_record_ref.as_ref() != Some(&evidence.owner_record_id)
+                || condition.owner_record_digest.as_ref() != Some(&evidence.owner_record_digest)
+            {
+                return Err("application assessment evidence identity is invalid".to_owned());
+            }
+            for label in [&evidence.owner_outcome, &evidence.maintenance_annotation]
+                .into_iter()
+                .flatten()
+            {
+                if label.is_empty()
+                    || label.len() > 128
+                    || !label.bytes().all(|byte| byte.is_ascii_graphic())
+                {
+                    return Err("application assessment evidence label is invalid".to_owned());
+                }
+            }
+            for timestamp in [
+                &evidence.source_observed_at,
+                &evidence.read_attempted_at,
+                &evidence.projected_at,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !is_rfc3339_timestamp(timestamp) {
+                    return Err("application assessment evidence timestamp is invalid".to_owned());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner_prerequisites(
+    prerequisites: &crate::model::ObjectiveOwnerPrerequisitesV1,
+) -> Result<(), String> {
+    match prerequisites.availability {
+        ObjectivePrerequisiteAvailabilityV1::Available => {
+            if prerequisites.coverage.as_deref() != Some("owner_asserted_complete")
+                || prerequisites.reason.is_some()
+            {
+                return Err(
+                    "available prerequisite projection lacks explicit owner coverage".to_owned(),
+                );
+            }
+        }
+        ObjectivePrerequisiteAvailabilityV1::Unavailable => {
+            if prerequisites.coverage.is_some()
+                || !prerequisites.items.is_empty()
+                || prerequisites.reason.as_ref().is_none_or(String::is_empty)
+            {
+                return Err("unavailable prerequisite projection is contradictory".to_owned());
+            }
+        }
+    }
+    let mut prerequisite_ids = BTreeSet::new();
+    for item in &prerequisites.items {
+        if item.prerequisite_id.is_empty()
+            || item.relation.is_empty()
+            || item.owner_record_ref.is_empty()
+            || !is_sha256_digest(&item.owner_record_digest)
+            || !prerequisite_ids.insert(&item.prerequisite_id)
+        {
+            return Err("application prerequisite identity is invalid".to_owned());
         }
     }
     Ok(())
@@ -1658,10 +2154,83 @@ fn is_sha256_digest(value: &str) -> bool {
             .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+fn is_rfc3339_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    let number = |start: usize, end: usize| {
+        bytes
+            .get(start..end)
+            .filter(|part| part.iter().all(u8::is_ascii_digit))
+            .and_then(|part| std::str::from_utf8(part).ok())
+            .and_then(|part| part.parse::<u32>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    if year == 0 {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let mut cursor = 19;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == start {
+            return false;
+        }
+    }
+    match bytes.get(cursor..) {
+        Some(b"Z") => true,
+        Some(zone)
+            if zone.len() == 6
+                && matches!(zone[0], b'+' | b'-')
+                && zone[3] == b':'
+                && zone[1..3].iter().all(u8::is_ascii_digit)
+                && zone[4..6].iter().all(u8::is_ascii_digit) =>
+        {
+            let hours = u32::from(zone[1] - b'0') * 10 + u32::from(zone[2] - b'0');
+            let minutes = u32::from(zone[4] - b'0') * 10 + u32::from(zone[5] - b'0');
+            hours <= 23 && minutes <= 59
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod objective_projection_tests {
     use super::*;
-    use crate::model::{MaudeAcceptanceCriterionV1, MaudeObjectiveAvailabilityV1};
+    use crate::model::{
+        MaudeAcceptanceCriterionV1, MaudeObjectiveAvailabilityV1, ObjectiveEvidenceCurrentnessV1,
+        ObjectiveOwnerConditionV1, ObjectiveOwnerEvidenceV1, ObjectiveOwnerPrerequisitesV1,
+    };
     use std::os::unix::fs::PermissionsExt as _;
 
     fn available() -> ObjectiveDetailV1 {
@@ -1687,16 +2256,270 @@ mod objective_projection_tests {
                 criterion: "A real owner assessment is present".to_owned(),
                 disposition: ObjectiveConditionDispositionV1::Unknown,
                 owner_record_ref: None,
+                owner_record_digest: None,
+                evidence: Vec::new(),
+                reason: None,
             }],
             occurrences: Vec::new(),
             causal_unavailable: Vec::new(),
             prerequisites: ObjectivePrerequisitesV1::Unknown,
+            owner_projection: None,
         }
+    }
+
+    fn owner_source() -> ObjectiveOwnerProjectionSourceV1 {
+        ObjectiveOwnerProjectionSourceV1 {
+            program: PathBuf::from("/bin/phosphor-objective-owner-reader"),
+            config: PathBuf::from("/owner.json"),
+            expected_owner_id: "example-owner".into(),
+            expected_owner_capability: "saved-check-interpretation/v1".into(),
+            expected_source_revision: "revision-1".into(),
+            expected_plan_digest: format!("sha256:{}", "b".repeat(64)),
+        }
+    }
+
+    fn owner_projection() -> ObjectiveOwnerProjectionV1 {
+        let evidence = ObjectiveOwnerEvidenceV1 {
+            owner_schema: "nq.saved-check-condition/v1".into(),
+            owner_record_id: "evaluation-1".into(),
+            owner_record_digest: format!("sha256:{}", "e".repeat(64)),
+            source_observed_at: Some("2026-09-14T00:00:00Z".into()),
+            read_attempted_at: Some("2026-09-14T00:00:01.123Z".into()),
+            projected_at: Some("2026-09-14T00:00:02+00:00".into()),
+            source_currentness: ObjectiveEvidenceCurrentnessV1::Fresh,
+            owner_outcome: Some("failed".into()),
+            maintenance_annotation: Some("covered".into()),
+        };
+        let mut value = ObjectiveOwnerProjectionV1 {
+            schema: OBJECTIVE_OWNER_PROJECTION_SCHEMA_V1.into(),
+            projection_id: String::new(),
+            plan_digest: format!("sha256:{}", "b".repeat(64)),
+            owner_id: "example-owner".into(),
+            owner_capability: "saved-check-interpretation/v1".into(),
+            owner_source_revision: "revision-1".into(),
+            projected_at: "2026-09-14T00:00:03.456789+00:00".into(),
+            conditions: vec![ObjectiveOwnerConditionV1 {
+                condition_id: format!("sha256:{}", "c".repeat(64)),
+                assessment: ObjectiveConditionDispositionV1::Satisfied,
+                owner_record_ref: Some("evaluation-1".into()),
+                owner_record_digest: Some(format!("sha256:{}", "e".repeat(64))),
+                evidence: vec![evidence],
+                reason: None,
+            }],
+            prerequisites: ObjectiveOwnerPrerequisitesV1 {
+                availability: ObjectivePrerequisiteAvailabilityV1::Available,
+                coverage: Some("owner_asserted_complete".into()),
+                items: Vec::new(),
+                reason: None,
+            },
+            authority: "none".into(),
+        };
+        let bytes = serde_jcs::to_vec(&value).unwrap();
+        value.projection_id = format!("sha256:{:x}", Sha256::digest(bytes));
+        value
     }
 
     #[test]
     fn objective_conditions_remain_unknown_without_owner_assessment() {
-        assert!(validate_objective_detail(&available()).is_ok());
+        let detail = available();
+        assert!(validate_objective_detail(&detail).is_ok());
+        let wire = serde_json::to_value(detail).unwrap();
+        assert_eq!(wire["schema"], OBJECTIVE_DETAIL_SCHEMA_V1);
+        assert!(wire.get("owner_projection").is_none());
+        assert!(wire["conditions"][0].get("evidence").is_none());
+        assert!(wire["conditions"][0].get("owner_record_digest").is_none());
+        assert!(wire["conditions"][0].get("reason").is_none());
+    }
+
+    #[test]
+    fn exact_application_owner_projection_overlays_without_completion_verdict() {
+        let owner = owner_projection();
+        assert!(validate_objective_owner_projection(&owner, &owner_source()).is_ok());
+        let source = SourceResultV1::Available {
+            source: "application objective owner".into(),
+            command: ReadCommandNameV1::ObjectiveOwnerProjection,
+            captured_at_unix_ms: 9,
+            raw: serde_json::to_value(&owner).unwrap(),
+            value: owner,
+        };
+        let detail =
+            assemble_objective_detail(available().objective, &[], Vec::new(), Some(source));
+        assert_eq!(detail.schema, OBJECTIVE_DETAIL_SCHEMA_V2);
+        assert_eq!(
+            detail.conditions[0].disposition,
+            ObjectiveConditionDispositionV1::Satisfied
+        );
+        assert!(
+            matches!(detail.prerequisites,ObjectivePrerequisitesV1::OwnerDeclared { ref items, .. } if items.is_empty())
+        );
+        assert!(validate_objective_detail(&detail).is_ok());
+        let mut mislabeled = detail.clone();
+        mislabeled.schema = OBJECTIVE_DETAIL_SCHEMA_V1.to_owned();
+        assert!(validate_objective_detail(&mislabeled).is_err());
+    }
+
+    #[test]
+    fn owner_projection_refuses_wrong_identity_contradiction_and_bad_time() {
+        let source = owner_source();
+        let mut value = owner_projection();
+        value.plan_digest = format!("sha256:{}", "a".repeat(64));
+        assert!(validate_objective_owner_projection(&value, &source).is_err());
+        let mut value = owner_projection();
+        value.conditions[0].assessment = ObjectiveConditionDispositionV1::Unavailable;
+        assert!(validate_objective_owner_projection(&value, &source).is_err());
+        let mut value = owner_projection();
+        value.conditions[0].evidence[0].projected_at = Some("not-time".into());
+        assert!(validate_objective_owner_projection(&value, &source).is_err());
+    }
+
+    #[test]
+    fn stale_owner_fact_remains_indeterminate_with_original_labels() {
+        let source = owner_source();
+        let mut value = owner_projection();
+        value.conditions[0].assessment = ObjectiveConditionDispositionV1::Indeterminate;
+        value.conditions[0].reason = Some("owner evidence is stale".into());
+        value.conditions[0].evidence[0].source_currentness = ObjectiveEvidenceCurrentnessV1::Stale;
+        let bytes = serde_jcs::to_vec(&ObjectiveOwnerProjectionV1 {
+            projection_id: String::new(),
+            ..value.clone()
+        })
+        .unwrap();
+        value.projection_id = format!("sha256:{:x}", Sha256::digest(bytes));
+        assert!(validate_objective_owner_projection(&value, &source).is_ok());
+        assert_eq!(
+            value.conditions[0].evidence[0].owner_outcome.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            value.conditions[0].evidence[0]
+                .maintenance_annotation
+                .as_deref(),
+            Some("covered")
+        );
+
+        value.conditions[0].assessment = ObjectiveConditionDispositionV1::Satisfied;
+        value.conditions[0].reason = None;
+        value.projection_id.clear();
+        value.projection_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_jcs::to_vec(&value).unwrap())
+        );
+        assert!(validate_objective_owner_projection_shape(&value).is_err());
+    }
+
+    #[test]
+    fn owner_projection_uses_only_the_enrolled_config_and_exact_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("phosphor-objective-owner-reader");
+        let arguments = root.path().join("arguments");
+        let config = root.path().join("owner.json");
+        let output = serde_json::to_string(&owner_projection()).unwrap();
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+                arguments.display(),
+                output
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = ObjectiveOwnerProjectionSourceV1 {
+            program,
+            config: config.clone(),
+            ..owner_source()
+        };
+        let expected_plan_digest = source.expected_plan_digest.clone();
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: root.path().join("ag-loopctl"),
+            nightshift: None,
+            docket: None,
+            maude_acquisition: None,
+            maude_objective: None,
+            objective_owner_projection: Some(source),
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
+        })
+        .unwrap();
+        let result = reader.objective_owner_projection();
+        assert!(
+            matches!(&result, SourceResultV1::Available { .. }),
+            "unexpected owner-projection result: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            format!(
+                "--config\n{}\nobjective-projection\n--plan-digest\n{}\n",
+                config.display(),
+                expected_plan_digest
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_objective_read_refuses_owner_condition_outside_maude() {
+        let root = tempfile::tempdir().unwrap();
+        let owner_program = root.path().join("phosphor-objective-owner-reader");
+        let maude_program = root.path().join("maude-plan");
+        let plan = root.path().join("plan.json");
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let mut owner = owner_projection();
+        owner.conditions[0].condition_id = format!("sha256:{}", "d".repeat(64));
+        owner.projection_id.clear();
+        owner.projection_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_jcs::to_vec(&owner).unwrap())
+        );
+        let maude = available().objective;
+        for (program, output) in [
+            (&owner_program, serde_json::to_string(&owner).unwrap()),
+            (&maude_program, serde_json::to_string(&maude).unwrap()),
+        ] {
+            std::fs::write(program, format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: root.path().join("ag-loopctl"),
+            nightshift: None,
+            docket: None,
+            maude_acquisition: None,
+            maude_objective: Some(MaudeObjectiveReadSourceV1 {
+                program: maude_program,
+                plan,
+                expected_plan_digest: digest.clone(),
+            }),
+            objective_owner_projection: Some(ObjectiveOwnerProjectionSourceV1 {
+                program: owner_program,
+                config: root.path().join("owner.json"),
+                expected_plan_digest: digest.clone(),
+                ..owner_source()
+            }),
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
+        })
+        .unwrap();
+        let detail = reader
+            .objective_detail(digest.trim_start_matches("sha256:"))
+            .unwrap();
+        assert_eq!(detail.schema, OBJECTIVE_DETAIL_SCHEMA_V2);
+        assert!(
+            matches!(
+                &detail.owner_projection,
+                Some(SourceResultV1::Unavailable {
+                    error_kind: SourceErrorKindV1::IncompatibleSchema,
+                    ..
+                })
+            ),
+            "unexpected owner-binding result: {:?}",
+            detail.owner_projection
+        );
+        assert_eq!(
+            detail.conditions[0].disposition,
+            ObjectiveConditionDispositionV1::Unknown
+        );
+        assert_eq!(detail.prerequisites, ObjectivePrerequisitesV1::Unavailable);
     }
 
     #[test]
@@ -1751,14 +2574,16 @@ mod objective_projection_tests {
                 plan: plan.clone(),
                 expected_plan_digest: digest.clone(),
             }),
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
-        assert!(matches!(
-            reader.maude_objective_read(),
-            SourceResultV1::Available { .. }
-        ));
+        let result = reader.maude_objective_read();
+        assert!(
+            matches!(&result, SourceResultV1::Available { .. }),
+            "unexpected Maude objective result: {result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(arguments).unwrap(),
             format!(
@@ -2137,6 +2962,7 @@ fn validate_docket(value: &DocketInspectionV1, issuance: &str) -> Result<(), Str
 
 fn run_bounded(command: &mut Command) -> Result<Vec<u8>, CaptureFailureV1> {
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2160,8 +2986,7 @@ fn run_bounded(command: &mut Command) -> Result<Vec<u8>, CaptureFailureV1> {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_command_group(&mut child);
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(CaptureFailureV1 {
@@ -2171,6 +2996,9 @@ fn run_bounded(command: &mut Command) -> Result<Vec<u8>, CaptureFailureV1> {
                 });
             }
             Err(error) => {
+                terminate_command_group(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(CaptureFailureV1 {
                     kind: SourceErrorKindV1::Unavailable,
                     detail: format!("canonical command wait failed: {error}"),
@@ -2179,6 +3007,9 @@ fn run_bounded(command: &mut Command) -> Result<Vec<u8>, CaptureFailureV1> {
             }
         }
     };
+    // Enrolled read programs must keep descendants in this process group.
+    // Close inherited pipes before joining readers after the leader exits.
+    terminate_command_group(&mut child);
     let stdout = stdout_reader.join().map_err(|_| CaptureFailureV1 {
         kind: SourceErrorKindV1::Unavailable,
         detail: "canonical command stdout reader failed".to_owned(),
@@ -2200,6 +3031,17 @@ fn run_bounded(command: &mut Command) -> Result<Vec<u8>, CaptureFailureV1> {
         });
     }
     Ok(stdout)
+}
+
+fn terminate_command_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn read_bounded(mut stream: impl Read, limit: u64) -> Result<Vec<u8>, CaptureFailureV1> {
@@ -2325,19 +3167,24 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let index = reader.campaign_index().unwrap();
         assert_eq!(index.campaigns.len(), 1);
-        assert!(matches!(
-            index.campaigns[0].inspect,
-            SourceResultV1::Unavailable {
-                error_kind: SourceErrorKindV1::MalformedOutput,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &index.campaigns[0].inspect,
+                SourceResultV1::Unavailable {
+                    error_kind: SourceErrorKindV1::MalformedOutput,
+                    ..
+                }
+            ),
+            "unexpected malformed-output result: {:?}",
+            index.campaigns[0].inspect
+        );
         assert_eq!(
             index.campaigns[0].projection.correspondence,
             ProjectionCorrespondenceV1::Partial
@@ -2401,19 +3248,23 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_authoring_export(&campaign, occurrence);
-        assert!(matches!(
-            result,
-            SourceResultV1::Available {
-                command: ReadCommandNameV1::NightshiftExportAuthoringContext,
-                value: NightshiftAuthoringContextExportV1 { matches, .. },
-                ..
-            } if matches.is_empty()
-        ));
+        assert!(
+            matches!(
+                &result,
+                SourceResultV1::Available {
+                    command: ReadCommandNameV1::NightshiftExportAuthoringContext,
+                    value: NightshiftAuthoringContextExportV1 { matches, .. },
+                    ..
+                } if matches.is_empty()
+            ),
+            "unexpected authoring-context result: {result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(arguments).unwrap(),
             format!(
@@ -2423,6 +3274,25 @@ mod tests {
                 occurrence,
             )
         );
+    }
+
+    #[test]
+    fn bounded_reader_closes_same_group_inherited_pipe_after_leader_exit() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & printf '{}'"]);
+        assert_eq!(run_bounded(&mut command).unwrap(), b"{}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bounded_reader_terminates_same_group_descendant_at_deadline() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let error = run_bounded(&mut command).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKindV1::Timeout);
+        assert!(started.elapsed() < COMMAND_TIMEOUT + Duration::from_secs(2));
     }
 
     #[test]
@@ -2465,19 +3335,23 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_authoring_custody_export(&campaign, occurrence);
-        assert!(matches!(
-            result,
-            SourceResultV1::Available {
-                command: ReadCommandNameV1::NightshiftExportAuthoringCustody,
-                value: NightshiftAuthoringCustodyExportV1 { matches, .. },
-                ..
-            } if matches.is_empty()
-        ));
+        assert!(
+            matches!(
+                &result,
+                SourceResultV1::Available {
+                    command: ReadCommandNameV1::NightshiftExportAuthoringCustody,
+                    value: NightshiftAuthoringCustodyExportV1 { matches, .. },
+                    ..
+                } if matches.is_empty()
+            ),
+            "unexpected authoring-custody result: {result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(arguments).unwrap(),
             format!(
@@ -2529,19 +3403,23 @@ mod tests {
             docket: None,
             maude_acquisition: None,
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.nightshift_external_observation_export(&campaign, occurrence);
-        assert!(matches!(
-            result,
-            SourceResultV1::Available {
-                command: ReadCommandNameV1::NightshiftExportExternalObservation,
-                value: ExternalObservationExportV1 { matches, .. },
-                ..
-            } if matches.is_empty()
-        ));
+        assert!(
+            matches!(
+                &result,
+                SourceResultV1::Available {
+                    command: ReadCommandNameV1::NightshiftExportExternalObservation,
+                    value: ExternalObservationExportV1 { matches, .. },
+                    ..
+                } if matches.is_empty()
+            ),
+            "unexpected external-observation result: {result:?}"
+        );
         let arguments = std::fs::read_to_string(arguments).unwrap();
         assert!(arguments.contains("\nexternal-observation\nexport\n"));
         assert!(arguments.contains(&format!(
@@ -2590,19 +3468,23 @@ mod tests {
                 ledger: root.path().join("acquisition.sqlite"),
             }),
             maude_objective: None,
+            objective_owner_projection: None,
             public_objective_projection: None,
             public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.maude_acquisition_export(&campaign, occurrence);
-        assert!(matches!(
-            result,
-            SourceResultV1::Available {
-                command: ReadCommandNameV1::MaudeExportObservationAcquisitions,
-                value: AcquisitionHistoryV1 { acquisitions, .. },
-                ..
-            } if acquisitions.is_empty()
-        ));
+        assert!(
+            matches!(
+                &result,
+                SourceResultV1::Available {
+                    command: ReadCommandNameV1::MaudeExportObservationAcquisitions,
+                    value: AcquisitionHistoryV1 { acquisitions, .. },
+                    ..
+                } if acquisitions.is_empty()
+            ),
+            "unexpected acquisition-history result: {result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(arguments).unwrap(),
             format!(

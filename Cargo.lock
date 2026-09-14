@@ -92,8 +92,11 @@ dependencies = [
  "ag-store",
  "anyhow",
  "clap",
+ "nix",
  "serde",
+ "serde_jcs",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

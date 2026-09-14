@@ -17,11 +17,13 @@ assessment is still unknown.
 | Nightshift authoring lineage | Explicit plan/campaign/occurrence/proposal/work relationships retained by the owner | Relationships inferred from time, titles, filenames, or proximity |
 | AG campaign projections | Journal states, exact proposals, consumed authorization and retained occurrence history | Success inferred merely from authorization or an issuance |
 | Docket inspection | Attempt custody, execution outcome and settlement, with their exact identities | Objective completion or permission for another attempt |
-| Phosphor `phosphor-ng.objective-detail/v1` | Bounded assembly of those sources, keeping their independent results | A new authority service, scheduler or objective evaluator |
+| Optional application-owner projection | Exact owner assertions and prerequisite coverage for exact Maude condition IDs, with separate evidence currentness | Independent proof of the application interpretation, objective completion, permission, or execution |
+| Phosphor objective detail (`v1`, or opt-in `v2` with an owner source) | Bounded assembly of those sources, keeping their independent results | A new authority service, scheduler or objective evaluator |
 
-The projection's `conditions` currently have disposition `unknown` and no
-assessment record. Its `prerequisites` is explicitly `unknown`: an empty list
-must not imply that no prerequisites exist. Linked campaign detail preserves
+Without an enrolled application-owner projection, conditions have disposition
+`unknown` and prerequisites remain unknown. An owner projection can explicitly
+assert complete prerequisite coverage, including an empty set; an absent or
+unavailable source never implies that no prerequisites exist. Linked campaign detail preserves
 execution, authority and evidence source results separately. Failed causal
 reads remain visible in `causal_unavailable`; missing configuration is not a
 successful empty observation. Historical links use exact retained owner
@@ -45,6 +47,36 @@ the authoring relationships; Docket is required to inspect actual attempt
 custody and settlement. Omitting either leaves its contribution unavailable,
 not replaced by Maude. Acquisition-ledger inspection is a separate optional
 read source for this use case; omitting it loses acquisition-mechanics detail.
+
+An application that owns the interpretation of Maude's authored criteria can
+also enroll one fixed bounded reader:
+
+```text
+--objective-owner-bin /absolute/path/to/phosphor-objective-owner-reader
+--objective-owner-config /absolute/path/to/pinned-reader-config.json
+--objective-owner-id APPLICATION_OWNER_ID
+--objective-owner-capability CAPABILITY_ID
+--objective-owner-source-revision SOURCE_REVISION
+--objective-owner-expected-plan-digest sha256:YOUR_EXACT_PLAN_DIGEST
+```
+
+Phosphor invokes only `phosphor-objective-owner-reader --config CONFIG
+objective-projection --plan-digest DIGEST`. The enrollment declares the reader
+and configuration identity; it is not cryptographic proof of their origin.
+The closed result must bind the exact plan and Maude condition identifiers.
+It retains application-owner assertions, record digests, source currentness,
+and source/read/projection timestamps separately. RFC 3339 timestamp strings
+are validated but not trimmed, retimed, or normalized before the projection's
+JCS identity is checked. Stale, future, refused, or claimed owner facts remain
+indeterminate rather than becoming a completion verdict.
+
+The prerequisite list is authoritative only as an application-owner assertion.
+An empty list is meaningful solely when accompanied by the explicit
+`owner_asserted_complete` coverage value. This read path grants no permission
+and does not aggregate the condition assertions into an objective-complete bit.
+Enrolling this source explicitly selects `phosphor-ng.objective-detail/v2`.
+With no owner source, Phosphor continues to emit the unchanged strict `v1`
+shape: no owner-projection member and no new empty evidence members.
 
 Use the 64 hexadecimal characters of that plan digest in these loopback URLs:
 
@@ -79,7 +111,7 @@ The separate routes are `/public/objectives/PLAN_DIGEST_HEX` and
 `/api/v1/public/objectives/PLAN_DIGEST_HEX`. They are still loopback-only.
 They do not automatically derive text or links from the operator view.
 
-## Qualification and remaining work
+## Original v1 qualification
 
 The component qualification exercised Linux, Python3.12 and the repository's
 locked Rust dependency set. Exact source combination:
@@ -100,9 +132,40 @@ become objective completion. A missing-plan control returned unavailable with
 no authored content. The public-artifact check used a synthetic allowlisted
 URL, not a verified public receipt destination.
 
-This qualifies a local read path, not a reproducible suite release or a full
+This qualified the original local read path, not a reproducible suite release or a full
 application migration. External applications still own their presentation
-schema, domain interpretation and deployment. Automatic condition assessment,
-prerequisite assembly and cross-repository objective discovery are not supplied
-by this contract. See the [Integration guide](https://unpingable.com/constellation/integration.html)
+schema, domain interpretation and deployment. The optional source carries an
+application-owned interpretation; Phosphor does not independently establish
+that interpretation as real-world truth. Cross-repository objective discovery
+is not supplied by this contract. See the [Integration guide](https://unpingable.com/constellation/integration.html)
 for separately qualified compositions and public prerequisites.
+
+## Application assessments: v2 scope
+
+The optional [NQ condition reader](../examples/objective-owner-reader.md) uses
+an explicitly configured application mapping; Maude's criterion text is not
+parsed into an implicit rule. Its condition reference is the exact NQ evaluation
+ID, and its evidence digest covers the exact response bytes. Missing sources,
+changed plan/criterion bindings and incompatible owner records remain visible
+as unavailable, with no owner assertions applied.
+
+A disposable integration used real Maude authoring, Monitor acquisition,
+Nightshift finite recurrence, NQ saved evaluation/maintenance, this reader and
+Phosphor's HTTP and rendered views. It kept a fresh failed result `not_satisfied`,
+an old result `indeterminate`, and another criterion `unknown`. Maintenance was
+`covered` for the fresh projection and `overrun` for the old one at its later
+projection time; the historical attention receipt was not rewritten. One
+prerequisite was explicitly application-declared, not discovered by Phosphor.
+No AG/Docket execution was needed or substituted in that read-only case.
+
+The source runner bounds same-process-group reads and closes retained pipes on
+exit or timeout. Enrolled programs must not detach. The NQ example uses an
+inner three-second read deadline inside Phosphor's five-second capture limit;
+its exact local read does not start executors. Source bytes and local paths
+remain within the operator's deployment trust boundary. Multiple owner reads
+are not an atomic snapshot.
+
+This extends component-level read integration; it does not itself qualify the
+full application journey, public-only installation, retention rollover, live
+notifications or a new suite release. Existing immutable release profiles keep
+their documented narrower scope.

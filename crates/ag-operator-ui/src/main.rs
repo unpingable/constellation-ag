@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use ag_operator_ui::server::{serve, validate_bind_ip};
 use ag_operator_ui::source::{
     DocketReadSourceV1, MaudeAcquisitionReadSourceV1, MaudeObjectiveReadSourceV1,
-    NightshiftReadSourceV1, OperatorReaderV1, OperatorSourceConfigV1,
+    NightshiftReadSourceV1, ObjectiveOwnerProjectionSourceV1, OperatorReaderV1,
+    OperatorSourceConfigV1,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -26,7 +27,7 @@ struct Args {
     ag_loopctl: Option<PathBuf>,
 
     /// Deterministic captured corpus for presentation qualification only.
-    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state", "maude_acquisition_bin", "maude_acquisition_ledger", "maude_objective_bin", "maude_objective_plan", "maude_objective_expected_plan_digest", "public_objective_projection"])]
+    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state", "maude_acquisition_bin", "maude_acquisition_ledger", "maude_objective_bin", "maude_objective_plan", "maude_objective_expected_plan_digest", "objective_owner_bin", "objective_owner_config", "objective_owner_id", "objective_owner_capability", "objective_owner_source_revision", "objective_owner_expected_plan_digest", "public_objective_projection"])]
     demo_corpus: Option<PathBuf>,
 
     /// Absolute path to the canonical `nightshift` executable.
@@ -53,17 +54,30 @@ struct Args {
     #[arg(long, requires = "maude_acquisition_bin")]
     maude_acquisition_ledger: Option<PathBuf>,
 
-    /// Absolute path to the closed Maude PlanDocument reader.
+    /// Absolute path to the closed Maude `PlanDocument` reader.
     #[arg(long, requires_all = ["maude_objective_plan", "maude_objective_expected_plan_digest"])]
     maude_objective_bin: Option<PathBuf>,
 
-    /// Existing PlanDocument file consulted by the bounded Maude reader.
+    /// Existing `PlanDocument` file consulted by the bounded Maude reader.
     #[arg(long, requires_all = ["maude_objective_bin", "maude_objective_expected_plan_digest"])]
     maude_objective_plan: Option<PathBuf>,
 
-    /// Exact expected `sha256:` PlanDocument digest for the objective read.
+    /// Exact expected `sha256:` `PlanDocument` digest for the objective read.
     #[arg(long, requires_all = ["maude_objective_bin", "maude_objective_plan"])]
     maude_objective_expected_plan_digest: Option<String>,
+
+    #[arg(long, requires_all = ["objective_owner_config", "objective_owner_id", "objective_owner_capability", "objective_owner_source_revision", "objective_owner_expected_plan_digest"])]
+    objective_owner_bin: Option<PathBuf>,
+    #[arg(long, requires = "objective_owner_bin")]
+    objective_owner_config: Option<PathBuf>,
+    #[arg(long, requires = "objective_owner_bin")]
+    objective_owner_id: Option<String>,
+    #[arg(long, requires = "objective_owner_bin")]
+    objective_owner_capability: Option<String>,
+    #[arg(long, requires = "objective_owner_bin")]
+    objective_owner_source_revision: Option<String>,
+    #[arg(long, requires = "objective_owner_bin")]
+    objective_owner_expected_plan_digest: Option<String>,
 
     /// Separately approved public-safe objective projection artifact.
     #[arg(long)]
@@ -118,6 +132,34 @@ fn main() -> Result<()> {
                 "Maude objective binary, plan, and expected digest must be configured together"
             ),
         };
+        let objective_owner_projection = match (
+            args.objective_owner_bin,
+            args.objective_owner_config,
+            args.objective_owner_id,
+            args.objective_owner_capability,
+            args.objective_owner_source_revision,
+            args.objective_owner_expected_plan_digest,
+        ) {
+            (
+                Some(program),
+                Some(config),
+                Some(expected_owner_id),
+                Some(expected_owner_capability),
+                Some(expected_source_revision),
+                Some(expected_plan_digest),
+            ) => Some(ObjectiveOwnerProjectionSourceV1 {
+                program,
+                config,
+                expected_owner_id,
+                expected_owner_capability,
+                expected_source_revision,
+                expected_plan_digest,
+            }),
+            (None, None, None, None, None, None) => None,
+            _ => bail!(
+                "objective owner binary, config, identity, capability, source revision, and plan digest must be configured together"
+            ),
+        };
         OperatorReaderV1::new(OperatorSourceConfigV1 {
             campaign_root: args
                 .campaign_root
@@ -129,6 +171,7 @@ fn main() -> Result<()> {
             docket,
             maude_acquisition,
             maude_objective,
+            objective_owner_projection,
             public_objective_projection: args.public_objective_projection,
             public_approved_receipt_urls: args.public_approved_receipt_urls.into_iter().collect(),
         })

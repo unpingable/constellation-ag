@@ -12,8 +12,9 @@ use serde_json::Value;
 use crate::links::GovernedRuntimeLinkV1;
 use crate::model::{
     AgInspectV1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1, DocketInspectionV1,
-    DocketRecordStatusV1, MaudeObjectiveAvailabilityV1, ObjectiveDetailV1,
-    ProjectionCorrespondenceV1, PublicObjectiveProjectionV1, RelatedSourceV1, SourceResultV1,
+    DocketRecordStatusV1, MaudeObjectiveAvailabilityV1, ObjectiveConditionDispositionV1,
+    ObjectiveDetailV1, ObjectivePrerequisitesV1, ProjectionCorrespondenceV1,
+    PublicObjectiveProjectionV1, RelatedSourceV1, SourceResultV1,
 };
 use crate::source::selected_snapshot;
 
@@ -324,7 +325,110 @@ pub fn campaign_detail_for_link_with_context(
 
 /// Renders an additive objective projection. This is an operator read view:
 /// it does not publish Maude content and never derives completion from links.
+fn render_objective_conditions(body: &mut String, model: &ObjectiveDetailV1) {
+    body.push_str("<section class=panel wide><h2>What needs to be true</h2>");
+    if model.conditions.is_empty() {
+        body.push_str(
+            "<p class=empty>No available authored conditions. Completion is unknown.</p>",
+        );
+    }
+    for condition in &model.conditions {
+        let disposition = match condition.disposition {
+            ObjectiveConditionDispositionV1::Satisfied => "Met",
+            ObjectiveConditionDispositionV1::NotSatisfied => "Not met",
+            ObjectiveConditionDispositionV1::Indeterminate => "Needs current evidence",
+            ObjectiveConditionDispositionV1::Unavailable
+            | ObjectiveConditionDispositionV1::OwnerAttested => "Result unavailable",
+            ObjectiveConditionDispositionV1::Unknown => "Not assessed",
+        };
+        let _ = write!(
+            body,
+            "<div class=residual><strong>{}</strong><p><span class=unknown>{}</span> <span class=k>Configured application assessment</span></p>",
+            escape(&condition.criterion),
+            disposition,
+        );
+        if let Some(reason) = &condition.reason {
+            let _ = write!(
+                body,
+                "<div class=kv><div class=k>owner reason</div><div class=v>{}</div></div>",
+                escape(reason)
+            );
+        }
+        for evidence in &condition.evidence {
+            let _ = write!(
+                body,
+                "<div class=kv><div class=k>Recorded outcome</div><div class=v>{}</div><div class=k>Evidence currentness</div><div class=v>{:?}</div><div class=k>Maintenance</div><div class=v>{}</div></div><details class=raw><summary>Assessment evidence and timing</summary><div class=kv><div class=k>condition ID</div><div class=v><code>{}</code></div><div class=k>owner record reference</div><div class=v><code>{}</code></div><div class=k>owner record digest</div><div class=v><code>{}</code></div><div class=k>source observed</div><div class=v>{}</div><div class=k>read attempted</div><div class=v>{}</div><div class=k>projected</div><div class=v>{}</div></div></details>",
+                escape(evidence.owner_outcome.as_deref().unwrap_or("not supplied")),
+                evidence.source_currentness,
+                escape(
+                    evidence
+                        .maintenance_annotation
+                        .as_deref()
+                        .unwrap_or("not supplied")
+                ),
+                escape(&condition.condition_id),
+                escape(
+                    condition
+                        .owner_record_ref
+                        .as_deref()
+                        .unwrap_or("not supplied")
+                ),
+                escape(&evidence.owner_record_digest),
+                escape(
+                    evidence
+                        .source_observed_at
+                        .as_deref()
+                        .unwrap_or("not supplied")
+                ),
+                escape(
+                    evidence
+                        .read_attempted_at
+                        .as_deref()
+                        .unwrap_or("not supplied")
+                ),
+                escape(evidence.projected_at.as_deref().unwrap_or("not supplied")),
+            );
+        }
+        if condition.evidence.is_empty() {
+            let _ = write!(
+                body,
+                "<details class=raw><summary>Condition reference</summary><div class=kv><div class=k>condition ID</div><div class=v><code>{}</code></div></div></details>",
+                escape(&condition.condition_id)
+            );
+        }
+        body.push_str("</div>");
+    }
+    body.push_str("</section>");
+}
+
+fn render_objective_owner_custody(body: &mut String, model: &ObjectiveDetailV1) {
+    if let Some(SourceResultV1::Available {
+        value,
+        captured_at_unix_ms,
+        ..
+    }) = &model.owner_projection
+    {
+        let _ = write!(
+            body,
+            "<section class=panel><h2>Where these assessments came from</h2><p>Configured application <code>{}</code>, reader capability <code>{}</code>, source revision <code>{}</code>. Assessment time {} and local capture {} are separate coordinates. These application assertions are not an objective-complete decision, permission, or execution.</p></section>",
+            escape(&value.owner_id),
+            escape(&value.owner_capability),
+            escape(&value.owner_source_revision),
+            escape(&value.projected_at),
+            captured_at_unix_ms
+        );
+    } else if let Some(SourceResultV1::Unavailable { detail, .. }) = &model.owner_projection {
+        let _ = write!(
+            body,
+            "<section class=panel attention><h2>Application-owner projection unavailable</h2><p><span class=unknown>unavailable</span> {}</p></section>",
+            escape(detail)
+        );
+    }
+}
+
 #[must_use]
+/// Render authored criteria and separately attributed owner facts without
+/// inferring completion, current deployment health, or permission to act.
 pub fn objective_detail_with_context(model: &ObjectiveDetailV1, source_mode: &str) -> String {
     let mut body = String::new();
     let objective = &model.objective;
@@ -333,58 +437,43 @@ pub fn objective_detail_with_context(model: &ObjectiveDetailV1, source_mode: &st
         MaudeObjectiveAvailabilityV1::Unavailable => "unavailable",
         MaudeObjectiveAvailabilityV1::Conflicting => "conflicting",
     };
-    let _ = write!(
-        body,
-        "<div class=eyebrow>Phosphor / objective projection</div><h1>Objective projection</h1><p class=lede><span class=projection>read-only assembly</span> Maude authored content, Nightshift lineage, and governed occurrence records remain separate. Occurrence outcome never establishes objective completion.</p><section class=panel wide><h2>Maude source</h2><div class=kv><div class=k>availability</div><div class=v><span class=unknown>{}</span></div><div class=k>publication</div><div class=v>{}</div><div class=k>captured</div><div class=v>{}</div></div></section>",
-        escape(availability),
-        escape(&objective.publication),
-        objective.captured_at_unix_ms,
-    );
+    body.push_str("<div class=eyebrow>Goal and related runs</div>");
     if let (Some(goal), Some(digest)) = (&objective.goal, &objective.plan_digest) {
         let _ = write!(
             body,
-            "<section class=panel wide><h2>Authored objective</h2><p>{}</p><div class=kv><div class=k>exact plan digest</div><div class=v><code>{}</code></div></div></section>",
+            "<h1>{}</h1><p class=lede>Review the authored conditions and the runs linked to this exact goal. A run result does not by itself mark the goal complete.</p><details class=raw><summary>Authored goal reference</summary><div class=kv><div class=k>source availability</div><div class=v>{}</div><div class=k>exact plan digest</div><div class=v><code>{}</code></div><div class=k>publication boundary</div><div class=v>{}</div><div class=k>captured</div><div class=v>{}</div></div></details>",
             escape(goal),
-            escape(digest)
+            escape(availability),
+            escape(digest),
+            escape(&objective.publication),
+            objective.captured_at_unix_ms,
         );
     } else if let Some(error) = &objective.error_code {
         let _ = write!(
             body,
-            "<section class=panel attention><h2>Objective source unavailable</h2><p><span class=unknown>{}</span> No authored fields were supplied.</p></section>",
+            "<h1>Goal and related runs</h1><section class=panel attention><h2>Authored goal unavailable</h2><p><span class=unknown>{}</span> No authored goal or conditions were supplied.</p></section>",
             escape(error)
         );
+    } else {
+        body.push_str("<h1>Goal and related runs</h1><section class=panel attention><h2>Authored goal unavailable</h2><p>No authored goal or conditions were supplied.</p></section>");
     }
-    body.push_str("<section class=panel wide><h2>Completion conditions</h2>");
-    if model.conditions.is_empty() {
-        body.push_str(
-            "<p class=empty>No available authored conditions. Completion is unknown.</p>",
-        );
-    }
-    for condition in &model.conditions {
-        let _ = write!(
-            body,
-            "<div class=residual><span class=unknown>unknown</span> <code>{}</code> {}</div>",
-            escape(&condition.condition_id),
-            escape(&condition.criterion)
-        );
-    }
-    body.push_str("</section><section class=panel wide><h2>Exact governed occurrence links</h2>");
+    render_objective_conditions(&mut body, model);
+    body.push_str("<section class=panel wide><h2>Related runs</h2>");
     if model.occurrences.is_empty() {
         body.push_str(
             "<p class=empty>No exact Nightshift authoring lineage matched this plan revision.</p>",
         );
     }
     for link in &model.occurrences {
-        let locator = link
-            .detail_locator_token
-            .as_ref()
-            .map(|token| {
+        let locator = link.detail_locator_token.as_ref().map_or_else(
+            || "operator detail unavailable".to_owned(),
+            |token| {
                 format!(
                     "<a href=\"/campaign/{}\">open operator detail</a>",
                     escape(token)
                 )
-            })
-            .unwrap_or_else(|| "operator detail unavailable".to_owned());
+            },
+        );
         let _ = write!(
             body,
             "<div class=residual><code>{}</code> / <code>{}</code> · proposal <code>{}</code> · work <code>{}</code> · {}</div>",
@@ -395,7 +484,19 @@ pub fn objective_detail_with_context(model: &ObjectiveDetailV1, source_mode: &st
             locator
         );
     }
-    body.push_str("</section><section class=panel wide><h2>Causal prerequisites</h2><p><span class=unknown>unknown</span> No owner-supplied prerequisite relation is available; an empty occurrence list does not establish absence.</p></section>");
+    body.push_str("</section><section class=panel wide><h2>What this goal depends on</h2>");
+    match &model.prerequisites {
+        ObjectivePrerequisitesV1::Unknown => body.push_str("<p><span class=unknown>Not assessed</span> No configured application supplied a dependency list. This does not mean there are no dependencies.</p>"),
+        ObjectivePrerequisitesV1::Unavailable => body.push_str("<p><span class=unknown>Result unavailable</span> The configured application could not supply its dependency assessment.</p>"),
+        ObjectivePrerequisitesV1::OwnerDeclared { coverage, items } => {
+            body.push_str("<p><span class=projection>Configured application assessment</span> The application says this list is complete. This is not independent proof that every dependency is covered.</p>");
+            if items.is_empty() { body.push_str("<p class=empty>The configured application explicitly reported no dependencies.</p>"); }
+            for item in items { let _ = write!(body, "<div class=residual><code>{}</code> {} · owner record <code>{}</code></div>", escape(&item.prerequisite_id), escape(&item.relation), escape(&item.owner_record_digest)); }
+            let _ = write!(body, "<details class=raw><summary>Dependency assessment reference</summary><div class=kv><div class=k>coverage</div><div class=v>{}</div></div></details>", escape(coverage));
+        }
+    }
+    body.push_str("</section>");
+    render_objective_owner_custody(&mut body, model);
     if !model.causal_unavailable.is_empty() {
         body.push_str("<section class=panel attention><h2>Unresolved causal candidates</h2>");
         for unavailable in &model.causal_unavailable {
@@ -1940,6 +2041,69 @@ mod tests {
     #[test]
     fn escaping_prevents_canonical_data_from_becoming_markup() {
         assert_eq!(escape("<widget>&\"'"), "&lt;widget&gt;&amp;&quot;&#39;");
+    }
+
+    #[test]
+    fn objective_view_leads_with_goal_and_keeps_owner_states_separate() {
+        let model = ObjectiveDetailV1 {
+            schema: crate::model::OBJECTIVE_DETAIL_SCHEMA_V2.to_owned(),
+            objective: crate::model::MaudeObjectiveReadV1 {
+                schema: crate::model::MAUDE_OBJECTIVE_READ_SCHEMA_V1.to_owned(),
+                source: "maude".to_owned(),
+                availability: MaudeObjectiveAvailabilityV1::Available,
+                captured_at_unix_ms: 7,
+                plan_schema: Some("maude.plan-document/v1".to_owned()),
+                plan_digest: Some(format!("sha256:{}", "a".repeat(64))),
+                goal: Some("Keep <the queue> healthy".to_owned()),
+                acceptance_criteria: Some(vec![crate::model::MaudeAcceptanceCriterionV1 {
+                    condition_id: format!("sha256:{}", "b".repeat(64)),
+                    text: "The saved check passes".to_owned(),
+                }]),
+                error_code: None,
+                publication: "operator_only".to_owned(),
+            },
+            conditions: vec![crate::model::ObjectiveConditionV1 {
+                condition_id: format!("sha256:{}", "b".repeat(64)),
+                criterion: "The saved check passes".to_owned(),
+                disposition: ObjectiveConditionDispositionV1::Indeterminate,
+                owner_record_ref: Some("evaluation-1".to_owned()),
+                owner_record_digest: Some(format!("sha256:{}", "c".repeat(64))),
+                evidence: vec![crate::model::ObjectiveOwnerEvidenceV1 {
+                    owner_schema: "nq.saved-check-condition/v1".to_owned(),
+                    owner_record_id: "evaluation-1".to_owned(),
+                    owner_record_digest: format!("sha256:{}", "c".repeat(64)),
+                    source_observed_at: Some("2026-09-14T00:00:00Z".to_owned()),
+                    read_attempted_at: Some("2026-09-14T00:00:01Z".to_owned()),
+                    projected_at: Some("2026-09-14T00:10:00Z".to_owned()),
+                    source_currentness: crate::model::ObjectiveEvidenceCurrentnessV1::Stale,
+                    owner_outcome: Some("failed".to_owned()),
+                    maintenance_annotation: Some("overrun".to_owned()),
+                }],
+                reason: Some("owner evidence is stale".to_owned()),
+            }],
+            occurrences: Vec::new(),
+            causal_unavailable: Vec::new(),
+            prerequisites: ObjectivePrerequisitesV1::Unavailable,
+            owner_projection: Some(SourceResultV1::Unavailable {
+                source: "configured application".to_owned(),
+                command: crate::model::ReadCommandNameV1::ObjectiveOwnerProjection,
+                captured_at_unix_ms: 8,
+                error_kind: crate::model::SourceErrorKindV1::Unavailable,
+                detail: "assessment source unavailable".to_owned(),
+                exit_status: None,
+            }),
+        };
+        let rendered = objective_detail_with_context(&model, "component fixture");
+        assert!(rendered.contains("<h1>Keep &lt;the queue&gt; healthy</h1>"));
+        assert!(
+            rendered.find("Keep &lt;the queue&gt; healthy").unwrap()
+                < rendered.find("What needs to be true").unwrap()
+        );
+        assert!(rendered.contains("Needs current evidence"));
+        assert!(rendered.contains("Recorded outcome</div><div class=v>failed"));
+        assert!(rendered.contains("Evidence currentness</div><div class=v>Stale"));
+        assert!(rendered.contains("Maintenance</div><div class=v>overrun"));
+        assert!(!rendered.contains("Objective projection</h1>"));
     }
 
     #[test]

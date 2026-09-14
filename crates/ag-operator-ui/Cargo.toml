@@ -21,8 +21,11 @@ ag-primitives = { path = "../ag-primitives" }
 ag-store = { path = "../ag-store" }
 anyhow.workspace = true
 clap.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
