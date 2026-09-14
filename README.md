@@ -80,7 +80,12 @@ keeping currentness and maintenance separate from the result and permission.
 The [composed read example](examples/objective-owner-composed.md) adds real
 Maude authoring, finite Monitor/Nightshift/NQ acquisition and a Phosphor read,
 then inspects the same result after its freshness window expires. It remains a
-development example until its separately pinned public profile is qualified.
+separately pinned composition: the public-only
+[alpha.3 integration guide](https://unpingable.com/constellation/releases/0.1.0-alpha.3/guide.html)
+now records its qualified runtime and example-kit revisions, fresh/stale/missing
+reads, and retained-state inspection. That release does not qualify AG/Docket
+effects, objective completion or full application migration. The frozen source
+guide retains its earlier development-status wording.
 Authenticated operator intent is represented by several exact, narrow request
 classes—never a generic retry—and is specified in
 [`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).
