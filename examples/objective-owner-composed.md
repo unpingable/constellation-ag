@@ -153,6 +153,15 @@ terminal records, the Maude plan/store, and the complete
 mean the producer did nothing; reconcile those files and process identity
 before considering another occurrence. Do not restart over this root.
 
+Each read retains `<label>-server-stdout.log` and `<label>-server-stderr.log`
+(`fresh`, `stale`, or `missing-evaluation`). Each stream retains at most 1 MiB;
+excess is drained and discarded so it cannot block the server. The matching
+`<label>-server-terminal.json` records byte counts, truncation, capture errors,
+and whether the pipe reached EOF. Incomplete diagnostic capture refuses success.
+These logs may contain operator-only text: review and redact a minimal excerpt
+before reporting it. The reader terminates and reaps its same process group;
+this does not establish recovery of a detached process or supervisor-loss safety.
+
 The missing-evaluation result means the caller named no retained evaluation at
 that identity. It does not erase or contradict the actual retained evaluation.
 Inspect the original `fresh-reader.json`, exact evaluation ID, NQ condition and

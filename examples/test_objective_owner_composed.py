@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util, json, tempfile, unittest
 from pathlib import Path
+from unittest.mock import patch
 
 HERE=Path(__file__).parent
 spec=importlib.util.spec_from_file_location("composed",HERE/"objective-owner-composed.py")
@@ -65,7 +66,8 @@ class ComposedTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mod.validate_missing(view, objective)
 
-    def test_capture_http_retains_bounded_server_diagnostics_on_early_exit(self):
+    @patch.object(mod.socket, "create_connection", side_effect=ConnectionRefusedError)
+    def test_capture_http_retains_bounded_server_diagnostics_on_early_exit(self, unused_connect):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); objective={"plan_digest":"sha256:"+"a"*64}
             with self.assertRaises(RuntimeError):
@@ -75,5 +77,35 @@ class ComposedTests(unittest.TestCase):
             for item in terminal["diagnostics"].values():
                 self.assertTrue((root/item["path"]).is_file())
                 self.assertLessEqual(item["bytes"],mod.MAX_STREAM)
+                self.assertTrue(item["complete"])
+                self.assertIsNone(item["error"])
+
+    @patch.object(mod.socket, "create_connection", side_effect=ConnectionRefusedError)
+    def test_diagnostic_output_limit_drains_both_streams(self, unused_connect):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            server=root/"server"
+            server.write_text("#!/usr/bin/python3\nimport os\nfor i in range(300):\n os.write(1,b'x'*8192)\n os.write(2,b'y'*8192)\n")
+            server.chmod(0o700)
+            objective={"plan_digest":"sha256:"+"a"*64}
+            with self.assertRaisesRegex(RuntimeError,"Phosphor exited before read"):
+                mod.capture_http(root,"large",23456,server,Path("/bin/true"),Path("/bin/true"),root/"plan",objective,Path("/bin/true"),root/"config","revision")
+            terminal=json.loads((root/"large-server-terminal.json").read_text())
+            for item in terminal["diagnostics"].values():
+                self.assertEqual((root/item["path"]).stat().st_size,mod.MAX_STREAM)
+                self.assertTrue(item["truncated"])
+                self.assertTrue(item["complete"])
+
+    @patch.object(mod.socket, "create_connection", side_effect=ConnectionRefusedError)
+    def test_diagnostic_file_collision_refuses_without_overwrite(self, unused_connect):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            original=root/"failure-server-stderr.log"
+            original.write_bytes(b"existing")
+            with self.assertRaisesRegex(RuntimeError,"diagnostic capture incomplete"):
+                mod.capture_http(root,"failure",23456,Path("/bin/sh"),Path("/bin/true"),Path("/bin/true"),root/"plan",{"plan_digest":"sha256:"+"a"*64},Path("/bin/true"),root/"config","revision")
+            self.assertEqual(original.read_bytes(),b"existing")
+            terminal=json.loads((root/"failure-server-terminal.json").read_text())
+            self.assertIsNotNone(terminal["diagnostics"]["stderr"]["error"])
 
 if __name__=="__main__": unittest.main()

@@ -236,21 +236,40 @@ def capture_http(root,label,port,ui,loopctl,maude,plan,objective,reader,config,r
     ]
     save(root/f"{label}-server-planned.json",{"argv":[str(x) for x in argv]})
     streams = {}
+    stop_diagnostics = threading.Event()
     def drain(name, stream, path):
         written = 0
         truncated = False
-        with path.open("xb") as output:
-            while True:
-                block = stream.read(8192)
-                if not block:
-                    break
-                take = min(len(block), max(0, MAX_STREAM - written))
-                if take:
-                    output.write(block[:take]); written += take
-                truncated |= take != len(block)
-        streams[name] = {"path": path.name, "bytes": written, "truncated": truncated}
+        complete = False
+        error = None
+        try:
+            os.set_blocking(stream.fileno(), False)
+            with path.open("xb", buffering=0) as output:
+                while not stop_diagnostics.is_set():
+                    try:
+                        block = os.read(stream.fileno(), 8192)
+                    except BlockingIOError:
+                        stop_diagnostics.wait(.02)
+                        continue
+                    if not block:
+                        complete = True
+                        break
+                    take = min(len(block), max(0, MAX_STREAM - written))
+                    if take:
+                        output.write(block[:take])
+                        written += take
+                    # Keep draining after truncation so diagnostics cannot block
+                    # the server. Retained bytes are a prefix, not a full log.
+                    truncated |= take != len(block)
+        except Exception as caught:
+            error = str(caught)
+        finally:
+            stream.close()
+            streams[name] = {"path": path.name, "bytes": written,
+                             "truncated": truncated, "complete": complete,
+                             "error": error}
     p=subprocess.Popen([str(x) for x in argv],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-    readers = [threading.Thread(target=drain,args=(name,stream,root/f"{label}-server-{name}.log")) for name,stream in (("stdout",p.stdout),("stderr",p.stderr))]
+    readers = [threading.Thread(target=drain,args=(name,stream,root/f"{label}-server-{name}.log"),daemon=True) for name,stream in (("stdout",p.stdout),("stderr",p.stderr))]
     for thread in readers: thread.start()
     try:
         save(root/f"{label}-server.json",{"pid":p.pid,"argv":[str(x) for x in argv]})
@@ -275,18 +294,26 @@ def capture_http(root,label,port,ui,loopctl,maude,plan,objective,reader,config,r
         save(root / f"{label}-objective.json", value)
         return value
     finally:
-            try: os.killpg(p.pid,signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
-            for thread in readers: thread.join(timeout=1)
-            if any(thread.is_alive() for thread in readers):
-                raise RuntimeError("Phosphor diagnostic reader did not terminate")
-            save(root/f"{label}-server-terminal.json",{"pid":p.pid,"returncode":p.returncode,"diagnostics":streams})
+        try: os.killpg(p.pid,signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        # Reap the same process group even if the initial server already exited;
+        # a remaining child could otherwise hold diagnostic pipes open.
+        try: os.killpg(p.pid,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+        for thread in readers: thread.join(timeout=1)
+        stop_diagnostics.set()
+        for thread in readers: thread.join(timeout=1)
+        save(root/f"{label}-server-terminal.json",{"pid":p.pid,"returncode":p.returncode,"diagnostics":dict(streams)})
+        if (any(thread.is_alive() for thread in readers) or len(streams) != 2
+                or any(item["error"] is not None or not item["complete"] for item in streams.values())):
+            raise RuntimeError("Phosphor diagnostic capture incomplete; inspect retained records")
 
 def main():
     parser = argparse.ArgumentParser()
