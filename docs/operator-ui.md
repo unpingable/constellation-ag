@@ -13,6 +13,10 @@ The public name is Phosphor. Existing `/phosphor-ng` routes, Rust package and
 executable names, and persisted read-model schemas remain unchanged for
 compatibility. A product-name change is not a protocol migration.
 
+For an exact authored goal alongside its linked runs, see
+[Objective read projection](objective-read-projection.md). This additive view
+keeps goal assessment separate from execution and settlement.
+
 ## Build and launch
 
 Build the three owner CLIs and UI from their existing workspaces. Then point

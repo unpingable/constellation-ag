@@ -72,6 +72,8 @@ contract is in [`docs/operator-ui.md`](docs/operator-ui.md); it is a
 canonical-fact projection with no runtime mutation surface. Maude/Phosphor-ng
 roles, vocabulary, semantic deep links, and legacy Phosphor disposition are in
 [`docs/operator-surface-convergence.md`](docs/operator-surface-convergence.md).
+The [objective read projection](docs/objective-read-projection.md) connects an
+exact Maude-authored goal to owner-linked runs without inferring completion.
 Authenticated operator intent is represented by several exact, narrow request
 classes—never a generic retry—and is specified in
 [`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).
