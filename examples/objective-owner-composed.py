@@ -10,6 +10,7 @@ import signal
 import socket
 import stat
 import subprocess
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -234,31 +235,46 @@ def capture_http(root,label,port,ui,loopctl,maude,plan,objective,reader,config,r
         "--objective-owner-expected-plan-digest", digest,
     ]
     save(root/f"{label}-server-planned.json",{"argv":[str(x) for x in argv]})
-    with open(os.devnull,"wb") as null:
-        p=subprocess.Popen([str(x) for x in argv],stdin=subprocess.DEVNULL,stdout=null,stderr=null,start_new_session=True)
-        save(root/f"{label}-server.json",{"pid":p.pid,"argv":[str(x) for x in argv]})
-        try:
-            url=f"http://127.0.0.1:{port}/api/v1/objectives/{digest[7:]}"
-            deadline=time.monotonic()+5
-            while time.monotonic()<deadline:
-                if p.poll() is not None:
-                    raise RuntimeError("Phosphor exited before read")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=.2):
-                        pass
+    streams = {}
+    def drain(name, stream, path):
+        written = 0
+        truncated = False
+        with path.open("xb") as output:
+            while True:
+                block = stream.read(8192)
+                if not block:
                     break
-                except ConnectionRefusedError:
-                    time.sleep(.1)
-            else:
-                raise RuntimeError("Phosphor loopback unavailable")
-            with HTTP_OPENER.open(url, timeout=12) as response:
-                raw = response.read(MAX_HTTP + 1)
-            if len(raw) > MAX_HTTP:
-                raise RuntimeError("Phosphor response limit")
-            value = parse_json(raw)
-            save(root / f"{label}-objective.json", value)
-            return value
-        finally:
+                take = min(len(block), max(0, MAX_STREAM - written))
+                if take:
+                    output.write(block[:take]); written += take
+                truncated |= take != len(block)
+        streams[name] = {"path": path.name, "bytes": written, "truncated": truncated}
+    p=subprocess.Popen([str(x) for x in argv],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+    readers = [threading.Thread(target=drain,args=(name,stream,root/f"{label}-server-{name}.log")) for name,stream in (("stdout",p.stdout),("stderr",p.stderr))]
+    for thread in readers: thread.start()
+    try:
+        save(root/f"{label}-server.json",{"pid":p.pid,"argv":[str(x) for x in argv]})
+        url=f"http://127.0.0.1:{port}/api/v1/objectives/{digest[7:]}"
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            if p.poll() is not None:
+                raise RuntimeError("Phosphor exited before read")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=.2):
+                    pass
+                break
+            except ConnectionRefusedError:
+                time.sleep(.1)
+        else:
+            raise RuntimeError("Phosphor loopback unavailable")
+        with HTTP_OPENER.open(url, timeout=12) as response:
+            raw = response.read(MAX_HTTP + 1)
+        if len(raw) > MAX_HTTP:
+            raise RuntimeError("Phosphor response limit")
+        value = parse_json(raw)
+        save(root / f"{label}-objective.json", value)
+        return value
+    finally:
             try: os.killpg(p.pid,signal.SIGTERM)
             except ProcessLookupError:
                 pass
@@ -267,7 +283,10 @@ def capture_http(root,label,port,ui,loopctl,maude,plan,objective,reader,config,r
             except subprocess.TimeoutExpired:
                 os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
-            save(root/f"{label}-server-terminal.json",{"pid":p.pid,"returncode":p.returncode})
+            for thread in readers: thread.join(timeout=1)
+            if any(thread.is_alive() for thread in readers):
+                raise RuntimeError("Phosphor diagnostic reader did not terminate")
+            save(root/f"{label}-server-terminal.json",{"pid":p.pid,"returncode":p.returncode,"diagnostics":streams})
 
 def main():
     parser = argparse.ArgumentParser()

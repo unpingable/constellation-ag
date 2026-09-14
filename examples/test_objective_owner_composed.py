@@ -65,4 +65,15 @@ class ComposedTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mod.validate_missing(view, objective)
 
+    def test_capture_http_retains_bounded_server_diagnostics_on_early_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); objective={"plan_digest":"sha256:"+"a"*64}
+            with self.assertRaises(RuntimeError):
+                mod.capture_http(root,"failure",23456,Path("/bin/sh"),Path("/bin/true"),Path("/bin/true"),Path("/tmp/plan"),objective,Path("/bin/true"),Path("/tmp/config"),"revision")
+            terminal=json.loads((root/"failure-server-terminal.json").read_text())
+            self.assertEqual(set(terminal["diagnostics"]),{"stdout","stderr"})
+            for item in terminal["diagnostics"].values():
+                self.assertTrue((root/item["path"]).is_file())
+                self.assertLessEqual(item["bytes"],mod.MAX_STREAM)
+
 if __name__=="__main__": unittest.main()
