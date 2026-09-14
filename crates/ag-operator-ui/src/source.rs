@@ -482,7 +482,9 @@ impl OperatorReaderV1 {
             return Err("public objective receipt URL is not explicitly allowlisted".to_owned());
         }
         if projection.plan_digest != expected_plan_digest {
-            return Err("public objective selector does not match approved plan digest".to_owned());
+            return Err(
+                "public objective selector does not match configured plan digest".to_owned(),
+            );
         }
         Ok(projection)
     }
@@ -1337,9 +1339,25 @@ fn demo_objective_link_has_lineage(
         let Some(inspect) = detail.inspect.value() else {
             return false;
         };
+        let snapshot = if inspect.current.key().occurrence.to_string() == link.occurrence_id {
+            Some(&inspect.current)
+        } else {
+            detail.history.value().and_then(|history| {
+                history
+                    .transitions
+                    .iter()
+                    .rev()
+                    .map(|transition| &transition.successor)
+                    .find(|snapshot| snapshot.key().occurrence.to_string() == link.occurrence_id)
+            })
+        };
         link.detail_locator_token.as_deref() == Some(detail.locator_token.as_str())
-            && inspect.current.key().campaign.to_string() == link.campaign_id
-            && inspect.current.key().occurrence.to_string() == link.occurrence_id
+            && snapshot.is_some_and(|snapshot| {
+                snapshot.key().campaign.to_string() == link.campaign_id
+                    && snapshot.proposal().is_some_and(|proposal| {
+                        proposal.reference().as_digest().to_string() == link.proposal_id
+                    })
+            })
             && detail.authoring_contexts.iter().any(|related| {
                 related.result.value().is_some_and(|export| {
                     export.matches.iter().any(|relation| {
@@ -1354,17 +1372,17 @@ fn demo_objective_link_has_lineage(
     })
 }
 
-/// Assembles exact objective-to-occurrence links from Maude's approved plan
+/// Assembles exact objective-to-occurrence links from Maude's operator-authored plan
 /// digest and Nightshift's already-validated authoring lineage. It accepts no
-/// timestamp, label, filename, or summary as a join key. A campaign whose
-/// current identity does not agree with the lineage record is omitted.
+/// timestamp, label, filename, or summary as a join key. Both current and
+/// retained historical snapshots are considered by exact identity.
 #[must_use]
 pub fn assemble_objective_detail(
     objective: MaudeObjectiveReadV1,
     campaigns: &[CampaignDetailV1],
-    causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
+    mut causal_unavailable: Vec<ObjectiveCausalUnavailableV1>,
 ) -> ObjectiveDetailV1 {
-    let mut links = BTreeSet::new();
+    let mut links = BTreeMap::new();
     let plan_digest = objective.plan_digest.clone();
     if objective.availability != MaudeObjectiveAvailabilityV1::Available {
         return ObjectiveDetailV1 {
@@ -1388,10 +1406,19 @@ pub fn assemble_objective_detail(
     };
     for detail in campaigns {
         let Some(inspect) = detail.inspect.value() else {
+            causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                locator_token: detail.locator_token.clone(),
+                detail: "AG inspection source unavailable for causal join".to_owned(),
+            });
             continue;
         };
         for related in &detail.authoring_contexts {
             let Some(export) = related.result.value() else {
+                causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                    locator_token: detail.locator_token.clone(),
+                    detail: "Nightshift authoring lineage source unavailable for causal join"
+                        .to_owned(),
+                });
                 continue;
             };
             for relation in &export.matches {
@@ -1411,6 +1438,13 @@ pub fn assemble_objective_detail(
                         })
                     };
                 let Some(snapshot) = snapshot else {
+                    if !detail.history.is_available() {
+                        causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                            locator_token: detail.locator_token.clone(),
+                            detail: "AG retained history unavailable for historical causal join"
+                                .to_owned(),
+                        });
+                    }
                     continue;
                 };
                 if relation.maude_plan_ref != plan_digest
@@ -1421,15 +1455,15 @@ pub fn assemble_objective_detail(
                 {
                     continue;
                 }
-                links.insert((
+                let key = (
                     relation.campaign_id.clone(),
                     relation.occurrence_id.clone(),
                     relation.proposal_id.clone(),
                     relation.exact_work_id.clone(),
                     relation.maude_plan_ref.clone(),
                     detail.locator_token.clone(),
-                    detail.clone(),
-                ));
+                );
+                links.entry(key).or_insert_with(|| detail.clone());
             }
         }
     }
@@ -1458,8 +1492,8 @@ pub fn assemble_objective_detail(
                     exact_work_id,
                     maude_plan_ref,
                     token,
-                    detail,
-                )| {
+                ),
+                 detail| {
                     ObjectiveOccurrenceLinkV1 {
                         campaign_id,
                         occurrence_id,
