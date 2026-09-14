@@ -2591,6 +2591,7 @@ mod tests {
             }),
             maude_objective: None,
             public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
         })
         .unwrap();
         let result = reader.maude_acquisition_export(&campaign, occurrence);
