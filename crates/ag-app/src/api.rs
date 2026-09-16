@@ -597,6 +597,10 @@ pub enum ProviderRequestV1 {
         /// Exact terminal session whose grants must be burned.
         session: SessionId,
     },
+    /// Read-only content-free readiness projection for every configured
+    /// endpoint. The response never carries credential values, filesystem
+    /// paths, or counts.
+    EndpointReadiness {},
 }
 
 /// Provider daemon responses for crash-safe two-phase governor custody.
@@ -650,6 +654,33 @@ pub enum ProviderResponseV1 {
         /// Exact durable capability-burn receipt.
         receipt: Digest,
     },
+    /// Content-free per-endpoint pre-dispatch readiness projection.
+    EndpointReadiness {
+        /// Exact readiness of every root-configured endpoint.
+        endpoints: Vec<EndpointReadinessEntryV1>,
+    },
+}
+
+/// Content-free readiness of one root-configured endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointReadinessEntryV1 {
+    /// Root-owned endpoint ID.
+    pub endpoint_id: String,
+    /// Closed pre-dispatch readiness status.
+    pub status: EndpointReadinessStatusV1,
+}
+
+/// Closed content-free pre-dispatch readiness statuses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointReadinessStatusV1 {
+    /// Every pre-dispatch check for the endpoint passes.
+    Ready,
+    /// The endpoint credential is absent or malformed.
+    CredentialUnavailable,
+    /// The endpoint command executable is absent or not executable.
+    CommandUnavailable,
 }
 
 /// Error codes are stable and messages carry no authority.
@@ -674,6 +705,9 @@ pub enum ApiErrorCodeV1 {
     UnsupportedAuthorityFamily,
     /// Internal error with a correlation identifier.
     Internal,
+    /// A definitive pre-dispatch refusal: the request was rejected before any
+    /// reservation, network send, or process spawn, so nothing was executed.
+    Unavailable,
 }
 
 /// Every API response is explicitly success or error.
@@ -735,6 +769,72 @@ mod tests {
                 r#"{"method":"health","reserved_cost_microunits":0}"#,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_readiness_wire_is_closed_and_content_free() {
+        assert!(matches!(
+            serde_json::from_str::<ProviderRequestV1>(r#"{"method":"endpoint_readiness"}"#)
+                .unwrap(),
+            ProviderRequestV1::EndpointReadiness {}
+        ));
+        assert!(
+            serde_json::from_str::<ProviderRequestV1>(
+                r#"{"method":"endpoint_readiness","endpoint":"primary"}"#,
+            )
+            .is_err()
+        );
+
+        let response = ProviderResponseV1::EndpointReadiness {
+            endpoints: vec![
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "local".to_owned(),
+                    status: EndpointReadinessStatusV1::Ready,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "remote".to_owned(),
+                    status: EndpointReadinessStatusV1::CredentialUnavailable,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "command".to_owned(),
+                    status: EndpointReadinessStatusV1::CommandUnavailable,
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "kind": "endpoint_readiness",
+                "endpoints": [
+                    {"endpoint_id": "local", "status": "ready"},
+                    {"endpoint_id": "remote", "status": "credential_unavailable"},
+                    {"endpoint_id": "command", "status": "command_unavailable"},
+                ],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderResponseV1>(wire).unwrap(),
+            response
+        );
+        assert!(
+            serde_json::from_value::<EndpointReadinessEntryV1>(serde_json::json!(
+                {"endpoint_id": "remote", "status": "ready", "credential_name": "key"}
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_error_code_has_a_stable_wire_string() {
+        assert_eq!(
+            serde_json::to_value(ApiErrorCodeV1::Unavailable).unwrap(),
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            serde_json::from_value::<ApiErrorCodeV1>(serde_json::json!("unavailable")).unwrap(),
+            ApiErrorCodeV1::Unavailable
         );
     }
 

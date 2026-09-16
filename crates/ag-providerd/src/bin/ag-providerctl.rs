@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
-use ag_app::api::{ApiResultV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1};
+use ag_app::api::{
+    ApiResultV1, EndpointReadinessEntryV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
+};
 use ag_app::config::{
     AgctlDaemonPeerV1, AgctlLimitsV1, AgctlSocketPeerCheckV1, ProviderdConfigV1, load_config,
 };
@@ -29,6 +31,7 @@ enum Operation {
     Call,
     Prepare,
     Execute,
+    EndpointReadiness,
 }
 
 #[derive(Debug, Parser)]
@@ -127,6 +130,12 @@ struct ProviderTransactionV1 {
     request: ProviderRequestCustodyV1,
     request_bytes: OpaqueBytesV1,
     dispatch: Digest,
+}
+
+/// Content-free endpoint readiness projection printed by `endpoint-readiness`.
+#[derive(Debug, Serialize)]
+struct EndpointReadinessOutputV1 {
+    endpoints: Vec<EndpointReadinessEntryV1>,
 }
 
 fn socket_check(peer: &AgctlDaemonPeerV1) -> SocketPeerCheckV1 {
@@ -367,6 +376,17 @@ fn main() -> anyhow::Result<()> {
             let mut client = SignedClient::new(&config)?;
             write_result(&execute(&mut client, transaction)?)
         }
+        Operation::EndpointReadiness => {
+            let mut client = SignedClient::new(&config)?;
+            let readiness = client.call(ProviderRequestV1::EndpointReadiness {})?;
+            let endpoints = match readiness {
+                ApiResultV1::Ok {
+                    response: ProviderResponseV1::EndpointReadiness { endpoints },
+                } => endpoints,
+                other => bail!("ag-providerd endpoint readiness request failed: {other:?}"),
+            };
+            write_result(&EndpointReadinessOutputV1 { endpoints })
+        }
     }
 }
 
@@ -456,5 +476,29 @@ rpc_replay_capacity = 4096
         let mut transaction = prepare(&config, &policy(), input()).unwrap();
         transaction.dispatch = Digest::hash_bytes(b"substituted");
         assert!(validate_transaction(&transaction).is_err());
+    }
+
+    #[test]
+    fn endpoint_readiness_output_is_the_exact_consumed_shape() {
+        let output = EndpointReadinessOutputV1 {
+            endpoints: vec![
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "local".to_owned(),
+                    status: ag_app::api::EndpointReadinessStatusV1::Ready,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "remote".to_owned(),
+                    status: ag_app::api::EndpointReadinessStatusV1::CredentialUnavailable,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "command".to_owned(),
+                    status: ag_app::api::EndpointReadinessStatusV1::CommandUnavailable,
+                },
+            ],
+        };
+        assert_eq!(
+            String::from_utf8(canonical_json(&output).unwrap()).unwrap(),
+            r#"{"endpoints":[{"endpoint_id":"local","status":"ready"},{"endpoint_id":"remote","status":"credential_unavailable"},{"endpoint_id":"command","status":"command_unavailable"}]}"#
+        );
     }
 }

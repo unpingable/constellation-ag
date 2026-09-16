@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use ag_app::api::{
-    ApiErrorCodeV1, ApiResultV1, HealthV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
+    ApiErrorCodeV1, ApiResultV1, EndpointReadinessEntryV1, EndpointReadinessStatusV1, HealthV1,
+    OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
 };
 use ag_app::config::{
     ProviderCommandConfigV1, ProviderCommandModelArgumentV1, ProviderEndpointConfigV1,
@@ -201,6 +203,7 @@ pub struct ProviderCoreV1 {
     authority_domain: AuthorityDomain,
     epoch: Epoch,
     client: Client,
+    credential_directory: Option<PathBuf>,
 }
 
 impl ProviderCoreV1 {
@@ -238,6 +241,7 @@ impl ProviderCoreV1 {
             authority_domain,
             epoch,
             client,
+            credential_directory: credential_directory_from_environment(),
         })
     }
 
@@ -282,6 +286,7 @@ impl ProviderCoreV1 {
                     quiesced: self.store.active_backup_cut()?.is_some(),
                 },
             }),
+            ProviderRequestV1::EndpointReadiness {} => Ok(self.endpoint_readiness()),
             ProviderRequestV1::RegisterCapability {
                 capability,
                 worker_principal,
@@ -355,6 +360,22 @@ impl ProviderCoreV1 {
                 &governor_custody_record,
             ),
             ProviderRequestV1::TerminateSession { session } => self.terminate_session(&session),
+        }
+    }
+
+    fn endpoint_readiness(&self) -> ProviderResponseV1 {
+        ProviderResponseV1::EndpointReadiness {
+            endpoints: self
+                .endpoints
+                .values()
+                .map(|endpoint| EndpointReadinessEntryV1 {
+                    endpoint_id: endpoint.id.clone(),
+                    status: endpoint_readiness_status(
+                        endpoint,
+                        self.credential_directory.as_deref(),
+                    ),
+                })
+                .collect(),
         }
     }
 
@@ -446,8 +467,19 @@ impl ProviderCoreV1 {
             revocation_state: loaded.state.revocation_state.clone(),
         })?;
 
-        // Reservation is committed before any credential is loaded or network
-        // dispatch begins. A crash cannot restore/reuse this budget.
+        // Configuration-owned dispatch preconditions — every configured
+        // header, the endpoint credential, and the command executable — are
+        // validated before the reservation is committed. Refusal here is
+        // definitive: no budget is burned, no reservation is written, and no
+        // network or process I/O has begun.
+        if let Some(refusal) = pre_dispatch_refusal(&endpoint, self.credential_directory.as_deref())
+        {
+            return Err(refusal.error());
+        }
+
+        // Reservation is committed after the configuration-owned
+        // preconditions above and before any network or process dispatch
+        // begins. A crash cannot restore/reuse this budget.
         let state = ProviderCapabilityStateV1 {
             usage: validated.resulting_usage,
             ..loaded.state
@@ -725,10 +757,12 @@ impl ProviderCoreV1 {
                 credential_header,
                 credential_prefix,
             } => {
-                let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                let credential_directory = self
+                    .credential_directory
+                    .as_deref()
                     .ok_or(ProviderError::CredentialUnavailable)?;
                 let mut credential =
-                    read_provider_credential(Path::new(&credential_directory), credential_name)?;
+                    read_provider_credential(credential_directory, credential_name)?;
                 while credential.ends_with(['\n', '\r']) {
                     credential.pop();
                 }
@@ -1334,6 +1368,120 @@ fn read_credential_fd(fd: OwnedFd) -> Result<String, ProviderError> {
     String::from_utf8(bytes).map_err(|_| ProviderError::CredentialUnavailable)
 }
 
+/// Resolves the daemon credential directory from the process environment.
+///
+/// The directory is supplied by the service manager (`LoadCredential=`), so
+/// it is resolved exactly once when the daemon core is constructed.
+#[must_use]
+pub fn credential_directory_from_environment() -> Option<PathBuf> {
+    std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
+}
+
+/// Computes the content-free pre-dispatch readiness of one endpoint.
+///
+/// The result is derived from the same preconditions that gate `infer`, so
+/// an endpoint reporting `ready` cannot be refused pre-dispatch for a
+/// configuration defect. The status never exposes credential values,
+/// filesystem paths, or counts.
+#[must_use]
+pub fn endpoint_readiness_status(
+    endpoint: &ProviderEndpointConfigV1,
+    credential_directory: Option<&Path>,
+) -> EndpointReadinessStatusV1 {
+    pre_dispatch_refusal(endpoint, credential_directory)
+        .map_or(EndpointReadinessStatusV1::Ready, PreDispatchRefusal::status)
+}
+
+/// Closed configuration-defect classes provable before any dispatch I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreDispatchRefusal {
+    /// Credential absence/malformation or a credential/header shape defect.
+    Credential,
+    /// Command executable absence or a missing execute permission.
+    Command,
+}
+
+impl PreDispatchRefusal {
+    fn error(self) -> ProviderError {
+        match self {
+            Self::Credential => ProviderError::CredentialRefused,
+            Self::Command => ProviderError::CommandRefused,
+        }
+    }
+
+    fn status(self) -> EndpointReadinessStatusV1 {
+        match self {
+            Self::Credential => EndpointReadinessStatusV1::CredentialUnavailable,
+            Self::Command => EndpointReadinessStatusV1::CommandUnavailable,
+        }
+    }
+}
+
+/// Validates every configuration-owned dispatch precondition: configured
+/// header shapes, the endpoint credential (exactly the `dispatch` read and
+/// shape rules), and the command executable. Every defect found here is
+/// provably pre-dispatch, so callers may refuse without a reservation.
+fn pre_dispatch_refusal(
+    endpoint: &ProviderEndpointConfigV1,
+    credential_directory: Option<&Path>,
+) -> Option<PreDispatchRefusal> {
+    let headers_valid = endpoint.headers.iter().all(|(name, value)| {
+        HeaderName::from_bytes(name.as_bytes()).is_ok() && HeaderValue::from_str(value).is_ok()
+    });
+    match &endpoint.transport {
+        ProviderTransportConfigV1::CredentialedHttpsApi {
+            credential_name,
+            credential_header,
+            credential_prefix,
+            ..
+        } => {
+            if !headers_valid {
+                return Some(PreDispatchRefusal::Credential);
+            }
+            let credential = credential_directory
+                .and_then(|directory| read_provider_credential(directory, credential_name).ok());
+            let Some(mut credential) = credential else {
+                return Some(PreDispatchRefusal::Credential);
+            };
+            while credential.ends_with(['\n', '\r']) {
+                credential.pop();
+            }
+            if credential.is_empty()
+                || credential.contains(['\n', '\r', '\0'])
+                || HeaderName::from_bytes(credential_header.as_bytes()).is_err()
+                || HeaderValue::from_str(&format!("{credential_prefix}{credential}")).is_err()
+            {
+                return Some(PreDispatchRefusal::Credential);
+            }
+            None
+        }
+        ProviderTransportConfigV1::Command { command } => {
+            if headers_valid && command_executable_ready(command) {
+                None
+            } else {
+                Some(PreDispatchRefusal::Command)
+            }
+        }
+        ProviderTransportConfigV1::LocalHttp { .. } => {
+            // A cleartext-local endpoint has no credential or executable of
+            // its own; a configured header defect refuses it pre-dispatch
+            // under the credential class.
+            if headers_valid {
+                None
+            } else {
+                Some(PreDispatchRefusal::Credential)
+            }
+        }
+    }
+}
+
+/// True only when the command transport executable is a regular file with at
+/// least one execute permission bit.
+fn command_executable_ready(command: &ProviderCommandConfigV1) -> bool {
+    std::fs::metadata(&command.executable)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn response_for_existing_dispatch(
     state: &ProviderDispatchStateV1,
 ) -> Result<ProviderResponseV1, ProviderError> {
@@ -1567,6 +1715,9 @@ fn provider_api_error<T>(error: &ProviderError) -> ApiResultV1<T> {
         | ProviderError::CommandPipe
         | ProviderError::CommandWait
         | ProviderError::DispatchOutcomeIndeterminate => ApiErrorCodeV1::Indeterminate,
+        ProviderError::CredentialRefused | ProviderError::CommandRefused => {
+            ApiErrorCodeV1::Unavailable
+        }
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -1669,6 +1820,16 @@ pub enum ProviderError {
     /// systemd credential is absent or malformed.
     #[error("provider credential is unavailable")]
     CredentialUnavailable,
+    /// Endpoint credential or configured header failed the pre-reservation
+    /// check. The refusal is definitive: no reservation was committed, no
+    /// budget was burned, and nothing was sent.
+    #[error("provider credential is refused before dispatch")]
+    CredentialRefused,
+    /// Command transport executable is absent or not executable at the
+    /// pre-reservation check. The refusal is definitive: no reservation was
+    /// committed, no budget was burned, and nothing was spawned.
+    #[error("provider command is refused before dispatch")]
+    CommandRefused,
     /// Event stream could not be canonicalized.
     #[error("provider event stream canonicalization failed: {0}")]
     Canonical(String),
@@ -1688,9 +1849,9 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::net::TcpListener;
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ag_primitives::{
         InferenceBudgetV1, InferenceEnvelopeV1, InferenceMethodId, LifecycleNonce, ModelId,
@@ -1884,7 +2045,16 @@ mod tests {
         }
 
         fn capability(&self, session: &SessionId, sequence: u64) -> InferenceCapabilityV1 {
-            let endpoint = self.core.endpoints.get("primary").unwrap();
+            self.capability_for_endpoint("primary", session, sequence)
+        }
+
+        fn capability_for_endpoint(
+            &self,
+            endpoint_id: &str,
+            session: &SessionId,
+            sequence: u64,
+        ) -> InferenceCapabilityV1 {
+            let endpoint = self.core.endpoints.get(endpoint_id).unwrap();
             let model_policy = &endpoint.models[0];
             let mut nonce = [0_u8; 16];
             nonce[8..].copy_from_slice(&sequence.to_be_bytes());
@@ -2465,6 +2635,394 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state.usage, reserved_usage);
+    }
+
+    fn model_policy(id: &str) -> ProviderModelPolicyConfigV1 {
+        ProviderModelPolicyConfigV1 {
+            id: id.to_owned(),
+            max_event_stream_bytes: 16 * 1024,
+            worst_case_cost_microunits: 1,
+        }
+    }
+
+    fn command_endpoint(id: &str, executable: &Path) -> ProviderEndpointConfigV1 {
+        ProviderEndpointConfigV1 {
+            id: id.to_owned(),
+            transport: ProviderTransportConfigV1::Command {
+                command: ProviderCommandConfigV1 {
+                    adapter: "claude-code".to_owned(),
+                    model_argument: ProviderCommandModelArgumentV1::Required,
+                    executable: executable.to_path_buf(),
+                    working_directory: Path::new("/tmp").to_path_buf(),
+                    environment: BTreeMap::new(),
+                },
+            },
+            headers: BTreeMap::new(),
+            models: vec![model_policy("command-model")],
+            protocol: "opaque_json_v1".to_owned(),
+            methods: vec!["command.complete".to_owned()],
+        }
+    }
+
+    fn local_endpoint(id: &str) -> ProviderEndpointConfigV1 {
+        ProviderEndpointConfigV1 {
+            id: id.to_owned(),
+            transport: ProviderTransportConfigV1::LocalHttp {
+                url: "http://127.0.0.1:11434/v1/chat/completions".to_owned(),
+                allowed_origins: vec!["http://127.0.0.1:11434".to_owned()],
+                redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+            },
+            headers: BTreeMap::new(),
+            models: vec![model_policy("local-model")],
+            protocol: "opaque_json_v1".to_owned(),
+            methods: vec!["chat.completions.create".to_owned()],
+        }
+    }
+
+    fn install_credentials_directory(fixture: &ProviderFixture) -> PathBuf {
+        let credentials = fixture._directory.path().join("credentials");
+        fs::create_dir(&credentials).unwrap();
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700)).unwrap();
+        credentials
+    }
+
+    fn install_credential(credentials: &Path, name: &str, bytes: &[u8], mode: u32) {
+        let credential = credentials.join(name);
+        fs::write(&credential, bytes).unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn assert_predispatch_refusal(
+        fixture: &mut ProviderFixture,
+        capability: &InferenceCapabilityV1,
+        request_bytes: &[u8],
+        hits: &Arc<AtomicUsize>,
+    ) {
+        let request = request_custody(capability, request_bytes);
+        let dispatch = dispatch_identity(
+            &fixture.core.authority_domain,
+            fixture.core.epoch,
+            &capability.id(),
+            &request.custody_record,
+        )
+        .unwrap();
+        let head_before = fixture.core.store.chain_head().unwrap();
+        let hits_before = hits.load(Ordering::SeqCst);
+        let result = fixture.core.handle(
+            ProviderRequestV1::Infer {
+                capability: Box::new(capability.clone()),
+                request: Box::new(request),
+                request_bytes: OpaqueBytesV1::new(request_bytes.to_vec()),
+            },
+            &fixture.peer,
+        );
+        assert!(
+            matches!(
+                result,
+                ApiResultV1::Error {
+                    code: ApiErrorCodeV1::Unavailable,
+                    ..
+                }
+            ),
+            "a pre-dispatch refusal must use the definitive unavailable wire code"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            hits_before,
+            "a refused dispatch reached the loopback provider"
+        );
+        assert!(
+            fixture
+                .core
+                .store
+                .materialized_state::<ProviderDispatchStateV1>(&dispatch_entity(&dispatch))
+                .unwrap()
+                .is_none(),
+            "a refused dispatch left a reservation behind"
+        );
+        assert_eq!(
+            fixture.core.store.chain_head().unwrap(),
+            head_before,
+            "a refused dispatch appended store events"
+        );
+        let stored = fixture
+            .core
+            .store
+            .materialized_state::<ProviderCapabilityStateV1>(&capability_entity(&capability.id()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state.usage,
+            InferenceUsageV1::default(),
+            "a refused dispatch burned budget"
+        );
+    }
+
+    #[test]
+    fn credential_defects_refuse_before_dispatch_without_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(750) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.limits.provider_deadline_ms = 200;
+            config.endpoints[0].transport = ProviderTransportConfigV1::CredentialedHttpsApi {
+                url,
+                credential_name: "provider-test-key".to_owned(),
+                credential_header: "authorization".to_owned(),
+                credential_prefix: "Bearer ".to_owned(),
+            };
+        });
+        let credentials = install_credentials_directory(&fixture);
+        fixture.core.credential_directory = Some(credentials.clone());
+        let session = SessionId::new("credential-refusal-session").unwrap();
+        let request_bytes = br#"{"model":"production-model"}"#;
+
+        // The credential file is absent.
+        let capability = fixture.capability(&session, 11);
+        fixture.register(&capability);
+        assert_predispatch_refusal(&mut fixture, &capability, request_bytes, &hits);
+
+        // The credential file is empty.
+        install_credential(&credentials, "provider-test-key", &[], 0o600);
+        let capability = fixture.capability(&session, 12);
+        fixture.register(&capability);
+        assert_predispatch_refusal(&mut fixture, &capability, request_bytes, &hits);
+
+        // The credential trims to empty.
+        install_credential(&credentials, "provider-test-key", b"\n", 0o600);
+        let capability = fixture.capability(&session, 13);
+        fixture.register(&capability);
+        assert_predispatch_refusal(&mut fixture, &capability, request_bytes, &hits);
+
+        // The credential spans multiple lines.
+        install_credential(&credentials, "provider-test-key", b"first\nsecond\n", 0o600);
+        let capability = fixture.capability(&session, 14);
+        fixture.register(&capability);
+        assert_predispatch_refusal(&mut fixture, &capability, request_bytes, &hits);
+
+        // The credential is group readable.
+        install_credential(&credentials, "provider-test-key", b"shared-secret\n", 0o640);
+        let capability = fixture.capability(&session, 15);
+        fixture.register(&capability);
+        assert_predispatch_refusal(&mut fixture, &capability, request_bytes, &hits);
+
+        server.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn missing_command_executable_refuses_before_dispatch_without_reservation() {
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.endpoints.push(command_endpoint(
+                "command",
+                Path::new("/nonexistent-ag-providerd-test/codex"),
+            ));
+        });
+        let session = SessionId::new("command-refusal-session").unwrap();
+        let capability = fixture.capability_for_endpoint("command", &session, 1);
+        fixture.register(&capability);
+        assert_predispatch_refusal(
+            &mut fixture,
+            &capability,
+            br#"{"model":"command-model"}"#,
+            &Arc::new(AtomicUsize::new(0)),
+        );
+    }
+
+    #[test]
+    fn credentialed_dispatch_that_passes_checks_still_times_out_indeterminate() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(750) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        thread::sleep(Duration::from_millis(250));
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.limits.provider_deadline_ms = 50;
+            config.endpoints[0].transport = ProviderTransportConfigV1::CredentialedHttpsApi {
+                url,
+                credential_name: "provider-test-key".to_owned(),
+                credential_header: "authorization".to_owned(),
+                credential_prefix: "Bearer ".to_owned(),
+            };
+        });
+        let credentials = install_credentials_directory(&fixture);
+        install_credential(
+            &credentials,
+            "provider-test-key",
+            b"loopback-secret\n",
+            0o600,
+        );
+        fixture.core.credential_directory = Some(credentials);
+
+        let session = SessionId::new("credentialed-timeout-session").unwrap();
+        let capability = fixture.capability(&session, 1);
+        fixture.register(&capability);
+        let request_bytes = br#"{"model":"production-model"}"#;
+        let request = request_custody(&capability, request_bytes);
+        let dispatch = dispatch_identity(
+            &fixture.core.authority_domain,
+            fixture.core.epoch,
+            &capability.id(),
+            &request.custody_record,
+        )
+        .unwrap();
+        let infer = || ProviderRequestV1::Infer {
+            capability: Box::new(capability.clone()),
+            request: Box::new(request.clone()),
+            request_bytes: OpaqueBytesV1::new(request_bytes.to_vec()),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.core.handle(infer(), &fixture.peer),
+                ApiResultV1::Error {
+                    code: ApiErrorCodeV1::Indeterminate,
+                    ..
+                }
+            ));
+        }
+        server.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let stored_dispatch = fixture
+            .core
+            .store
+            .materialized_state::<ProviderDispatchStateV1>(&dispatch_entity(&dispatch))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored_dispatch.state.phase,
+            ProviderDispatchPhaseV1::Reserved
+        ));
+        let stored = fixture
+            .core
+            .store
+            .materialized_state::<ProviderCapabilityStateV1>(&capability_entity(&capability.id()))
+            .unwrap()
+            .unwrap();
+        let model = &fixture.core.endpoints.get("primary").unwrap().models[0];
+        assert_eq!(
+            stored.state.usage,
+            InferenceUsageV1 {
+                requests: 1,
+                input_bytes: request_bytes.len() as u64,
+                output_bytes: model.max_event_stream_bytes,
+                cost_microunits: model.worst_case_cost_microunits,
+            },
+            "the committed reservation is never restored or double-charged"
+        );
+    }
+
+    #[test]
+    fn endpoint_readiness_reports_each_endpoint_without_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-command");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let missing = directory.path().join("missing-command");
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.endpoints.extend([
+                command_endpoint("command-ready", &executable),
+                command_endpoint("command-missing", &missing),
+                local_endpoint("local"),
+            ]);
+        });
+        let credentials = directory.path().join("credentials");
+        fs::create_dir(&credentials).unwrap();
+        fs::set_permissions(&credentials, fs::Permissions::from_mode(0o700)).unwrap();
+        install_credential(
+            &credentials,
+            "provider-api-key",
+            b"readiness-secret\n",
+            0o600,
+        );
+        fixture.core.credential_directory = Some(credentials.clone());
+
+        let readiness = |fixture: &mut ProviderFixture| {
+            let result = fixture
+                .core
+                .handle(ProviderRequestV1::EndpointReadiness {}, &fixture.peer);
+            let ApiResultV1::Ok {
+                response: ProviderResponseV1::EndpointReadiness { endpoints },
+            } = result
+            else {
+                panic!("endpoint readiness must succeed without any dispatch");
+            };
+            endpoints
+        };
+        let endpoints = readiness(&mut fixture);
+        assert_eq!(
+            endpoints,
+            vec![
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "command-missing".to_owned(),
+                    status: EndpointReadinessStatusV1::CommandUnavailable,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "command-ready".to_owned(),
+                    status: EndpointReadinessStatusV1::Ready,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "local".to_owned(),
+                    status: EndpointReadinessStatusV1::Ready,
+                },
+                EndpointReadinessEntryV1 {
+                    endpoint_id: "primary".to_owned(),
+                    status: EndpointReadinessStatusV1::Ready,
+                },
+            ]
+        );
+        let wire = serde_json::to_string(&endpoints).unwrap();
+        assert!(!wire.contains("readiness-secret"));
+
+        fs::remove_file(credentials.join("provider-api-key")).unwrap();
+        let endpoints = readiness(&mut fixture);
+        assert_eq!(
+            endpoints.last().unwrap(),
+            &EndpointReadinessEntryV1 {
+                endpoint_id: "primary".to_owned(),
+                status: EndpointReadinessStatusV1::CredentialUnavailable,
+            }
+        );
     }
 
     #[test]
