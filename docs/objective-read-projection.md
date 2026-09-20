@@ -169,3 +169,20 @@ This extends component-level read integration; it does not itself qualify the
 full application journey, public-only installation, retention rollover, live
 notifications or a new suite release. Existing immutable release profiles keep
 their documented narrower scope.
+
+## Check an explicit governed occurrence
+
+The objective contract already carries exact owner-minted occurrence links;
+no additional objective schema or caller-supplied relationship is needed.  For
+a composed qualification, use
+[`phosphor-objective-occurrence-check`](../examples/objective-occurrence-read.md)
+against a retained objective response produced with AG, Nightshift, Docket and
+Maude sources configured.  The checker binds the exact plan, campaign,
+occurrence, proposal, work and issuance identities while leaving condition
+assessment, evidence currentness, AG projection correspondence, Docket custody
+state, present health and future authority separate.
+
+This helper is not evidence that a particular deployment has completed the
+journey.  A release profile must still identify the exact participating
+revisions and retain one disposable actual-owner result.  Fixture-only checks
+must remain labeled as such.

@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Check one explicit owner-minted occurrence in a Phosphor objective read.
+
+This is a read-only integration check over an already captured
+``phosphor-ng.objective-detail/v1|v2`` response.  It does not discover links,
+read component databases, infer relationships from timestamps, or decide that
+an objective succeeded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import stat
+import sys
+from pathlib import Path
+
+MAX_INPUT_BYTES = 2_097_152
+DETAIL_SCHEMA = "ag.operator-ui.campaign-detail/v1"
+OBJECTIVE_SCHEMAS = {
+    "phosphor-ng.objective-detail/v1",
+    "phosphor-ng.objective-detail/v2",
+}
+CONDITION_STATES = {
+    "satisfied",
+    "not_satisfied",
+    "indeterminate",
+    "unknown",
+    "unavailable",
+}
+CURRENTNESS_STATES = {
+    "fresh",
+    "stale",
+    "future",
+    "indeterminate",
+    "unavailable",
+}
+SOURCE_STATES = {"available", "unavailable"}
+DOCKET_STATES = {"accepted", "settled", "indeterminate"}
+
+
+def _strict_object(raw: bytes) -> dict:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate JSON member: {key}")
+            result[key] = value
+        return result
+
+    def reject_float(_value):
+        raise ValueError("floating-point values are outside this check")
+
+    value = json.loads(raw.decode("ascii"), object_pairs_hook=pairs, parse_float=reject_float)
+    if not isinstance(value, dict):
+        raise ValueError("objective response must be an object")
+    return value
+
+
+def load_regular(path: Path) -> tuple[dict, str]:
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("--input must be an absolute final-non-symlink path")
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_INPUT_BYTES:
+        raise ValueError("--input must be a bounded regular file")
+    raw = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ValueError("objective response changed during bounded read")
+    return _strict_object(raw), "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _source_result(value: object, label: str) -> str:
+    if not isinstance(value, dict) or value.get("availability") not in SOURCE_STATES:
+        raise ValueError(f"{label} lacks explicit source availability")
+    if value["availability"] == "available" and not isinstance(value.get("value"), dict):
+        raise ValueError(f"{label} available source has no typed value")
+    if value["availability"] == "unavailable" and value.get("error_kind") is None:
+        raise ValueError(f"{label} unavailable source has no reason class")
+    return value["availability"]
+
+
+def _validate_conditions(view: dict) -> dict:
+    counts = {state: 0 for state in sorted(CONDITION_STATES)}
+    conditions = view.get("conditions")
+    if not isinstance(conditions, list):
+        raise ValueError("objective conditions must be a list")
+    for condition in conditions:
+        if not isinstance(condition, dict) or condition.get("disposition") not in CONDITION_STATES:
+            raise ValueError("objective condition has an unsupported disposition")
+        counts[condition["disposition"]] += 1
+        evidence = condition.get("evidence", [])
+        if not isinstance(evidence, list):
+            raise ValueError("condition evidence must be a list")
+        for item in evidence:
+            if not isinstance(item, dict) or item.get("source_currentness") not in CURRENTNESS_STATES:
+                raise ValueError("condition evidence lacks explicit currentness")
+    return counts
+
+
+def check(view: dict, expected: dict) -> dict:
+    if view.get("schema") not in OBJECTIVE_SCHEMAS:
+        raise ValueError("unsupported objective-detail schema")
+    objective = view.get("objective")
+    if not isinstance(objective, dict) or objective.get("availability") != "available":
+        raise ValueError("Maude objective source is not available")
+    if objective.get("plan_digest") != expected["plan_digest"]:
+        raise ValueError("objective plan digest mismatch")
+    condition_counts = _validate_conditions(view)
+
+    occurrences = view.get("occurrences")
+    if not isinstance(occurrences, list):
+        raise ValueError("objective occurrences must be a list")
+    matching = [
+        item
+        for item in occurrences
+        if isinstance(item, dict)
+        and all(item.get(name) == expected[name] for name in (
+            "campaign_id",
+            "occurrence_id",
+            "proposal_id",
+            "exact_work_id",
+            "maude_plan_ref",
+        ))
+    ]
+    if len(matching) != 1:
+        raise ValueError("expected exactly one owner-minted occurrence link")
+    link = matching[0]
+    detail = link.get("detail")
+    if not isinstance(detail, dict) or detail.get("schema") != DETAIL_SCHEMA:
+        raise ValueError("occurrence link lacks its exact campaign detail")
+
+    source_states = {
+        name: _source_result(detail.get(name), f"AG {name}")
+        for name in ("inspect", "status", "replay", "history", "refusals")
+    }
+    projection = detail.get("projection")
+    if not isinstance(projection, dict) or projection.get("correspondence") not in {
+        "exact",
+        "partial",
+        "disagreement",
+    }:
+        raise ValueError("campaign detail lacks explicit projection correspondence")
+
+    docket = detail.get("docket")
+    if not isinstance(docket, list):
+        raise ValueError("campaign detail docket projection must be a list")
+    docket_matches = []
+    for related in docket:
+        if not isinstance(related, dict):
+            raise ValueError("malformed Docket related source")
+        result = related.get("result")
+        state = _source_result(result, "Docket inspection")
+        if state != "available":
+            continue
+        value = result["value"]
+        if value.get("requested_issuance") == expected["issuance_id"]:
+            docket_matches.append(value)
+    if len(docket_matches) != 1:
+        raise ValueError("expected exactly one available Docket issuance record")
+    record = docket_matches[0].get("record")
+    if not isinstance(record, dict) or record.get("status") not in DOCKET_STATES:
+        raise ValueError("Docket record has no supported explicit custody state")
+
+    causal_unavailable = view.get("causal_unavailable", [])
+    if not isinstance(causal_unavailable, list):
+        raise ValueError("causal_unavailable must remain an explicit list")
+    prerequisites = view.get("prerequisites")
+    prerequisites_are_explicit = (
+        isinstance(prerequisites, str)
+        and prerequisites in {"unknown", "unavailable"}
+    ) or (
+        isinstance(prerequisites, dict)
+        and set(prerequisites) == {"owner_declared"}
+        and isinstance(prerequisites["owner_declared"], dict)
+    )
+    if not prerequisites_are_explicit:
+        raise ValueError("objective prerequisites lost their explicit availability")
+
+    return {
+        "schema": "constellation.objective-occurrence-check/v1",
+        "input_sha256": expected["input_sha256"],
+        "plan_digest": expected["plan_digest"],
+        "campaign_id": expected["campaign_id"],
+        "occurrence_id": expected["occurrence_id"],
+        "proposal_id": expected["proposal_id"],
+        "exact_work_id": expected["exact_work_id"],
+        "issuance_id": expected["issuance_id"],
+        "docket_record_status": record["status"],
+        "ag_source_availability": source_states,
+        "projection_correspondence": projection["correspondence"],
+        "condition_dispositions": condition_counts,
+        "causal_unavailable_count": len(causal_unavailable),
+        "objective_completion": "not_determined",
+        "current_health": "not_derived_from_execution",
+        "authority_for_another_action": "none",
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=Path, required=True)
+    for name in (
+        "plan-digest",
+        "campaign-id",
+        "occurrence-id",
+        "proposal-id",
+        "exact-work-id",
+        "issuance-id",
+    ):
+        parser.add_argument("--" + name, required=True)
+    args = parser.parse_args(argv)
+    try:
+        view, input_sha256 = load_regular(args.input)
+        expected = vars(args) | {"maude_plan_ref": args.plan_digest, "input_sha256": input_sha256}
+        expected.pop("input")
+        result = check(view, expected)
+        sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+        return 0
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
