@@ -17,11 +17,14 @@ classic Python Agent Governor is a predecessor, not a compatible installation.
 
 ## Current status
 
-This tree is qualification-ready development code, not a production-deployment
-claim. Its canonical path is `ag-loopctl` through the durable C1 campaign
+This tree is not a production-deployment claim. Its canonical path is
+`ag-loopctl` through the durable C1 campaign
 engine and store. The older standalone producer and vertical examples are
 bounded historical or conformance surfaces; they are not alternate current
-installation paths. Start with the [C1 loop contract](governed-loop-c1.md) and
+installation paths. The current immutable
+[0.1.0-alpha.6 walkthrough](https://unpingable.com/constellation/releases/0.1.0-alpha.6/guide.html)
+qualifies one exact reviewed local-copy effect through AG and Docket; it is the
+recommended first composed path. Start component work with the [C1 loop contract](governed-loop-c1.md) and
 the [deployment qualification contract](governed-loop-deployment-qualification.md),
 not an older vertical in isolation.
 

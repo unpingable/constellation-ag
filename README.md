@@ -9,9 +9,22 @@ New here? Start with the [main-branch guide](docs/public-guide.md). This revisio
 contains the governed-loop `ag-loopctl` command and read-only `ag-operator-ui`
 surface alongside the existing daemon/library workspace and `agctl` command.
 
+## Current public integration status
+
+The current immutable Constellation integration release is
+[0.1.0-alpha.6](https://unpingable.com/constellation/releases/0.1.0-alpha.6/guide.html).
+Its `reviewed-local-copy/v1` profile exercised one reviewed, exact, one-use AG
+authorization followed by Docket custody and a harmless local effect. The
+result was reconciled, and the public evidence was independently reproduced
+from anonymous clones without repeating the provider call or effect. This is a
+qualified profile, not a general deployment or a blanket claim for every AG
+entry point. Start with that walkthrough; use this repository's component guide
+for source-level contracts and other, separately qualified surfaces.
+
 ## Implementation status (2026-08-10)
 
-AG-ng is the canonical durable governor of exact-work occurrences. The
+Constellation AG is the canonical durable governor of exact-work occurrences.
+`AG-ng` is a historical implementation name, not a second product. The
 production-reachable path is `ag-loopctl` -> `CampaignEngineV1` ->
 `GovernedLoopKernelV1` -> `CampaignStoreV1`: AG records the exact proposal,
 resolves fresh observation and current standing, decides admissibility,
@@ -26,7 +39,7 @@ is qualification-ready development code, not an earned qualification or
 deployment claim. Older vertical documents remain valid only for the narrower
 surfaces they explicitly name.
 
-Agent Governor NG is a Rust hard successor to the classic Python Agent
+Constellation AG is a Rust hard successor to the classic Python Agent
 Governor. Its authority boundary is deliberately narrow:
 
 > Workers propose. AG governs one exact occurrence. Docket custodies one
@@ -45,7 +58,7 @@ context; it cannot deserialize or convert them into runtime authority. See
 `docs/formal-calculus-crosswalk.md` for correspondence and non-correspondence
 claims.
 
-AG-ng also produces authenticated authorization issuances for an external
+Constellation AG also produces authenticated authorization issuances for an external
 governed-work runtime. That producer is deliberately narrow: it decides through
 this office's own catalog and principal checks, burns its own decision authority
 once, and emits an immutable authenticated record. The record is not authority —
@@ -84,8 +97,10 @@ separately pinned composition: the public-only
 [alpha.3 integration guide](https://unpingable.com/constellation/releases/0.1.0-alpha.3/guide.html)
 now records its qualified runtime and example-kit revisions, fresh/stale/missing
 reads, and retained-state inspection. That release does not qualify AG/Docket
-effects, objective completion or full application migration. The frozen source
-guide retains its earlier development-status wording.
+effects, objective completion or full application migration. For the later,
+exact reviewed local-copy effect, use the current
+[alpha.6 walkthrough](https://unpingable.com/constellation/releases/0.1.0-alpha.6/guide.html).
+The frozen alpha.3 source guide retains its earlier development-status wording.
 Authenticated operator intent is represented by several exact, narrow request
 classes—never a generic retry—and is specified in
 [`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).
