@@ -51,7 +51,7 @@ if ! rg -q 'campaign: Digest' "$ui/src/links.rs" \
   exit 1
 fi
 
-for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody external-observation export-occurrence; do
+for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody export-precompiled-workflow-lineage external-observation export-occurrence; do
   if ! rg -q "$verb" "$ui/src/source.rs"; then
     echo "operator UI closed read-command surface lost $verb" >&2
     exit 1

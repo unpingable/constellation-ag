@@ -14,7 +14,7 @@ assessment is still unknown.
 | Source or view | What it establishes | What it does not establish |
 |---|---|---|
 | Maude `maude.objective-source/v1` | Goal and criteria from one exact PlanDocument digest, or explicit unavailable/conflicting source result | Completion, current deployment state, permission, or public disclosure approval |
-| Nightshift authoring lineage | Explicit plan/campaign/occurrence/proposal/work relationships retained by the owner | Relationships inferred from time, titles, filenames, or proximity |
+| Nightshift workflow lineage | Explicit plan/campaign/occurrence/proposal/work relationships retained by the owner, either from a supervised Maude authoring handoff or a retained precompiled cycle | Maude session custody when only the precompiled-cycle relationship exists; relationships inferred from time, titles, filenames, or proximity |
 | AG campaign projections | Journal states, exact proposals, consumed authorization and retained occurrence history | Success inferred merely from authorization or an issuance |
 | Docket inspection | Attempt custody, execution outcome and settlement, with their exact identities | Objective completion or permission for another attempt |
 | Optional application-owner projection | Exact owner assertions and prerequisite coverage for exact Maude condition IDs, with separate evidence currentness | Independent proof of the application interpretation, objective completion, permission, or execution |
@@ -27,7 +27,10 @@ unavailable source never implies that no prerequisites exist. Linked campaign de
 execution, authority and evidence source results separately. Failed causal
 reads remain visible in `causal_unavailable`; missing configuration is not a
 successful empty observation. Historical links use exact retained owner
-identities, not the most recent timestamp.
+identities, not the most recent timestamp. Nightshift never backfills a Maude
+authoring context from a later plan/proposal resemblance. Its separate
+precompiled-workflow export can expose an exact relationship that the original
+cycle already retained while keeping absent supervised-session custody explicit.
 
 ## Configure the read view
 
@@ -43,7 +46,7 @@ from your authored plan:
 
 These are additional arguments, not a standalone runnable command. The
 campaign root and AG CLI remain required. Nightshift is required to establish
-the authoring relationships; Docket is required to inspect actual attempt
+the workflow relationships; Docket is required to inspect actual attempt
 custody and settlement. Omitting either leaves its contribution unavailable,
 not replaced by Maude. Acquisition-ledger inspection is a separate optional
 read source for this use case; omitting it loses acquisition-mechanics detail.
@@ -184,5 +187,7 @@ state, present health and future authority separate.
 
 This helper is not evidence that a particular deployment has completed the
 journey.  A release profile must still identify the exact participating
-revisions and retain one disposable actual-owner result.  Fixture-only checks
+revisions and retain one disposable actual-owner result. A precompiled-cycle
+relationship remains distinct from a supervised Maude handoff even when both
+bind the same plan, proposal and work identities. Fixture-only checks
 must remain labeled as such.

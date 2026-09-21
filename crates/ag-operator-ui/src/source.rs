@@ -30,7 +30,8 @@ use crate::model::{
     DocketInspectionV1, ExternalObservationExportV1, InterventionSubmissionHistoryProjectionV1,
     MAUDE_OBJECTIVE_READ_SCHEMA_V1, MaudeObjectiveAvailabilityV1, MaudeObjectiveReadV1,
     NightshiftAuthoringContextExportV1, NightshiftAuthoringContextQueryV1,
-    NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, OBJECTIVE_DETAIL_SCHEMA_V1,
+    NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1,
+    NightshiftPrecompiledWorkflowLineageExportV1, OBJECTIVE_DETAIL_SCHEMA_V1,
     OBJECTIVE_DETAIL_SCHEMA_V2, OBJECTIVE_OWNER_PROJECTION_SCHEMA_V1, ObjectiveCausalUnavailableV1,
     ObjectiveConditionDispositionV1, ObjectiveConditionV1, ObjectiveDetailV1,
     ObjectiveEvidenceCurrentnessV1, ObjectiveOccurrenceLinkV1, ObjectiveOwnerProjectionV1,
@@ -214,6 +215,10 @@ enum CanonicalReadRequestV1 {
         campaign: String,
         occurrence: String,
     },
+    NightshiftExportPrecompiledWorkflowLineage {
+        campaign: String,
+        occurrence: String,
+    },
     NightshiftExportExternalObservation {
         campaign: String,
         occurrence: String,
@@ -244,6 +249,9 @@ impl CanonicalReadRequestV1 {
             }
             Self::NightshiftExportAuthoringCustody { .. } => {
                 ReadCommandNameV1::NightshiftExportAuthoringCustody
+            }
+            Self::NightshiftExportPrecompiledWorkflowLineage { .. } => {
+                ReadCommandNameV1::NightshiftExportPrecompiledWorkflowLineage
             }
             Self::NightshiftExportExternalObservation { .. } => {
                 ReadCommandNameV1::NightshiftExportExternalObservation
@@ -433,6 +441,8 @@ impl OperatorReaderV1 {
 
         let nightshift = self.collect_nightshift_sources(observations);
         let authoring_contexts = self.collect_authoring_sources(occurrences.clone());
+        let precompiled_workflow_lineage =
+            self.collect_precompiled_workflow_lineage_sources(occurrences.clone());
         let authoring_custody = self.collect_authoring_custody_sources(occurrences.clone());
         let external_observations = self.collect_external_observations(occurrences.clone());
         let observation_acquisitions = self.collect_acquisition_sources(occurrences);
@@ -451,6 +461,7 @@ impl OperatorReaderV1 {
             projection,
             nightshift,
             authoring_contexts,
+            precompiled_workflow_lineage,
             authoring_custody,
             external_observations,
             observation_acquisitions,
@@ -643,6 +654,30 @@ impl OperatorReaderV1 {
                     )
                 },
                 identity,
+            })
+            .collect()
+    }
+
+    fn collect_precompiled_workflow_lineage_sources(
+        &self,
+        occurrences: BTreeSet<(String, String)>,
+    ) -> Vec<RelatedSourceV1<NightshiftPrecompiledWorkflowLineageExportV1>> {
+        occurrences
+            .into_iter()
+            .enumerate()
+            .map(|(index, (campaign, occurrence))| RelatedSourceV1 {
+                identity: format!("{campaign}/{occurrence}"),
+                result: if index < RELATED_SOURCE_PROCESS_LIMIT {
+                    self.nightshift_precompiled_workflow_lineage_export(&campaign, &occurrence)
+                } else {
+                    unavailable(
+                        "Nightshift",
+                        ReadCommandNameV1::NightshiftExportPrecompiledWorkflowLineage,
+                        SourceErrorKindV1::Unavailable,
+                        "related-source process limit exceeded; fact not queried".to_owned(),
+                        None,
+                    )
+                },
             })
             .collect()
     }
@@ -984,6 +1019,36 @@ impl OperatorReaderV1 {
         )
     }
 
+    fn nightshift_precompiled_workflow_lineage_export(
+        &self,
+        campaign: &str,
+        occurrence: &str,
+    ) -> SourceResultV1<NightshiftPrecompiledWorkflowLineageExportV1> {
+        let Some(_) = &self
+            .canonical_config()
+            .ok()
+            .and_then(|value| value.nightshift.as_ref())
+        else {
+            return unavailable(
+                "Nightshift",
+                ReadCommandNameV1::NightshiftExportPrecompiledWorkflowLineage,
+                SourceErrorKindV1::NotConfigured,
+                "Nightshift source is not configured".to_owned(),
+                None,
+            );
+        };
+        self.capture_typed(
+            "Nightshift",
+            &CanonicalReadRequestV1::NightshiftExportPrecompiledWorkflowLineage {
+                campaign: campaign.to_owned(),
+                occurrence: occurrence.to_owned(),
+            },
+            |value: &NightshiftPrecompiledWorkflowLineageExportV1| {
+                value.validate_for_occurrence(campaign, occurrence)
+            },
+        )
+    }
+
     fn nightshift_external_observation_export(
         &self,
         campaign: &str,
@@ -1243,32 +1308,24 @@ fn canonical_command(
         CanonicalReadRequestV1::NightshiftExportAuthoringContext {
             campaign,
             occurrence,
+        } => {
+            nightshift_occurrence_command(config, "export-authoring-context", campaign, occurrence)?
         }
-        | CanonicalReadRequestV1::NightshiftExportAuthoringCustody {
+        CanonicalReadRequestV1::NightshiftExportAuthoringCustody {
             campaign,
             occurrence,
         } => {
-            let source = require_nightshift_source(config)?;
-            let verb = match request {
-                CanonicalReadRequestV1::NightshiftExportAuthoringContext { .. } => {
-                    "export-authoring-context"
-                }
-                CanonicalReadRequestV1::NightshiftExportAuthoringCustody { .. } => {
-                    "export-authoring-custody"
-                }
-                _ => unreachable!(),
-            };
-            let mut command = Command::new(&source.program);
-            command.args(["--store"]).arg(&source.store).args([
-                "cycle",
-                verb,
-                "--campaign-id",
-                campaign,
-                "--occurrence-id",
-                occurrence,
-            ]);
-            command
+            nightshift_occurrence_command(config, "export-authoring-custody", campaign, occurrence)?
         }
+        CanonicalReadRequestV1::NightshiftExportPrecompiledWorkflowLineage {
+            campaign,
+            occurrence,
+        } => nightshift_occurrence_command(
+            config,
+            "export-precompiled-workflow-lineage",
+            campaign,
+            occurrence,
+        )?,
         CanonicalReadRequestV1::NightshiftExportExternalObservation {
             campaign,
             occurrence,
@@ -1303,6 +1360,25 @@ fn canonical_command(
             objective_owner_projection_command(config)?
         }
     };
+    Ok(command)
+}
+
+fn nightshift_occurrence_command(
+    config: &OperatorSourceConfigV1,
+    verb: &str,
+    campaign: &str,
+    occurrence: &str,
+) -> Result<Command, CaptureFailureV1> {
+    let source = require_nightshift_source(config)?;
+    let mut command = Command::new(&source.program);
+    command.args(["--store"]).arg(&source.store).args([
+        "cycle",
+        verb,
+        "--campaign-id",
+        campaign,
+        "--occurrence-id",
+        occurrence,
+    ]);
     Ok(command)
 }
 
@@ -1533,7 +1609,7 @@ fn demo_objective_link_has_lineage(
                         proposal.reference().as_digest().to_string() == link.proposal_id
                     })
             })
-            && detail.authoring_contexts.iter().any(|related| {
+            && (detail.authoring_contexts.iter().any(|related| {
                 related.result.value().is_some_and(|export| {
                     export.matches.iter().any(|relation| {
                         relation.campaign_id == link.campaign_id
@@ -1543,7 +1619,17 @@ fn demo_objective_link_has_lineage(
                             && relation.maude_plan_ref == link.maude_plan_ref
                     })
                 })
-            })
+            }) || detail.precompiled_workflow_lineage.iter().any(|related| {
+                related.result.value().is_some_and(|export| {
+                    export.matches.iter().any(|relation| {
+                        relation.campaign_id == link.campaign_id
+                            && relation.occurrence_id == link.occurrence_id
+                            && relation.proposal_id == link.proposal_id
+                            && relation.exact_work_id == link.exact_work_id
+                            && relation.plan_document_ref == link.maude_plan_ref
+                    })
+                })
+            }))
     })
 }
 
@@ -1638,48 +1724,43 @@ fn assemble_objective_links(
                 continue;
             };
             for relation in &export.matches {
-                let snapshot =
-                    if inspect.current.key().occurrence.to_string() == relation.occurrence_id {
-                        Some(&inspect.current)
-                    } else {
-                        detail.history.value().and_then(|history| {
-                            history
-                                .transitions
-                                .iter()
-                                .rev()
-                                .map(|transition| &transition.successor)
-                                .find(|snapshot| {
-                                    snapshot.key().occurrence.to_string() == relation.occurrence_id
-                                })
-                        })
-                    };
-                let Some(snapshot) = snapshot else {
-                    if !detail.history.is_available() {
-                        causal_unavailable.push(ObjectiveCausalUnavailableV1 {
-                            locator_token: detail.locator_token.clone(),
-                            detail: "AG retained history unavailable for historical causal join"
-                                .to_owned(),
-                        });
-                    }
-                    continue;
-                };
-                if relation.maude_plan_ref != plan_digest
-                    || snapshot.key().campaign.to_string() != relation.campaign_id
-                    || snapshot.proposal().is_none_or(|proposal| {
-                        proposal.reference().as_digest().to_string() != relation.proposal_id
-                    })
-                {
-                    continue;
-                }
-                let key = (
-                    relation.campaign_id.clone(),
-                    relation.occurrence_id.clone(),
-                    relation.proposal_id.clone(),
-                    relation.exact_work_id.clone(),
-                    relation.maude_plan_ref.clone(),
-                    detail.locator_token.clone(),
+                retain_objective_link(
+                    plan_digest,
+                    detail,
+                    inspect,
+                    &relation.campaign_id,
+                    &relation.occurrence_id,
+                    &relation.proposal_id,
+                    &relation.exact_work_id,
+                    &relation.maude_plan_ref,
+                    causal_unavailable,
+                    &mut links,
                 );
-                links.entry(key).or_insert_with(|| detail.clone());
+            }
+        }
+        for related in &detail.precompiled_workflow_lineage {
+            let Some(export) = related.result.value() else {
+                causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                    locator_token: detail.locator_token.clone(),
+                    detail:
+                        "Nightshift precompiled-workflow lineage source unavailable for causal join"
+                            .to_owned(),
+                });
+                continue;
+            };
+            for relation in &export.matches {
+                retain_objective_link(
+                    plan_digest,
+                    detail,
+                    inspect,
+                    &relation.campaign_id,
+                    &relation.occurrence_id,
+                    &relation.proposal_id,
+                    &relation.exact_work_id,
+                    &relation.plan_document_ref,
+                    causal_unavailable,
+                    &mut links,
+                );
             }
         }
     }
@@ -1700,6 +1781,65 @@ fn assemble_objective_links(
             },
         )
         .collect()
+}
+
+type ObjectiveLinkKeyV1 = (String, String, String, String, String, String);
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the six exact cross-owner identities are deliberately not bundled or inferred"
+)]
+fn retain_objective_link(
+    plan_digest: &str,
+    detail: &CampaignDetailV1,
+    inspect: &AgInspectV1,
+    campaign_id: &str,
+    occurrence_id: &str,
+    proposal_id: &str,
+    exact_work_id: &str,
+    relation_plan_ref: &str,
+    causal_unavailable: &mut Vec<ObjectiveCausalUnavailableV1>,
+    links: &mut BTreeMap<ObjectiveLinkKeyV1, CampaignDetailV1>,
+) {
+    let snapshot = if inspect.current.key().occurrence.to_string() == occurrence_id {
+        Some(&inspect.current)
+    } else {
+        detail.history.value().and_then(|history| {
+            history
+                .transitions
+                .iter()
+                .rev()
+                .map(|transition| &transition.successor)
+                .find(|snapshot| snapshot.key().occurrence.to_string() == occurrence_id)
+        })
+    };
+    let Some(snapshot) = snapshot else {
+        if !detail.history.is_available() {
+            causal_unavailable.push(ObjectiveCausalUnavailableV1 {
+                locator_token: detail.locator_token.clone(),
+                detail: "AG retained history unavailable for historical causal join".to_owned(),
+            });
+        }
+        return;
+    };
+    if relation_plan_ref != plan_digest
+        || snapshot.key().campaign.to_string() != campaign_id
+        || snapshot.state().meta().expected_work().as_str() != exact_work_id
+        || snapshot
+            .proposal()
+            .is_none_or(|proposal| proposal.reference().as_digest().as_str() != proposal_id)
+    {
+        return;
+    }
+    let key = (
+        campaign_id.to_owned(),
+        occurrence_id.to_owned(),
+        proposal_id.to_owned(),
+        exact_work_id.to_owned(),
+        relation_plan_ref.to_owned(),
+        detail.locator_token.clone(),
+    );
+    links.entry(key).or_insert_with(|| detail.clone());
 }
 
 fn apply_owner_projection(
@@ -3269,6 +3409,71 @@ mod tests {
             std::fs::read_to_string(arguments).unwrap(),
             format!(
                 "--store\n{}\ncycle\nexport-authoring-context\n--campaign-id\n{}\n--occurrence-id\n{}\n",
+                root.path().join("nightshift.sqlite").display(),
+                campaign,
+                occurrence,
+            )
+        );
+    }
+
+    #[test]
+    fn precompiled_lineage_uses_only_the_closed_nightshift_read_verb() {
+        let root = tempfile::tempdir().unwrap();
+        let ag = root.path().join("ag-loopctl");
+        std::fs::write(&ag, b"#!/bin/sh\nexit 1\n").unwrap();
+        let nightshift = root.path().join("nightshift");
+        let arguments = root.path().join("nightshift-arguments");
+        let campaign = ag_primitives::Digest::hash_bytes(b"campaign").to_string();
+        let occurrence = "00000000-0000-0000-0000-000000000001";
+        let payload = serde_json::json!({
+            "schema": crate::model::NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_EXPORT_SCHEMA_V1,
+            "campaign_id": campaign,
+            "occurrence_id": occurrence,
+            "matches": [],
+        });
+        std::fs::write(
+            &nightshift,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+                arguments.display(),
+                payload
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ag, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&nightshift, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: ag,
+            nightshift: Some(NightshiftReadSourceV1 {
+                program: nightshift,
+                store: root.path().join("nightshift.sqlite"),
+            }),
+            docket: None,
+            maude_acquisition: None,
+            maude_objective: None,
+            objective_owner_projection: None,
+            public_objective_projection: None,
+            public_approved_receipt_urls: BTreeSet::new(),
+        })
+        .unwrap();
+        let result = reader.nightshift_precompiled_workflow_lineage_export(&campaign, occurrence);
+        assert!(
+            matches!(
+                &result,
+                SourceResultV1::Available {
+                    command: ReadCommandNameV1::NightshiftExportPrecompiledWorkflowLineage,
+                    value: NightshiftPrecompiledWorkflowLineageExportV1 { matches, .. },
+                    ..
+                } if matches.is_empty()
+            ),
+            "unexpected precompiled-lineage result: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            format!(
+                "--store\n{}\ncycle\nexport-precompiled-workflow-lineage\n--campaign-id\n{}\n--occurrence-id\n{}\n",
                 root.path().join("nightshift.sqlite").display(),
                 campaign,
                 occurrence,

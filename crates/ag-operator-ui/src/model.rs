@@ -29,6 +29,12 @@ pub const NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1: &str =
 /// Exact owner-minted authoring-context provenance schema.
 pub const NIGHTSHIFT_AUTHORING_CONTEXT_PROVENANCE_SCHEMA_V1: &str =
     "nightshift.authoring_context_provenance.v1";
+/// Exact supported precompiled-workflow lineage export schema.
+pub const NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_EXPORT_SCHEMA_V1: &str =
+    "nightshift.precompiled_workflow_lineage_export.v1";
+/// Exact Nightshift read-projection schema for one retained plan/work relation.
+pub const NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_SCHEMA_V1: &str =
+    "nightshift.precompiled_workflow_lineage.v1";
 /// Exact supported authenticated custody export schema.
 pub const NIGHTSHIFT_AUTHORING_CUSTODY_EXPORT_SCHEMA_V1: &str =
     "nightshift.authoring_context_custody_export.v1";
@@ -264,6 +270,53 @@ pub struct NightshiftAuthoringContextExportV1 {
     pub query: NightshiftAuthoringContextQueryV1,
     /// Zero or more exact immutable matches.
     pub matches: Vec<NightshiftAuthoringContextProvenanceV1>,
+}
+
+/// Exact plan/proposal/work relation projected from a retained precompiled
+/// Nightshift cycle. This is not Maude supervised-session custody.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NightshiftPrecompiledWorkflowLineageV1 {
+    /// Exact relationship schema.
+    pub schema: String,
+    /// Self-digest of every other field.
+    pub lineage_id: String,
+    /// Owner that derived the relation from its retained canonical store.
+    pub producer_component: String,
+    /// Governed campaign identity.
+    pub campaign_id: String,
+    /// Governed occurrence identity.
+    pub occurrence_id: String,
+    /// Exact AG proposal identity.
+    pub proposal_id: String,
+    /// Exact work identity.
+    pub exact_work_id: String,
+    /// Immutable plan-document digest retained by the cycle.
+    pub plan_document_ref: String,
+    /// Source Nightshift intent digest.
+    pub source_intent_id: String,
+    /// Source Nightshift cycle identity.
+    pub cycle_id: String,
+    /// Retained cycle-state digest.
+    pub cycle_state_digest: String,
+    /// Retained cycle request identity.
+    pub source_cycle_request_id: String,
+    /// Digest of the retained cycle request.
+    pub source_cycle_request_digest: String,
+}
+
+/// Exact occurrence-scoped precompiled-workflow lineage response.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NightshiftPrecompiledWorkflowLineageExportV1 {
+    /// Exact export schema.
+    pub schema: String,
+    /// Echoed campaign lookup identity.
+    pub campaign_id: String,
+    /// Echoed occurrence lookup identity.
+    pub occurrence_id: String,
+    /// Owner-derived matching relationships.
+    pub matches: Vec<NightshiftPrecompiledWorkflowLineageV1>,
 }
 
 /// Authenticated producer/session delivery evidence. This is custody only;
@@ -645,6 +698,8 @@ pub enum ReadCommandNameV1 {
     NightshiftExportAuthoringContext,
     /// Nightshift authenticated authoring delivery evidence.
     NightshiftExportAuthoringCustody,
+    /// Nightshift retained precompiled plan/proposal/work relationship.
+    NightshiftExportPrecompiledWorkflowLineage,
     /// Nightshift authenticated workflow-specific external observation.
     NightshiftExportExternalObservation,
     /// Maude exact acquisition trigger/request/event history.
@@ -823,6 +878,11 @@ pub struct CampaignDetailV1 {
     /// campaign/occurrence identity.
     #[serde(default)]
     pub authoring_contexts: Vec<RelatedSourceV1<NightshiftAuthoringContextExportV1>>,
+    /// Exact plan/proposal/work relations from retained precompiled cycles.
+    /// These do not claim Maude supervised-session custody.
+    #[serde(default)]
+    pub precompiled_workflow_lineage:
+        Vec<RelatedSourceV1<NightshiftPrecompiledWorkflowLineageExportV1>>,
     /// Separately retained producer/session custody evidence. Historical
     /// lineage may legitimately have no custody match.
     #[serde(default)]
@@ -1329,6 +1389,81 @@ impl NightshiftAuthoringContextProvenanceV1 {
             return Err(
                 "Nightshift authoring context disagrees with canonical AG proposal/work".into(),
             );
+        }
+        Ok(())
+    }
+}
+
+impl NightshiftPrecompiledWorkflowLineageExportV1 {
+    /// Validates exact occurrence lookup and every owner-derived relationship.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema, echoed lookup identity, relationship
+    /// shape, or self-digest differs from the closed owner contract.
+    pub fn validate_for_occurrence(&self, campaign: &str, occurrence: &str) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_EXPORT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported Nightshift precompiled-workflow lineage export schema {}",
+                self.schema
+            ));
+        }
+        if self.campaign_id != campaign || self.occurrence_id != occurrence {
+            return Err(
+                "Nightshift precompiled-workflow lineage substituted lookup identity".into(),
+            );
+        }
+        for record in &self.matches {
+            record.validate_for_governed_relationship(campaign, occurrence)?;
+        }
+        Ok(())
+    }
+}
+
+impl NightshiftPrecompiledWorkflowLineageV1 {
+    fn validate_for_governed_relationship(
+        &self,
+        campaign: &str,
+        occurrence: &str,
+    ) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_SCHEMA_V1
+            || self.producer_component != "nightshift.canonical_store"
+        {
+            return Err("unsupported Nightshift precompiled-workflow lineage".into());
+        }
+        for (name, value) in [
+            ("lineage_id", &self.lineage_id),
+            ("campaign_id", &self.campaign_id),
+            ("proposal_id", &self.proposal_id),
+            ("exact_work_id", &self.exact_work_id),
+            ("plan_document_ref", &self.plan_document_ref),
+            ("source_intent_id", &self.source_intent_id),
+            ("cycle_state_digest", &self.cycle_state_digest),
+            ("source_cycle_request_id", &self.source_cycle_request_id),
+            (
+                "source_cycle_request_digest",
+                &self.source_cycle_request_digest,
+            ),
+        ] {
+            Digest::parse(value).map_err(|error| format!("invalid {name}: {error}"))?;
+        }
+        if self.campaign_id != campaign
+            || self.occurrence_id != occurrence
+            || self.cycle_id.trim().is_empty()
+            || self.cycle_id.chars().any(char::is_whitespace)
+            || serde_json::from_value::<OccurrenceId>(Value::String(self.occurrence_id.clone()))
+                .is_err()
+        {
+            return Err("Nightshift precompiled-workflow lineage relationship is malformed".into());
+        }
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        value
+            .as_object_mut()
+            .expect("precompiled workflow lineage is an object")
+            .remove("lineage_id");
+        let expected = Digest::from_serializable(&value).map_err(|error| error.to_string())?;
+        if expected.as_str() != self.lineage_id {
+            return Err("Nightshift precompiled-workflow lineage self-digest mismatch".into());
         }
         Ok(())
     }
@@ -1845,6 +1980,28 @@ mod authoring_context_tests {
         value
     }
 
+    fn precompiled_lineage() -> NightshiftPrecompiledWorkflowLineageV1 {
+        let mut value = NightshiftPrecompiledWorkflowLineageV1 {
+            schema: NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_SCHEMA_V1.to_owned(),
+            lineage_id: String::new(),
+            producer_component: "nightshift.canonical_store".to_owned(),
+            campaign_id: digest("campaign"),
+            occurrence_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            proposal_id: digest("proposal"),
+            exact_work_id: digest("work"),
+            plan_document_ref: digest("plan"),
+            source_intent_id: digest("intent"),
+            cycle_id: "cycle:one".to_owned(),
+            cycle_state_digest: digest("cycle state"),
+            source_cycle_request_id: digest("cycle request"),
+            source_cycle_request_digest: digest("cycle request body"),
+        };
+        let mut preimage = serde_json::to_value(&value).unwrap();
+        preimage.as_object_mut().unwrap().remove("lineage_id");
+        value.lineage_id = Digest::from_serializable(&preimage).unwrap().to_string();
+        value
+    }
+
     fn custody(
         authoring: &NightshiftAuthoringContextProvenanceV1,
     ) -> NightshiftAuthoringCustodyProvenanceV1 {
@@ -1873,6 +2030,30 @@ mod authoring_context_tests {
         preimage.as_object_mut().unwrap().remove("custody_id");
         value.custody_id = Digest::from_serializable(&preimage).unwrap().to_string();
         value
+    }
+
+    #[test]
+    fn precompiled_lineage_binds_exact_occurrence_and_self_digest() {
+        let relation = precompiled_lineage();
+        let export = NightshiftPrecompiledWorkflowLineageExportV1 {
+            schema: NIGHTSHIFT_PRECOMPILED_WORKFLOW_LINEAGE_EXPORT_SCHEMA_V1.to_owned(),
+            campaign_id: relation.campaign_id.clone(),
+            occurrence_id: relation.occurrence_id.clone(),
+            matches: vec![relation.clone()],
+        };
+        assert!(
+            export
+                .validate_for_occurrence(&relation.campaign_id, &relation.occurrence_id)
+                .is_ok()
+        );
+
+        let mut changed = export;
+        changed.matches[0].exact_work_id = digest("other work");
+        assert!(
+            changed
+                .validate_for_occurrence(&relation.campaign_id, &relation.occurrence_id)
+                .is_err()
+        );
     }
 
     fn external_observation_export() -> ExternalObservationExportV1 {

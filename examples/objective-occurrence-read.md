@@ -1,9 +1,11 @@
 # Check one occurrence linked to an authored objective
 
-Phosphor already assembles objective-to-occurrence relationships from exact
-Nightshift authoring lineage checked against AG history.  The relationship is
-not supplied by this checker and is never inferred from timestamps, labels,
-filenames, or matching prose.
+Phosphor assembles objective-to-occurrence relationships from exact Nightshift
+workflow lineage checked against AG history. Nightshift may supply either a
+supervised Maude authoring-context record or the separate plan/proposal/work
+relationship retained by a precompiled cycle. The latter does not claim Maude
+session custody. The relationship is not supplied by this checker and is never
+inferred from timestamps, labels, filenames, or matching prose.
 
 `phosphor-objective-occurrence-check` is a small read-only caller for a captured
 `phosphor-ng.objective-detail/v1` or `v2` response.  It verifies one exact
