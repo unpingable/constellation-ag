@@ -6,15 +6,21 @@ use std::sync::Arc;
 use ag_app::api::{ApiResultV1, EndpointReadinessStatusV1, ProviderRequestV1, ProviderResponseV1};
 use ag_app::config::{LoadedConfigV1, ProviderdConfigV1, load_config_with_identity};
 use ag_app::rpc_auth::{RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1};
-use ag_app::runtime::{ComponentActivationContextV1, open_component_store};
+use ag_app::runtime::{
+    ComponentActivationContextV1, component_activation_identity,
+    inspect_component_activation_succession, open_component_store,
+    run_component_activation_succession,
+};
 use ag_app::signed_transport::{
     AcceptedSignedRequestV1, SocketPeerCheckV1, accept_signed_request, write_signed_response,
 };
 use ag_app::transport::bind_socket;
+use ag_primitives::JcsDocument;
 use ag_protocol::FrameCodec;
 use ag_providerd::{
     ProviderCoreV1, credential_directory_from_environment, endpoint_readiness_status,
 };
+use ag_store::{ActivationSuccessionDirectionV1, ActivationSuccessionPlanV1};
 use clap::Parser;
 use tracing::{info, warn};
 
@@ -38,6 +44,21 @@ struct Arguments {
     /// values and paths are never printed.
     #[arg(long)]
     check_credentials: bool,
+    /// Verify an exact build-only offline succession plan without mutation.
+    #[arg(long, value_name = "PLAN", conflicts_with_all = ["check_config", "check_credentials", "activation_succession_commit", "activation_succession_reverse", "activation_succession_candidate", "activation_succession_inspect"])]
+    activation_succession_preflight: Option<PathBuf>,
+    /// Commit an exact build-only offline succession plan.
+    #[arg(long, value_name = "PLAN", conflicts_with_all = ["check_config", "check_credentials", "activation_succession_preflight", "activation_succession_reverse", "activation_succession_candidate", "activation_succession_inspect"])]
+    activation_succession_commit: Option<PathBuf>,
+    /// Commit an append-only reverse succession plan using the recorded predecessor binary.
+    #[arg(long, value_name = "PLAN", conflicts_with_all = ["check_config", "check_credentials", "activation_succession_preflight", "activation_succession_commit", "activation_succession_candidate", "activation_succession_inspect"])]
+    activation_succession_reverse: Option<PathBuf>,
+    /// Print the activation identity derived from this executable and config.
+    #[arg(long, conflicts_with_all = ["check_config", "check_credentials", "activation_succession_preflight", "activation_succession_commit", "activation_succession_reverse", "activation_succession_inspect"])]
+    activation_succession_candidate: bool,
+    /// Verify and print content-free current activation/head/lineage state.
+    #[arg(long, conflicts_with_all = ["check_config", "check_credentials", "activation_succession_preflight", "activation_succession_commit", "activation_succession_reverse", "activation_succession_candidate"])]
+    activation_succession_inspect: bool,
 }
 
 /// Computes the content-free `--check-credentials` report: one
@@ -89,6 +110,68 @@ fn main() -> anyhow::Result<()> {
         exact_bytes_digest: config_identity,
     }: LoadedConfigV1<ProviderdConfigV1> = load_config_with_identity(&arguments.config, true)?;
     config.validate()?;
+    let activation_context = ComponentActivationContextV1 {
+        authority_domain: &config.authority_domain,
+        epoch: &config.epoch,
+        security_profile: &config.security_profile,
+        authority_catalog_identity: None,
+    };
+    if arguments.activation_succession_candidate {
+        let candidate =
+            component_activation_identity("ag-providerd", &config_identity, activation_context)?;
+        let output = JcsDocument::canonicalize(&candidate)?;
+        println!("{}", std::str::from_utf8(output.as_bytes())?);
+        return Ok(());
+    }
+    if arguments.activation_succession_inspect {
+        let state = inspect_component_activation_succession(
+            PROVIDERD_APPLICATION_ID,
+            "ag-providerd",
+            &config.store,
+        )?;
+        let output = JcsDocument::canonicalize(&state)?;
+        println!("{}", std::str::from_utf8(output.as_bytes())?);
+        return Ok(());
+    }
+    if let Some((plan_path, direction, commit)) = arguments
+        .activation_succession_preflight
+        .as_ref()
+        .map(|path| (path, ActivationSuccessionDirectionV1::Forward, false))
+        .or_else(|| {
+            arguments
+                .activation_succession_commit
+                .as_ref()
+                .map(|path| (path, ActivationSuccessionDirectionV1::Forward, true))
+        })
+        .or_else(|| {
+            arguments
+                .activation_succession_reverse
+                .as_ref()
+                .map(|path| (path, ActivationSuccessionDirectionV1::Reverse, true))
+        })
+    {
+        const MAX_PLAN_BYTES: u64 = 64 * 1024;
+        let metadata = std::fs::metadata(plan_path)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PLAN_BYTES {
+            anyhow::bail!("succession plan must be a nonempty regular file no larger than 64 KiB");
+        }
+        let plan_bytes = std::fs::read(plan_path)?;
+        JcsDocument::from_canonical_bytes(&plan_bytes)?;
+        let plan: ActivationSuccessionPlanV1 = serde_json::from_slice(&plan_bytes)?;
+        let receipt = run_component_activation_succession(
+            PROVIDERD_APPLICATION_ID,
+            "ag-providerd",
+            &config_identity,
+            activation_context,
+            &config.store,
+            &plan,
+            direction,
+            commit,
+        )?;
+        let output = JcsDocument::canonicalize(&receipt)?;
+        println!("{}", std::str::from_utf8(output.as_bytes())?);
+        return Ok(());
+    }
     if arguments.check_config {
         info!(path = %arguments.config.display(), "configuration is valid");
         return Ok(());

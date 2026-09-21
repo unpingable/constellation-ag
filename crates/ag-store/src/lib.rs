@@ -357,6 +357,112 @@ pub struct StoreActivationRecordV1 {
     pub activated_at_unix_ms: i64,
 }
 
+/// Exact, operator-authorized offline transition between two component builds.
+///
+/// Every authority-bearing field except `build_identity` must remain identical.
+/// The expected chain head and lineage revision make a plan single-use and bind
+/// it to one exact store state. Evidence digests name records retained outside
+/// the store; they are not treated as cryptographic operator credentials.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSuccessionPlanV1 {
+    /// Exact plan schema.
+    pub schema: String,
+    /// Globally unique transition identifier.
+    pub transition_id: String,
+    /// Exact currently enrolled activation.
+    pub predecessor: StoreActivationRecordV1,
+    /// Exact activation to enroll.
+    pub successor: StoreActivationIdentityV1,
+    /// Exact event-chain head observed while preparing the plan.
+    pub expected_chain_head: ChainHeadV1,
+    /// Expected revision of the singleton succession lineage (zero initially).
+    pub expected_lineage_revision: u64,
+    /// Digest of the verified recovery manifest retained by the operator.
+    pub recovery_manifest_digest: Digest,
+    /// Digest of the explicit operator authorization record.
+    pub operator_authorization_digest: Digest,
+    /// Bounded human-readable reason retained as evidence.
+    pub reason: String,
+    /// Operator-observed transition time, treated only as evidence.
+    pub occurred_at_unix_ms: i64,
+}
+
+impl ActivationSuccessionPlanV1 {
+    /// Canonical plan schema.
+    pub const SCHEMA: &'static str = "ag-store-activation-succession-plan-v1";
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.schema != Self::SCHEMA {
+            return Err(StoreError::ActivationSuccessionRefused(
+                "unsupported plan schema".to_owned(),
+            ));
+        }
+        validate_identifier("transition_id", &self.transition_id, 192)?;
+        if self.reason.is_empty() || self.reason.len() > 512 || self.reason.contains('\0') {
+            return Err(StoreError::ActivationSuccessionRefused(
+                "reason must contain 1..=512 non-NUL bytes".to_owned(),
+            ));
+        }
+        self.predecessor.identity.validate()?;
+        self.successor.validate()?;
+        let mut expected = self.predecessor.identity.clone();
+        expected.build_identity = self.successor.build_identity.clone();
+        if expected != self.successor
+            || self.predecessor.identity.build_identity == self.successor.build_identity
+        {
+            return Err(StoreError::ActivationSuccessionRefused(
+                "succession must change only build_identity and must change it".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Direction recorded for an append-only activation transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationSuccessionDirectionV1 {
+    /// Install a successor build.
+    Forward,
+    /// Reinstall a recorded predecessor through a new transition.
+    Reverse,
+}
+
+/// Content-free receipt for a preflight or committed transition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSuccessionReceiptV1 {
+    /// Exact transition identifier.
+    pub transition_id: String,
+    /// Transition direction.
+    pub direction: ActivationSuccessionDirectionV1,
+    /// Activation digest before the transition.
+    pub predecessor_activation_digest: StoreDigestV1,
+    /// Activation digest after the transition.
+    pub successor_activation_digest: StoreDigestV1,
+    /// Head required by the plan.
+    pub predecessor_chain_head: ChainHeadV1,
+    /// Resulting head when committed; absent for preflight.
+    pub committed_chain_head: Option<ChainHeadV1>,
+    /// Resulting lineage revision when committed; expected revision for preflight.
+    pub lineage_revision: u64,
+    /// Event receipt when committed; absent for preflight.
+    pub event_receipt: Option<EventReceiptV1>,
+}
+
+/// Content-free exact store state needed to prepare a succession plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationSuccessionStoreStateV1 {
+    /// Current enrolled activation and its verified digest.
+    pub activation: StoreActivationRecordV1,
+    /// Current verified event-chain head.
+    pub chain_head: ChainHeadV1,
+    /// Current singleton succession-lineage revision.
+    pub lineage_revision: u64,
+}
+
 /// Exact filesystem custody required while preparing a daemon database.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DatabaseFileCustodyV1 {
@@ -960,6 +1066,9 @@ pub enum StoreError {
     /// An activation identity is malformed or uses an unsupported schema.
     #[error("invalid store activation identity: {0}")]
     InvalidActivationIdentity(String),
+    /// An offline activation-succession plan or store precondition was refused.
+    #[error("activation succession refused: {0}")]
+    ActivationSuccessionRefused(String),
     /// An existing file was not already an AG store and may not be initialized online.
     #[error("existing database is not an initialized AG store: {0}")]
     UnrecognizedExistingDatabase(PathBuf),
@@ -2512,6 +2621,360 @@ struct BackupReleasePayloadV1<'a> {
     bundle_digest: &'a Digest,
 }
 
+const ACTIVATION_SUCCESSION_ENTITY_ID: &str = "store-activation-succession-lineage";
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationSuccessionEventV1<'a> {
+    schema: &'static str,
+    transition_id: &'a str,
+    direction: ActivationSuccessionDirectionV1,
+    predecessor: &'a StoreActivationRecordV1,
+    successor: &'a StoreActivationIdentityV1,
+    expected_chain_head: &'a ChainHeadV1,
+    expected_lineage_revision: u64,
+    recovery_manifest_digest: &'a Digest,
+    operator_authorization_digest: &'a Digest,
+    reason: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationSuccessionLineageV1 {
+    schema: String,
+    transition_id: String,
+    direction: ActivationSuccessionDirectionV1,
+    predecessor_activation: StoreActivationIdentityV1,
+    predecessor_activation_digest: StoreDigestV1,
+    current_activation: StoreActivationIdentityV1,
+    current_activation_digest: StoreDigestV1,
+    recovery_manifest_digest: Digest,
+    operator_authorization_digest: Digest,
+}
+
+/// Verify an exact activation transition without mutating the store.
+///
+/// The caller supplies a descriptor-bound database prepared under the
+/// component's configured filesystem custody. This function acquires the same
+/// exclusive writer lock as the daemon and refuses any active backup barrier.
+///
+/// # Errors
+///
+/// Returns an error for custody drift, a live writer, corruption, a stale plan,
+/// an active backup cut, or any transition that changes more than the build.
+pub fn preflight_activation_succession(
+    prepared_database: PreparedDatabaseV1,
+    expected_store_identity: &StoreIdentityV1,
+    plan: &ActivationSuccessionPlanV1,
+    direction: ActivationSuccessionDirectionV1,
+) -> Result<ActivationSuccessionReceiptV1, StoreError> {
+    plan.validate()?;
+    let (connection, _lock) =
+        open_activation_succession_store(prepared_database, expected_store_identity, false)?;
+    activation_succession_preconditions(&connection, expected_store_identity, plan, direction)
+}
+
+/// Atomically append an activation-lineage event and enroll its successor.
+///
+/// The transaction updates only the append-only event chain, the singleton
+/// succession-lineage materialization, and `store_activation`. Provider
+/// dispatches, capabilities, reservations, acknowledgments, blobs, and every
+/// other materialized entity remain untouched.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as
+/// [`preflight_activation_succession`], or if any exact precondition changes
+/// before the immediate transaction commits.
+pub fn commit_activation_succession(
+    prepared_database: PreparedDatabaseV1,
+    expected_store_identity: &StoreIdentityV1,
+    plan: &ActivationSuccessionPlanV1,
+    direction: ActivationSuccessionDirectionV1,
+) -> Result<ActivationSuccessionReceiptV1, StoreError> {
+    plan.validate()?;
+    let (mut connection, _lock) =
+        open_activation_succession_store(prepared_database, expected_store_identity, true)?;
+    let _ =
+        activation_succession_preconditions(&connection, expected_store_identity, plan, direction)?;
+    configure_mutating_connection_pragmas(&connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_no_backup_barrier(&transaction)?;
+    let current = load_activation(&transaction)?.ok_or(StoreError::ActivationIdentityMissing)?;
+    if current != plan.predecessor {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "durable predecessor changed after preflight".to_owned(),
+        ));
+    }
+    let head = chain_head_from_connection(&transaction)?;
+    if head != plan.expected_chain_head {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "event-chain head changed after plan creation".to_owned(),
+        ));
+    }
+    let lineage_revision = materialized_revision(&transaction, ACTIVATION_SUCCESSION_ENTITY_ID)?;
+    if lineage_revision != plan.expected_lineage_revision {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "succession lineage revision changed after plan creation".to_owned(),
+        ));
+    }
+    let successor_jcs = jcs(&plan.successor)?;
+    let successor_digest = StoreDigestV1::hash("ag-store-activation-identity-v1", &successor_jcs);
+    let payload = ActivationSuccessionEventV1 {
+        schema: "ag-store-activation-succession-event-v1",
+        transition_id: &plan.transition_id,
+        direction,
+        predecessor: &plan.predecessor,
+        successor: &plan.successor,
+        expected_chain_head: &plan.expected_chain_head,
+        expected_lineage_revision: plan.expected_lineage_revision,
+        recovery_manifest_digest: &plan.recovery_manifest_digest,
+        operator_authorization_digest: &plan.operator_authorization_digest,
+        reason: &plan.reason,
+    };
+    let state = ActivationSuccessionLineageV1 {
+        schema: "ag-store-activation-succession-lineage-v1".to_owned(),
+        transition_id: plan.transition_id.clone(),
+        direction,
+        predecessor_activation: plan.predecessor.identity.clone(),
+        predecessor_activation_digest: plan.predecessor.activation_digest.clone(),
+        current_activation: plan.successor.clone(),
+        current_activation_digest: successor_digest.clone(),
+        recovery_manifest_digest: plan.recovery_manifest_digest.clone(),
+        operator_authorization_digest: plan.operator_authorization_digest.clone(),
+    };
+    let receipt = append_event_in_transaction(
+        &transaction,
+        NewEventV1 {
+            event_id: plan.transition_id.clone(),
+            entity_id: ACTIVATION_SUCCESSION_ENTITY_ID.to_owned(),
+            event_kind: match direction {
+                ActivationSuccessionDirectionV1::Forward => {
+                    "providerd.activation-succeeded.v1".to_owned()
+                }
+                ActivationSuccessionDirectionV1::Reverse => {
+                    "providerd.activation-reversed.v1".to_owned()
+                }
+            },
+            occurred_at_unix_ms: plan.occurred_at_unix_ms,
+            payload,
+        },
+        &state,
+        plan.expected_lineage_revision,
+    )?;
+    let changed = transaction.execute(
+        "UPDATE store_activation
+         SET activation_jcs = ?1, activation_digest = ?2, activated_at_unix_ms = ?3
+         WHERE singleton = 1 AND activation_jcs = ?4 AND activation_digest = ?5
+           AND activated_at_unix_ms = ?6",
+        params![
+            successor_jcs,
+            successor_digest.as_str(),
+            plan.occurred_at_unix_ms,
+            jcs(&plan.predecessor.identity)?,
+            plan.predecessor.activation_digest.as_str(),
+            plan.predecessor.activated_at_unix_ms,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "activation compare-and-swap failed".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    let committed_chain_head = chain_head_from_connection(&connection)?;
+    Ok(ActivationSuccessionReceiptV1 {
+        transition_id: plan.transition_id.clone(),
+        direction,
+        predecessor_activation_digest: plan.predecessor.activation_digest.clone(),
+        successor_activation_digest: successor_digest,
+        predecessor_chain_head: plan.expected_chain_head.clone(),
+        committed_chain_head: Some(committed_chain_head),
+        lineage_revision: receipt.entity_revision,
+        event_receipt: Some(receipt),
+    })
+}
+
+/// Inspect content-free activation/head/lineage state under the offline writer
+/// fence, after full integrity and event-chain verification.
+///
+/// # Errors
+///
+/// Returns an error for custody drift, a live writer, corruption, or an active
+/// backup cut.
+pub fn inspect_activation_succession_store(
+    prepared_database: PreparedDatabaseV1,
+    expected_store_identity: &StoreIdentityV1,
+) -> Result<ActivationSuccessionStoreStateV1, StoreError> {
+    let (connection, _lock) =
+        open_activation_succession_store(prepared_database, expected_store_identity, false)?;
+    verify_offline_activation_store(&connection, expected_store_identity)
+}
+
+fn open_activation_succession_store(
+    prepared_database: PreparedDatabaseV1,
+    expected_store_identity: &StoreIdentityV1,
+    writable: bool,
+) -> Result<(Connection, Flock<File>), StoreError> {
+    expected_store_identity.validate()?;
+    if prepared_database.created_new {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "succession requires an existing initialized store".to_owned(),
+        ));
+    }
+    prepared_database.revalidate()?;
+    let lock_path = writer_lock_path(&prepared_database.path)?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let lock = match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_file, Errno::EAGAIN)) => return Err(StoreError::WriterFenced(lock_path)),
+        Err((_file, error)) => {
+            return Err(StoreError::Io(io::Error::from_raw_os_error(error as i32)));
+        }
+    };
+    let access = if writable {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    let connection = Connection::open_with_flags(
+        &prepared_database.path,
+        access | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "trusted_schema", "OFF")?;
+    prepared_database.revalidate()?;
+    let actual_identity = read_store_identity(&connection)?;
+    if &actual_identity != expected_store_identity {
+        return Err(StoreError::IdentityMismatch {
+            expected: Box::new(expected_store_identity.clone()),
+            actual: Box::new(actual_identity),
+        });
+    }
+    drop(prepared_database);
+    Ok((connection, lock))
+}
+
+fn activation_succession_preconditions(
+    connection: &Connection,
+    expected_store_identity: &StoreIdentityV1,
+    plan: &ActivationSuccessionPlanV1,
+    direction: ActivationSuccessionDirectionV1,
+) -> Result<ActivationSuccessionReceiptV1, StoreError> {
+    plan.validate()?;
+    let state = verify_offline_activation_store(connection, expected_store_identity)?;
+    if state.activation != plan.predecessor {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "plan predecessor does not match durable activation".to_owned(),
+        ));
+    }
+    if state.chain_head != plan.expected_chain_head {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "plan chain head does not match durable head".to_owned(),
+        ));
+    }
+    if state.lineage_revision != plan.expected_lineage_revision {
+        return Err(StoreError::ActivationSuccessionRefused(
+            "plan lineage revision does not match durable lineage".to_owned(),
+        ));
+    }
+    if direction == ActivationSuccessionDirectionV1::Reverse {
+        let lineage = load_activation_succession_lineage(connection)?.ok_or_else(|| {
+            StoreError::ActivationSuccessionRefused(
+                "reverse succession requires an existing lineage".to_owned(),
+            )
+        })?;
+        if lineage.predecessor_activation != plan.successor
+            || lineage.predecessor_activation_digest
+                != StoreDigestV1::hash("ag-store-activation-identity-v1", &jcs(&plan.successor)?)
+        {
+            return Err(StoreError::ActivationSuccessionRefused(
+                "reverse successor is not the immediately recorded predecessor".to_owned(),
+            ));
+        }
+    }
+    let successor_jcs = jcs(&plan.successor)?;
+    let successor_digest = StoreDigestV1::hash("ag-store-activation-identity-v1", &successor_jcs);
+    Ok(ActivationSuccessionReceiptV1 {
+        transition_id: plan.transition_id.clone(),
+        direction,
+        predecessor_activation_digest: state.activation.activation_digest,
+        successor_activation_digest: successor_digest,
+        predecessor_chain_head: state.chain_head,
+        committed_chain_head: None,
+        lineage_revision: state.lineage_revision,
+        event_receipt: None,
+    })
+}
+
+fn verify_offline_activation_store(
+    connection: &Connection,
+    expected_store_identity: &StoreIdentityV1,
+) -> Result<ActivationSuccessionStoreStateV1, StoreError> {
+    let integrity: Vec<String> = connection
+        .prepare("PRAGMA integrity_check")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if integrity != ["ok"] {
+        return Err(StoreError::Corrupt(
+            "SQLite integrity_check did not return exactly ok".to_owned(),
+        ));
+    }
+    let foreign_key_violation: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if foreign_key_violation.is_some() {
+        return Err(StoreError::Corrupt(
+            "SQLite foreign-key check found a violation".to_owned(),
+        ));
+    }
+    ensure_no_backup_barrier(connection)?;
+    let actual = load_activation(connection)?.ok_or(StoreError::ActivationIdentityMissing)?;
+    let head = verify_chain_connection(connection, expected_store_identity)?;
+    let lineage_revision = materialized_revision(connection, ACTIVATION_SUCCESSION_ENTITY_ID)?;
+    if let Some(lineage) = load_activation_succession_lineage(connection)? {
+        if lineage.current_activation != actual.identity
+            || lineage.current_activation_digest != actual.activation_digest
+        {
+            return Err(StoreError::Corrupt(
+                "succession lineage disagrees with durable activation".to_owned(),
+            ));
+        }
+    }
+    Ok(ActivationSuccessionStoreStateV1 {
+        activation: actual,
+        chain_head: head,
+        lineage_revision,
+    })
+}
+
+fn load_activation_succession_lineage(
+    connection: &Connection,
+) -> Result<Option<ActivationSuccessionLineageV1>, StoreError> {
+    let state_jcs: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT state_jcs FROM materialized_state WHERE entity_id = ?1",
+            [ACTIVATION_SUCCESSION_ENTITY_ID],
+            |row| row.get(0),
+        )
+        .optional()?;
+    state_jcs
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| StoreError::InvalidStoredJson(error.to_string()))
+        })
+        .transpose()
+}
+
 fn initialize_or_validate(
     connection: &mut Connection,
     expected: &StoreIdentityV1,
@@ -3637,6 +4100,205 @@ mod tests {
             .open_activated("second", &activation)
             .expect("reopen exact activation");
         assert_eq!(reopened.activation(), Some(&enrolled));
+    }
+
+    fn succession_plan(
+        transition_id: &str,
+        predecessor: StoreActivationRecordV1,
+        successor: StoreActivationIdentityV1,
+        head: ChainHeadV1,
+        lineage_revision: u64,
+    ) -> ActivationSuccessionPlanV1 {
+        ActivationSuccessionPlanV1 {
+            schema: ActivationSuccessionPlanV1::SCHEMA.to_owned(),
+            transition_id: transition_id.to_owned(),
+            predecessor,
+            successor,
+            expected_chain_head: head,
+            expected_lineage_revision: lineage_revision,
+            recovery_manifest_digest: Digest::hash_domain("recovery", transition_id.as_bytes()),
+            operator_authorization_digest: Digest::hash_domain(
+                "operator-authorization",
+                transition_id.as_bytes(),
+            ),
+            reason: "qualified component build replacement".to_owned(),
+            occurred_at_unix_ms: 20 + i64::try_from(lineage_revision).unwrap(),
+        }
+    }
+
+    #[test]
+    fn activation_succession_is_build_only_append_only_and_reversible() {
+        let fixture = Fixture::new_for(0x4147_5001, "ag-providerd");
+        let predecessor = Fixture::activation("succession");
+        let mut store = fixture
+            .open_activated("predecessor", &predecessor)
+            .expect("enroll predecessor");
+        store
+            .append_event(
+                event("preserved-event", "provider-dispatch:opaque", "reserved"),
+                &TestState {
+                    value: "reserved".to_owned(),
+                },
+                0,
+            )
+            .expect("preserved provider state");
+        let predecessor_record = store.activation().unwrap().clone();
+        let predecessor_head = store.chain_head().unwrap();
+        let preserved_state = store
+            .materialized_state::<TestState>("provider-dispatch:opaque")
+            .unwrap()
+            .unwrap();
+        drop(store);
+
+        let mut successor = predecessor.clone();
+        successor.build_identity = Digest::hash_domain("build", b"successor-build");
+        let plan = succession_plan(
+            "activation-transition-forward",
+            predecessor_record.clone(),
+            successor.clone(),
+            predecessor_head.clone(),
+            0,
+        );
+        let database_before_preflight = fs::read(&fixture.database).unwrap();
+        let preflight = preflight_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &plan,
+            ActivationSuccessionDirectionV1::Forward,
+        )
+        .expect("preflight");
+        assert!(preflight.event_receipt.is_none());
+        assert_eq!(
+            fs::read(&fixture.database).unwrap(),
+            database_before_preflight
+        );
+
+        let forward = commit_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &plan,
+            ActivationSuccessionDirectionV1::Forward,
+        )
+        .expect("commit forward succession");
+        assert_eq!(forward.lineage_revision, 1);
+        assert!(fixture.open_activated("old-refuses", &predecessor).is_err());
+        let successor_store = fixture
+            .open_activated("successor", &successor)
+            .expect("successor opens");
+        assert_eq!(
+            successor_store
+                .materialized_state::<TestState>("provider-dispatch:opaque")
+                .unwrap()
+                .unwrap(),
+            preserved_state
+        );
+        let successor_record = successor_store.activation().unwrap().clone();
+        let successor_head = successor_store.chain_head().unwrap();
+        drop(successor_store);
+
+        let reverse = succession_plan(
+            "activation-transition-reverse",
+            successor_record,
+            predecessor.clone(),
+            successor_head,
+            1,
+        );
+        let reversed = commit_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &reverse,
+            ActivationSuccessionDirectionV1::Reverse,
+        )
+        .expect("commit reverse succession");
+        assert_eq!(reversed.lineage_revision, 2);
+        assert!(
+            fixture
+                .open_activated("successor-refuses", &successor)
+                .is_err()
+        );
+        fixture
+            .open_activated("predecessor-restored", &predecessor)
+            .expect("predecessor opens after append-only reverse");
+    }
+
+    #[test]
+    fn activation_succession_refuses_non_build_drift_and_stale_replay() {
+        let fixture = Fixture::new_for(0x4147_5001, "ag-providerd");
+        let predecessor = Fixture::activation("succession-refusal");
+        let store = fixture
+            .open_activated("predecessor", &predecessor)
+            .expect("enroll predecessor");
+        let predecessor_record = store.activation().unwrap().clone();
+        let head = store.chain_head().unwrap();
+        drop(store);
+
+        let mut invalid_successor = predecessor.clone();
+        invalid_successor.build_identity = Digest::hash_domain("build", b"candidate");
+        invalid_successor.epoch = EpochId::new(8).unwrap();
+        let invalid = succession_plan(
+            "activation-transition-invalid",
+            predecessor_record.clone(),
+            invalid_successor,
+            head.clone(),
+            0,
+        );
+        let error = preflight_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &invalid,
+            ActivationSuccessionDirectionV1::Forward,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StoreError::ActivationSuccessionRefused(_)));
+
+        let mut successor = predecessor.clone();
+        successor.build_identity = Digest::hash_domain("build", b"candidate");
+        let plan = succession_plan(
+            "activation-transition-once",
+            predecessor_record,
+            successor.clone(),
+            head,
+            0,
+        );
+        commit_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &plan,
+            ActivationSuccessionDirectionV1::Forward,
+        )
+        .expect("first commit");
+        let replay = commit_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &plan,
+            ActivationSuccessionDirectionV1::Forward,
+        )
+        .unwrap_err();
+        assert!(matches!(replay, StoreError::ActivationSuccessionRefused(_)));
+
+        let successor_store = fixture
+            .open_activated("successor-for-hostile-reverse", &successor)
+            .unwrap();
+        let successor_record = successor_store.activation().unwrap().clone();
+        let successor_head = successor_store.chain_head().unwrap();
+        drop(successor_store);
+        let mut arbitrary = predecessor;
+        arbitrary.build_identity = Digest::hash_domain("build", b"unrecorded-target");
+        let hostile_reverse = succession_plan(
+            "activation-transition-hostile-reverse",
+            successor_record,
+            arbitrary,
+            successor_head,
+            1,
+        );
+        let error = preflight_activation_succession(
+            prepare_database(&fixture.database, fixture.database_custody()).unwrap(),
+            &fixture.identity,
+            &hostile_reverse,
+            ActivationSuccessionDirectionV1::Reverse,
+        )
+        .unwrap_err();
+        assert!(matches!(error, StoreError::ActivationSuccessionRefused(_)));
     }
 
     #[test]

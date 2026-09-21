@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_primitives::{AuthorityDomainId, Digest, EpochId, JcsDocument};
 use ag_store::{
-    DatabaseFileCustodyV1, Store, StoreActivationIdentityV1, StoreIdentityV1, WriterIdentityV1,
-    prepare_database,
+    ActivationSuccessionDirectionV1, ActivationSuccessionPlanV1, ActivationSuccessionReceiptV1,
+    ActivationSuccessionStoreStateV1, DatabaseFileCustodyV1, Store, StoreActivationIdentityV1,
+    StoreIdentityV1, WriterIdentityV1, commit_activation_succession,
+    inspect_activation_succession_store, preflight_activation_succession, prepare_database,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -135,19 +137,9 @@ pub fn open_component_store(
 
     let identity = StoreIdentityV1::current(application_id, application_name)?;
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let build_identity = component_build_identity(application_name)?;
-    let activation = StoreActivationIdentityV1 {
-        schema: StoreActivationIdentityV1::SCHEMA.to_owned(),
-        authority_domain: AuthorityDomainId::parse(activation_context.authority_domain)?,
-        epoch: EpochId::parse(activation_context.epoch)?,
-        config_identity: config_identity.clone(),
-        security_profile_identity: Digest::hash_domain(
-            "ag-security-profile-identity-v1",
-            activation_context.security_profile.as_bytes(),
-        ),
-        build_identity: build_identity.clone(),
-        authority_catalog_identity: activation_context.authority_catalog_identity.cloned(),
-    };
+    let activation =
+        component_activation_identity(application_name, config_identity, activation_context)?;
+    let build_identity = activation.build_identity.clone();
     let writer = WriterIdentityV1 {
         writer_id: format!("{application_name}:{}", uuid::Uuid::new_v4()),
         principal_digest: Digest::hash_domain(
@@ -173,6 +165,44 @@ pub fn open_component_store(
     // The activated prepared open may initialize only its exclusively created
     // SQLite inode and claims the writer fence. Readiness is forbidden until
     // the resulting filesystem nodes still match the explicit startup policy.
+    validate_component_store_nodes(config, &writer_lock_path)?;
+    Ok(store)
+}
+
+/// Derive the exact activation identity from this executable and config.
+///
+/// # Errors
+///
+/// Returns an error if authority fields are invalid or the running executable
+/// cannot be observed as one stable bounded regular file.
+pub fn component_activation_identity(
+    application_name: &str,
+    config_identity: &Digest,
+    activation_context: ComponentActivationContextV1<'_>,
+) -> anyhow::Result<StoreActivationIdentityV1> {
+    let build_identity = component_build_identity(application_name)?;
+    Ok(StoreActivationIdentityV1 {
+        schema: StoreActivationIdentityV1::SCHEMA.to_owned(),
+        authority_domain: AuthorityDomainId::parse(activation_context.authority_domain)?,
+        epoch: EpochId::parse(activation_context.epoch)?,
+        config_identity: config_identity.clone(),
+        security_profile_identity: Digest::hash_domain(
+            "ag-security-profile-identity-v1",
+            activation_context.security_profile.as_bytes(),
+        ),
+        build_identity: build_identity.clone(),
+        authority_catalog_identity: activation_context.authority_catalog_identity.cloned(),
+    })
+}
+
+fn validate_component_store_nodes(
+    config: &StoreConfigV1,
+    writer_lock_path: &Path,
+) -> anyhow::Result<()> {
+    let database_parent = config
+        .database
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
     validate_node(
         &config.database,
         &config.store_custody.database,
@@ -195,7 +225,122 @@ pub fn open_component_store(
     )?;
     validate_sqlite_sidecar_if_present(&config.database, "-wal", &config.store_custody.database)?;
     validate_sqlite_sidecar_if_present(&config.database, "-shm", &config.store_custody.database)?;
-    Ok(store)
+    Ok(())
+}
+
+/// Run the exact offline activation-succession preflight or commit path.
+///
+/// The candidate activation is derived from this executable and the exact
+/// descriptor-bound config; callers cannot supply an arbitrary successor
+/// build. No credentials, transport, socket, or provider client are loaded.
+///
+/// # Errors
+///
+/// Returns an error for config/custody drift, a live writer, a plan that does
+/// not name this executable as successor, or any store precondition failure.
+pub fn run_component_activation_succession(
+    application_id: u32,
+    application_name: &str,
+    config_identity: &Digest,
+    activation_context: ComponentActivationContextV1<'_>,
+    config: &StoreConfigV1,
+    plan: &ActivationSuccessionPlanV1,
+    direction: ActivationSuccessionDirectionV1,
+    commit: bool,
+) -> anyhow::Result<ActivationSuccessionReceiptV1> {
+    let candidate =
+        component_activation_identity(application_name, config_identity, activation_context)?;
+    let executable_activation = match direction {
+        ActivationSuccessionDirectionV1::Forward => &plan.successor,
+        ActivationSuccessionDirectionV1::Reverse => &plan.predecessor.identity,
+    };
+    if &candidate != executable_activation {
+        anyhow::bail!(
+            "succession plan does not bind this executable and config in the required direction"
+        );
+    }
+    let database_parent = config
+        .database
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    validate_node(
+        database_parent,
+        &config.store_custody.database_parent,
+        CustodyNodeKindV1::Directory,
+    )?;
+    validate_node(
+        &config.object_store,
+        &config.store_custody.object_store,
+        CustodyNodeKindV1::Directory,
+    )?;
+    let writer_lock_path = writer_lock_path(&config.database)?;
+    validate_node(
+        &writer_lock_path,
+        &config.store_custody.writer_lock,
+        CustodyNodeKindV1::RegularFile,
+    )?;
+    let prepared = prepare_database(
+        &config.database,
+        DatabaseFileCustodyV1 {
+            uid: config.store_custody.database.uid,
+            gid: config.store_custody.database.gid,
+            mode: config.store_custody.database.mode,
+        },
+    )?;
+    let identity = StoreIdentityV1::current(application_id, application_name)?;
+    let receipt = if commit {
+        commit_activation_succession(prepared, &identity, plan, direction)?
+    } else {
+        preflight_activation_succession(prepared, &identity, plan, direction)?
+    };
+    validate_component_store_nodes(config, &writer_lock_path)?;
+    Ok(receipt)
+}
+
+/// Inspect the content-free store state needed to prepare an exact succession
+/// plan, under the same filesystem and writer-fence checks as the commit path.
+///
+/// # Errors
+///
+/// Returns an error for custody drift, a live writer, corruption, or an active
+/// backup cut.
+pub fn inspect_component_activation_succession(
+    application_id: u32,
+    application_name: &str,
+    config: &StoreConfigV1,
+) -> anyhow::Result<ActivationSuccessionStoreStateV1> {
+    let database_parent = config
+        .database
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    validate_node(
+        database_parent,
+        &config.store_custody.database_parent,
+        CustodyNodeKindV1::Directory,
+    )?;
+    validate_node(
+        &config.object_store,
+        &config.store_custody.object_store,
+        CustodyNodeKindV1::Directory,
+    )?;
+    let writer_lock_path = writer_lock_path(&config.database)?;
+    validate_node(
+        &writer_lock_path,
+        &config.store_custody.writer_lock,
+        CustodyNodeKindV1::RegularFile,
+    )?;
+    let prepared = prepare_database(
+        &config.database,
+        DatabaseFileCustodyV1 {
+            uid: config.store_custody.database.uid,
+            gid: config.store_custody.database.gid,
+            mode: config.store_custody.database.mode,
+        },
+    )?;
+    let identity = StoreIdentityV1::current(application_id, application_name)?;
+    let state = inspect_activation_succession_store(prepared, &identity)?;
+    validate_component_store_nodes(config, &writer_lock_path)?;
+    Ok(state)
 }
 
 fn component_build_identity(application_name: &str) -> anyhow::Result<Digest> {
