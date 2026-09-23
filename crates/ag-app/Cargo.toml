@@ -44,6 +44,10 @@ path = "src/bin/ag_standing_resolver.rs"
 name = "ag-gcl-v1-glass-heron"
 path = "src/bin/ag_gcl_v1_glass_heron.rs"
 
+[[bin]]
+name = "ag-civild-observation-decision"
+path = "src/bin/ag_civild_observation_decision.rs"
+
 [dependencies]
 async-io = { version = "2.3.2", optional = true }
 ag-campaign = { path = "../ag-campaign" }
