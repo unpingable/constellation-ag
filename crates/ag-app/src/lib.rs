@@ -2,8 +2,8 @@
 
 pub mod agd;
 pub mod api;
-pub mod config;
 pub mod civild_observation;
+pub mod config;
 mod custody;
 pub mod derived;
 pub mod descriptor_path;
