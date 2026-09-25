@@ -28,6 +28,7 @@ use ag_app::governed_ports::{
     CommandObservationResolverV1, CommandStandingResolverV1, GOVERNED_RUNTIME_PROFILE_SCHEMA_V1,
     GOVERNED_RUNTIME_PROFILE_SCHEMA_V2, GovernedRuntimeProfileEnrollmentV1,
     GovernedRuntimeProfileEnrollmentV2, GovernedRuntimeProfileV1, GovernedRuntimeProfileV2,
+    UnavailableEnrolledFileV1,
 };
 use ag_app::intervention_ingress::*;
 use ag_app::shared_admission::RecordReviewInputV1;
@@ -725,8 +726,8 @@ fn main() -> anyhow::Result<()> {
             write_exact(&engine.current()?)
         }
         Command::Status { database } => {
-            let (engine, _) = open_bound(&database)?;
-            write_exact(&engine.current()?)
+            let (engine, _, _, unavailable) = open_read_only(&database)?;
+            write_read_only(&engine.current()?, &unavailable)
         }
         Command::RecordReview { database, input } => {
             let input: RecordReviewInputV1 = read_exact_record(&input)?;
@@ -767,19 +768,19 @@ fn main() -> anyhow::Result<()> {
             run_input,
         } => run_finite(&database, &run_input, now),
         Command::Replay { database } => {
-            let (engine, _) = open_bound(&database)?;
-            write_exact(&engine.replay()?)
+            let (engine, _, _, unavailable) = open_read_only(&database)?;
+            write_read_only(&engine.replay()?, &unavailable)
         }
         Command::History { database } => {
-            let (engine, _) = open_bound(&database)?;
-            write_exact(&engine.history()?)
+            let (engine, _, _, unavailable) = open_read_only(&database)?;
+            write_read_only(&engine.history()?, &unavailable)
         }
         Command::Refusals { database } => {
-            let (engine, _) = open_bound(&database)?;
-            write_exact(&engine.refusal_history()?)
+            let (engine, _, _, unavailable) = open_read_only(&database)?;
+            write_read_only(&engine.refusal_history()?, &unavailable)
         }
         Command::Inspect { database } => {
-            let (engine, _) = open_bound(&database)?;
+            let (engine, _, _, unavailable) = open_read_only(&database)?;
             let stored = engine
                 .runtime_profile()?
                 .context("campaign has no genesis-bound runtime profile")?;
@@ -788,15 +789,18 @@ fn main() -> anyhow::Result<()> {
             if replay.current_state_digest != *current.state_digest() {
                 bail!("operational snapshot state differs from deterministic replay");
             }
-            write_exact(&OperationalSnapshotV1 {
-                schema: OPERATIONAL_SNAPSHOT_SCHEMA_V1,
-                current,
-                replay,
-                runtime_profile: RuntimeProfileBindingV1 {
-                    schema: stored.schema,
-                    digest: stored.digest,
+            write_read_only(
+                &OperationalSnapshotV1 {
+                    schema: OPERATIONAL_SNAPSHOT_SCHEMA_V1,
+                    current,
+                    replay,
+                    runtime_profile: RuntimeProfileBindingV1 {
+                        schema: stored.schema,
+                        digest: stored.digest,
+                    },
                 },
-            })
+                &unavailable,
+            )
         }
         Command::RecordProposal {
             database,
@@ -969,7 +973,7 @@ fn main() -> anyhow::Result<()> {
             database,
             submission,
         } => {
-            let (_, profile, profile_digest) = open_bound_with_digest(&database)?;
+            let (_, profile, profile_digest, unavailable) = open_read_only(&database)?;
             profile
                 .intervention_ingress
                 .as_ref()
@@ -977,33 +981,39 @@ fn main() -> anyhow::Result<()> {
             let submission = Digest::parse(&submission)?;
             let ledger_path = InterventionSubmissionLedgerV1::path_for_campaign(&database);
             if !ledger_path.exists() {
-                return write_exact(&InterventionSubmissionHistoryV1 {
-                    schema: INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1.to_owned(),
-                    target_runtime_profile: profile_digest,
-                    submission: Some(submission),
-                    receipts: Vec::new(),
-                });
+                return write_read_only(
+                    &InterventionSubmissionHistoryV1 {
+                        schema: INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1.to_owned(),
+                        target_runtime_profile: profile_digest,
+                        submission: Some(submission),
+                        receipts: Vec::new(),
+                    },
+                    &unavailable,
+                );
             }
             let ledger = InterventionSubmissionLedgerV1::open_reader(&ledger_path, profile_digest)?;
-            write_exact(&ledger.history(Some(&submission))?)
+            write_read_only(&ledger.history(Some(&submission))?, &unavailable)
         }
         Command::InterventionSubmissions { database } => {
-            let (_, profile, profile_digest) = open_bound_with_digest(&database)?;
+            let (_, profile, profile_digest, unavailable) = open_read_only(&database)?;
             profile
                 .intervention_ingress
                 .as_ref()
                 .context("runtime profile has no intervention ingress")?;
             let ledger_path = InterventionSubmissionLedgerV1::path_for_campaign(&database);
             if !ledger_path.exists() {
-                return write_exact(&InterventionSubmissionHistoryV1 {
-                    schema: INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1.to_owned(),
-                    target_runtime_profile: profile_digest,
-                    submission: None,
-                    receipts: Vec::new(),
-                });
+                return write_read_only(
+                    &InterventionSubmissionHistoryV1 {
+                        schema: INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1.to_owned(),
+                        target_runtime_profile: profile_digest,
+                        submission: None,
+                        receipts: Vec::new(),
+                    },
+                    &unavailable,
+                );
             }
             let ledger = InterventionSubmissionLedgerV1::open_reader(&ledger_path, profile_digest)?;
-            write_exact(&ledger.history(None)?)
+            write_read_only(&ledger.history(None)?, &unavailable)
         }
         Command::Complete {
             database,
@@ -1691,6 +1701,35 @@ fn open_bound(database: &Path) -> anyhow::Result<(CampaignEngineV1, GovernedRunt
 fn open_bound_with_digest(
     database: &Path,
 ) -> anyhow::Result<(CampaignEngineV1, GovernedRuntimeProfileV1, Digest)> {
+    let (engine, profile, digest, unavailable) = open_with_genesis_check(database, false)?;
+    debug_assert!(unavailable.is_empty());
+    Ok((engine, profile, digest))
+}
+
+/// Opens a campaign for a projection that cannot transition it. Genesis is
+/// verified against public material only: no signing key is opened, and
+/// absent enrolled files are returned for the caller to report.
+fn open_read_only(
+    database: &Path,
+) -> anyhow::Result<(
+    CampaignEngineV1,
+    GovernedRuntimeProfileV1,
+    Digest,
+    Vec<UnavailableEnrolledFileV1>,
+)> {
+    open_with_genesis_check(database, true)
+}
+
+fn open_with_genesis_check(
+    database: &Path,
+    read_only: bool,
+) -> anyhow::Result<(
+    CampaignEngineV1,
+    GovernedRuntimeProfileV1,
+    Digest,
+    Vec<UnavailableEnrolledFileV1>,
+)> {
+    let mut unavailable = Vec::new();
     let engine = CampaignEngineV1::open(database)?;
     let stored = engine
         .runtime_profile()?
@@ -1707,12 +1746,47 @@ fn open_bound_with_digest(
         GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 => {
             let profile: GovernedRuntimeProfileV2 = strict_json_from_slice(&stored.canonical_bytes)
                 .context("decode genesis-bound runtime profile v2")?;
-            profile.verify_genesis()?;
+            if read_only {
+                unavailable = profile.verify_genesis_read_only()?;
+            } else {
+                profile.verify_genesis()?;
+            }
             profile.common_profile()
         }
         _ => bail!("campaign runtime profile schema is not supported"),
     };
-    Ok((engine, profile, stored.digest))
+    Ok((engine, profile, stored.digest, unavailable))
+}
+
+/// Exit status of a read-only command that verified everything its retained
+/// bytes allow but found enrolled files absent. It is neither success nor a
+/// mismatch refusal (status 1).
+const EXIT_ENROLLED_FILE_UNAVAILABLE: i32 = 3;
+const READ_ONLY_VERIFICATION_SCHEMA_V1: &str = "ag.governed-loop.read-only-verification/v1";
+
+#[derive(Serialize)]
+struct ReadOnlyVerificationV1<'a> {
+    schema: &'static str,
+    status: &'static str,
+    unavailable: &'a [UnavailableEnrolledFileV1],
+}
+
+fn write_read_only<T: Serialize + ?Sized>(
+    value: &T,
+    unavailable: &[UnavailableEnrolledFileV1],
+) -> anyhow::Result<()> {
+    write_exact(value)?;
+    if unavailable.is_empty() {
+        return Ok(());
+    }
+    std::io::stdout().flush()?;
+    let report = JcsDocument::canonicalize(&ReadOnlyVerificationV1 {
+        schema: READ_ONLY_VERIFICATION_SCHEMA_V1,
+        status: "enrolled-file-unavailable",
+        unavailable,
+    })?;
+    eprintln!("enrolled file unavailable: {}", report.as_str());
+    std::process::exit(EXIT_ENROLLED_FILE_UNAVAILABLE);
 }
 
 fn submit_intervention(

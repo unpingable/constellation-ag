@@ -168,6 +168,80 @@ impl PinnedDeploymentFileV1 {
         }
         self.verify(executable)
     }
+
+    /// Read-only remeasure: an absent file is `None`, never a pass, while
+    /// present bytes must still equal the pinned identity.
+    fn verify_retained(&self) -> Result<Option<Vec<u8>>, GovernedPortErrorV1> {
+        match Self::read_bounded(&self.path, false) {
+            Err(GovernedPortErrorV1::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+            Ok(bytes) if Digest::hash_bytes(&bytes) != self.identity => {
+                Err(GovernedPortErrorV1::Deployment(format!(
+                    "pinned file identity changed: {}",
+                    self.path.display()
+                )))
+            }
+            Ok(bytes) => Ok(Some(bytes)),
+        }
+    }
+}
+
+/// A genesis-pinned file that a read-only open could not remeasure because it
+/// is absent. This is distinct from an identity mismatch, which refuses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnavailableEnrolledFileV1 {
+    /// Profile coordinate of the file.
+    pub role: &'static str,
+    /// Genesis-pinned locator.
+    pub path: PathBuf,
+    /// Genesis-pinned identity that could not be remeasured.
+    pub identity: Digest,
+}
+
+/// How a genesis verification measures pinned files. Live checks require
+/// every file, including the issuer signing key. Read-only checks never open
+/// the signing key and record absent files instead of refusing.
+struct GenesisCheck {
+    read_only: bool,
+    unavailable: Vec<UnavailableEnrolledFileV1>,
+}
+
+impl GenesisCheck {
+    const fn live() -> Self {
+        Self {
+            read_only: false,
+            unavailable: Vec::new(),
+        }
+    }
+
+    const fn read_only() -> Self {
+        Self {
+            read_only: true,
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn measure(
+        &mut self,
+        role: &'static str,
+        file: &PinnedDeploymentFileV1,
+        executable: bool,
+    ) -> Result<Option<Vec<u8>>, GovernedPortErrorV1> {
+        if !self.read_only {
+            return file.verify(executable).map(Some);
+        }
+        let bytes = file.verify_retained()?;
+        if bytes.is_none() && !self.unavailable.iter().any(|entry| entry.path == file.path) {
+            self.unavailable.push(UnavailableEnrolledFileV1 {
+                role,
+                path: file.path.clone(),
+                identity: file.identity.clone(),
+            });
+        }
+        Ok(bytes)
+    }
 }
 
 /// Deployment-owned Docket custody and execution coordinates. Docket state is
@@ -213,11 +287,20 @@ impl GovernedDocketRootV1 {
 
     /// Remeasures every configured Docket boundary component.
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
+        self.verify_with(&mut GenesisCheck::live())
+    }
+
+    fn verify_with(&self, check: &mut GenesisCheck) -> Result<(), GovernedPortErrorV1> {
         self.validate()?;
-        let _ = self.docket_program.verify(true)?;
-        let _ = self.trust_config.verify(false)?;
-        let _ = self.standing_resolver.verify(true)?;
-        let _ = self.executor_adapter.verify(true)?;
+        let _ = check.measure("docket.docket_program", &self.docket_program, true)?;
+        let _ = check.measure("docket.trust_config", &self.trust_config, false)?;
+        let _ = check.measure("docket.standing_resolver", &self.standing_resolver, true)?;
+        let _ = check.measure("docket.executor_adapter", &self.executor_adapter, true)?;
+        if check.read_only {
+            // The issuer is identified by the genesis principal and key id and
+            // by the pinned Docket trust bytes; signing material is not read.
+            return Ok(());
+        }
         let key = self.issuer_key.verify(false)?;
         let _ = AgIssuanceSignerV1::from_pkcs8(
             self.issuer_principal.clone(),
@@ -286,6 +369,10 @@ pub struct GovernedSharedAdmissionV1 {
 impl GovernedSharedAdmissionV1 {
     /// Remeasures the complete protected boundary.
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
+        self.verify_with(&mut GenesisCheck::live())
+    }
+
+    fn verify_with(&self, check: &mut GenesisCheck) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_SHARED_ADMISSION_SCHEMA_V1
             || self.plan_binding_schema != MAUDE_GOVERNED_PLAN_BINDING_SCHEMA_V1
             || self.compiler_contract.is_empty()
@@ -295,22 +382,47 @@ impl GovernedSharedAdmissionV1 {
                 "invalid governed shared admission",
             ));
         }
-        let _ = self.plan_validator.verify(true)?;
-        let config = self.plan_validator_config.verify(false)?;
-        let _ = crate::shared_admission::canonical_file_identity(&config)?;
-        let _ = self.review_verifier.verify(true)?;
-        let verifier_config = self.review_verifier_config.verify(false)?;
-        let verifier_config_digest =
-            crate::shared_admission::canonical_file_identity(&verifier_config)?;
-        let requirement = self.review_requirement.verify(false)?;
-        let requirement =
-            crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
-        if requirement.compiler_contract != self.compiler_contract
-            || requirement.route_enrollment_digest != verifier_config_digest
-        {
-            return Err(GovernedPortErrorV1::InvalidConfiguration(
-                "review requirement differs from shared admission enrollment",
-            ));
+        let _ = check.measure(
+            "shared_admission.plan_validator",
+            &self.plan_validator,
+            true,
+        )?;
+        if let Some(config) = check.measure(
+            "shared_admission.plan_validator_config",
+            &self.plan_validator_config,
+            false,
+        )? {
+            let _ = crate::shared_admission::canonical_file_identity(&config)?;
+        }
+        let _ = check.measure(
+            "shared_admission.review_verifier",
+            &self.review_verifier,
+            true,
+        )?;
+        let verifier_config_digest = check
+            .measure(
+                "shared_admission.review_verifier_config",
+                &self.review_verifier_config,
+                false,
+            )?
+            .map(|bytes| crate::shared_admission::canonical_file_identity(&bytes))
+            .transpose()?;
+        let requirement = check.measure(
+            "shared_admission.review_requirement",
+            &self.review_requirement,
+            false,
+        )?;
+        if let Some(requirement) = requirement {
+            let requirement =
+                crate::shared_admission::ReviewRequirementV1::from_canonical_bytes(&requirement)?;
+            if requirement.compiler_contract != self.compiler_contract
+                || verifier_config_digest
+                    .is_some_and(|digest| requirement.route_enrollment_digest != digest)
+            {
+                return Err(GovernedPortErrorV1::InvalidConfiguration(
+                    "review requirement differs from shared admission enrollment",
+                ));
+            }
         }
         Ok(())
     }
@@ -389,7 +501,7 @@ struct NightshiftPinnedFileV1 {
 }
 
 impl NightshiftCyclePortConfigV1 {
-    fn validate(&self) -> Result<(), GovernedPortErrorV1> {
+    fn validate(&self, check: &mut GenesisCheck) -> Result<(), GovernedPortErrorV1> {
         if self.schema != NIGHTSHIFT_AG_CYCLE_PORT_CONFIG_SCHEMA_V1
             || self.nq_source_id.is_empty()
             || self.ag_observation_resolver_id.is_empty()
@@ -411,18 +523,26 @@ impl NightshiftCyclePortConfigV1 {
                 "invalid Nightshift cycle adapter config",
             ));
         }
-        for (file, executable) in [
-            (&self.present_evidence_resolver, true),
-            (&self.nq_program, true),
-            (&self.nq_config, false),
-            (&self.ag_loopctl, true),
-            (&self.ag_observation_resolver, true),
+        for (role, file, executable) in [
+            (
+                "nightshift_cycle.config.present_evidence_resolver",
+                &self.present_evidence_resolver,
+                true,
+            ),
+            ("nightshift_cycle.config.nq_program", &self.nq_program, true),
+            ("nightshift_cycle.config.nq_config", &self.nq_config, false),
+            ("nightshift_cycle.config.ag_loopctl", &self.ag_loopctl, true),
+            (
+                "nightshift_cycle.config.ag_observation_resolver",
+                &self.ag_observation_resolver,
+                true,
+            ),
         ] {
-            let _ = PinnedDeploymentFileV1 {
+            let pinned = PinnedDeploymentFileV1 {
                 path: file.path.clone(),
                 identity: file.sha256.clone(),
-            }
-            .verify(executable)?;
+            };
+            let _ = check.measure(role, &pinned, executable)?;
         }
         Ok(())
     }
@@ -431,20 +551,30 @@ impl NightshiftCyclePortConfigV1 {
 impl GovernedNightshiftCyclePortV1 {
     /// Remeasures the complete cycle boundary.
     pub fn verify_all(&self) -> Result<(), GovernedPortErrorV1> {
+        self.verify_with(&mut GenesisCheck::live()).map(|_| ())
+    }
+
+    /// Returns the decoded cycle configuration when its bytes are available.
+    fn verify_with(
+        &self,
+        check: &mut GenesisCheck,
+    ) -> Result<Option<NightshiftCyclePortConfigV1>, GovernedPortErrorV1> {
         if self.schema != GOVERNED_NIGHTSHIFT_CYCLE_PORT_SCHEMA_V1 {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "invalid Nightshift cycle port",
             ));
         }
-        let _ = self.program.verify(true)?;
-        let config = self.config.verify(false)?;
+        let _ = check.measure("nightshift_cycle.program", &self.program, true)?;
+        let Some(config) = check.measure("nightshift_cycle.config", &self.config, false)? else {
+            return Ok(None);
+        };
         let _ = crate::shared_admission::canonical_file_identity(&config)?;
         let config: NightshiftCyclePortConfigV1 =
             JcsDocument::from_canonical_bytes(config.strip_suffix(b"\n").unwrap_or(&config))
                 .and_then(|document| document.decode())
                 .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        config.validate()?;
-        Ok(())
+        config.validate(check)?;
+        Ok(Some(config))
     }
 
     /// Invokes the fixed finite cycle operation. The request is mechanism
@@ -486,27 +616,44 @@ impl GovernedNightshiftCyclePortV1 {
 impl GovernedRuntimeProfileV2 {
     /// Validates V2 without accepting a V1 object or optional shared policy.
     pub fn verify_genesis(&self) -> Result<(), GovernedPortErrorV1> {
+        self.verify_genesis_with(&mut GenesisCheck::live())
+    }
+
+    /// Verifies the genesis profile for a read-only open against public
+    /// material only. The issuer signing key is never opened; the issuer is
+    /// bound by the genesis principal and key id and the pinned Docket trust
+    /// bytes. Present files must match their pins. Absent files are returned
+    /// as unavailable, and the caller must report them.
+    pub fn verify_genesis_read_only(
+        &self,
+    ) -> Result<Vec<UnavailableEnrolledFileV1>, GovernedPortErrorV1> {
+        let mut check = GenesisCheck::read_only();
+        self.verify_genesis_with(&mut check)?;
+        Ok(check.unavailable)
+    }
+
+    fn verify_genesis_with(&self, check: &mut GenesisCheck) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V2 {
             return Err(GovernedPortErrorV1::InvalidConfiguration(
                 "invalid governed runtime profile v2",
             ));
         }
-        self.common_profile().verify_genesis()?;
-        self.nightshift_cycle.verify_all()?;
-        self.shared_admission.verify_all()?;
-        let config_bytes = self.nightshift_cycle.config.verify(false)?;
-        let config: NightshiftCyclePortConfigV1 = JcsDocument::from_canonical_bytes(
-            config_bytes.strip_suffix(b"\n").unwrap_or(&config_bytes),
-        )
-        .and_then(|document| document.decode())
-        .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let requirement_bytes = self.shared_admission.review_requirement.verify(false)?;
-        let requirement_digest =
-            crate::shared_admission::canonical_file_identity(&requirement_bytes)?;
-        if config.shared_admission_requirement_digest != requirement_digest {
-            return Err(GovernedPortErrorV1::InvalidConfiguration(
-                "Nightshift config differs from shared admission requirement",
-            ));
+        self.common_profile().verify_genesis_with(check)?;
+        let config = self.nightshift_cycle.verify_with(check)?;
+        self.shared_admission.verify_with(check)?;
+        let requirement_bytes = check.measure(
+            "shared_admission.review_requirement",
+            &self.shared_admission.review_requirement,
+            false,
+        )?;
+        if let (Some(config), Some(requirement_bytes)) = (config, requirement_bytes) {
+            let requirement_digest =
+                crate::shared_admission::canonical_file_identity(&requirement_bytes)?;
+            if config.shared_admission_requirement_digest != requirement_digest {
+                return Err(GovernedPortErrorV1::InvalidConfiguration(
+                    "Nightshift config differs from shared admission requirement",
+                ));
+            }
         }
         Ok(())
     }
@@ -534,6 +681,10 @@ impl GovernedRuntimeProfileV2 {
 impl GovernedRuntimeProfileV1 {
     /// Validates and measures every genesis-bound component.
     pub fn verify_genesis(&self) -> Result<(), GovernedPortErrorV1> {
+        self.verify_genesis_with(&mut GenesisCheck::live())
+    }
+
+    fn verify_genesis_with(&self, check: &mut GenesisCheck) -> Result<(), GovernedPortErrorV1> {
         if self.schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V1
             || self.profile_label.is_empty()
             || self.profile_label.len() > 128
@@ -546,28 +697,31 @@ impl GovernedRuntimeProfileV1 {
                 "invalid governed runtime profile",
             ));
         }
-        let _ = self.observation_resolver.verify(true)?;
-        let _ = self.standing_resolver.verify(true)?;
-        let catalog = self.exact_work_catalog.verify(false)?;
-        let document =
-            JcsDocument::from_canonical_bytes(catalog.strip_suffix(b"\n").unwrap_or(&catalog))
-                .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let catalog: crate::governed_loop::VersionedExactWorkCatalogV1 =
-            serde_json::from_slice(document.as_bytes())
-                .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        catalog
-            .validate()
-            .map_err(|error| GovernedPortErrorV1::Deployment(error.to_string()))?;
+        let _ = check.measure("observation_resolver", &self.observation_resolver, true)?;
+        let _ = check.measure("standing_resolver", &self.standing_resolver, true)?;
+        if let Some(catalog) =
+            check.measure("exact_work_catalog", &self.exact_work_catalog, false)?
+        {
+            let document =
+                JcsDocument::from_canonical_bytes(catalog.strip_suffix(b"\n").unwrap_or(&catalog))
+                    .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+            let catalog: crate::governed_loop::VersionedExactWorkCatalogV1 =
+                serde_json::from_slice(document.as_bytes())
+                    .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+            catalog
+                .validate()
+                .map_err(|error| GovernedPortErrorV1::Deployment(error.to_string()))?;
+        }
         if let Some(review) = &self.controlling_review {
-            let _ = review.verify(false)?;
+            let _ = check.measure("controlling_review", review, false)?;
         }
         if let Some(verifier) = &self.human_verifier {
-            let _ = verifier.verify(true)?;
+            let _ = check.measure("human_verifier", verifier, true)?;
         }
         if let Some(ingress) = &self.intervention_ingress {
             ingress.validate()?;
         }
-        self.docket.verify_all()
+        self.docket.verify_with(check)
     }
 }
 

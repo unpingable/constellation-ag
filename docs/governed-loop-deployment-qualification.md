@@ -91,8 +91,21 @@ ag-loopctl inspect --database DATABASE
 `inspect` is a machine-readable projection containing the current occurrence,
 deterministic replay counts, and the genesis-bound profile schema/digest. It is
 read-only and deliberately does not require access to live signing material.
-`status` and `replay` remain narrower machine-readable projections. Command
-JSON is written to standard output; refusal diagnostics go to standard error.
+`status` and `replay` remain narrower machine-readable projections.
+
+The read-only commands (`inspect`, `status`, `replay`, `history`, `refusals`,
+`intervention-receipt` and `intervention-submissions`) verify a V2 genesis
+profile against public material only. They never open the issuer signing key.
+The issuer is bound by the genesis principal and key id and by the pinned
+Docket trust bytes. Every other enrolled file that is present must match its
+pin, or the command refuses with status 1. An enrolled file that is absent
+does not refuse: the command writes its JSON, then writes
+`enrolled file unavailable: {"schema":"ag.governed-loop.read-only-verification/v1",...}`
+to standard error, naming each absent file's role, path and pinned identity,
+and exits with status 3. Mutating commands and `verify-runtime-profile-v2`
+still remeasure every file, including the signing key.
+
+Command JSON is written to standard output; refusal diagnostics go to standard error.
 Operators must collect both without treating logs as transition inputs and
 must never log enrollment secret contents or signing-key bytes.
 
