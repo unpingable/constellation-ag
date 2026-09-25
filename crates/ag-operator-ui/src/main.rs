@@ -93,6 +93,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    if ag_build_info::answer_identity_request("ag-operator-ui")? {
+        return Ok(());
+    }
     let args = Args::parse();
     validate_bind_ip(args.bind.ip()).map_err(anyhow::Error::msg)?;
     let reader = if let Some(corpus) = args.demo_corpus {

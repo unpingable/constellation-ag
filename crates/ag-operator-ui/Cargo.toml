@@ -16,6 +16,7 @@ name = "ag-operator-ui"
 path = "src/main.rs"
 
 [dependencies]
+ag-build-info = { path = "../ag-build-info" }
 ag-campaign = { path = "../ag-campaign" }
 ag-primitives = { path = "../ag-primitives" }
 ag-store = { path = "../ag-store" }

@@ -44,6 +44,7 @@ name = "ag-gcl-v1-glass-heron"
 path = "src/bin/ag_gcl_v1_glass_heron.rs"
 
 [dependencies]
+ag-build-info = { path = "../ag-build-info" }
 ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }
 ag-kernel = { path = "../ag-kernel" }

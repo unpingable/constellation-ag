@@ -6,6 +6,7 @@ version = 4
 name = "ag-app"
 version = "0.1.0"
 dependencies = [
+ "ag-build-info",
  "ag-campaign",
  "ag-effect",
  "ag-kernel",
@@ -35,6 +36,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "ag-build-info"
+version = "0.1.0"
 
 [[package]]
 name = "ag-campaign"
@@ -87,6 +92,7 @@ dependencies = [
 name = "ag-operator-ui"
 version = "0.1.0"
 dependencies = [
+ "ag-build-info",
  "ag-campaign",
  "ag-primitives",
  "ag-store",

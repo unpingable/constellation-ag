@@ -25,7 +25,6 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-standing-resolver",
-    version,
     about = "Canonical AG standing authority over a local read-only mandate store"
 )]
 struct Arguments {
@@ -41,6 +40,9 @@ struct Arguments {
 }
 
 fn main() -> anyhow::Result<()> {
+    if ag_build_info::answer_identity_request("ag-standing-resolver")? {
+        return Ok(());
+    }
     let arguments = Arguments::parse();
     let config = StandingResolverConfigV1 {
         resolver_id: arguments.resolver_id,

@@ -45,7 +45,6 @@ use sha2::{Digest as _, Sha256};
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-loopctl",
-    version,
     about = "Canonical AG exact-occurrence governed-loop controller"
 )]
 struct Arguments {
@@ -596,6 +595,9 @@ fn v2_startup_disposition(
 }
 
 fn main() -> anyhow::Result<()> {
+    if ag_build_info::answer_identity_request("ag-loopctl")? {
+        return Ok(());
+    }
     let arguments = Arguments::parse();
     let now = now_unix_ms;
     match arguments.command {
