@@ -233,9 +233,9 @@ def third_party(tree_output: str, vendor: pathlib.Path) -> tuple[list[dict[str, 
         if any(crate == name for crate, _ in crates):
             raise Refusal(f"shipped dependency graph contains forbidden crate {name}")
     listing = [{"name": n, "version": v, "license": licence} for (n, v), licence in sorted(crates.items())]
-    text = ("Third-party Rust crates statically linked into the AG release executables.\n"
-            "Each crate's license text is in its published source; this list is generated\n"
-            "from `cargo tree` over the shipped packages at the source commit.\n\n"
+    text = ("Third-party Rust crates in the build graph (normal and build dependencies) of the\n"
+            "AG release executables. Each crate's license text is in its published source;\n"
+            "this list is generated from `cargo tree` over the shipped packages.\n\n"
             + "".join(f"{item['name']} {item['version']}: {item['license']}\n" for item in listing))
     return listing, text
 
