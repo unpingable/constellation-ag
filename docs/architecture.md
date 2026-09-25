@@ -1,5 +1,11 @@
 # AG-ng implementation contract
 
+Status: **earlier daemon line**. The `agd`, `ag-effectd`, `ag-providerd`, and
+`agctl` services described here are the earlier daemon line packaged by
+`debian/`. They are not the surface qualified in the 0.1.0-alpha.6 composed
+profile, which used `ag-loopctl` and `ag-operator-ui`; those are not packaged.
+See the [main-branch guide](public-guide.md) for the current path.
+
 ## Constitutional boundary
 
 `agd` may judge but may not mutate governed targets. `ag-providerd` may hold

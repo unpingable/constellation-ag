@@ -76,10 +76,11 @@ selected integration guide.
 For bounded continuation, [run input V2](../crates/ag-app/FINITE_CONTINUATION_V2.md)
 retains a finite sequence of occurrence-bound materials across restart. It does
 not acquire new observations or create another permission automatically. Its
-component tests have passed; qualification of the complete reviewed-plan
-workflow through the real reviewer, Nightshift, AG, Docket and executor is still
-in progress. The presence of these commands is not a completed integration
-recipe or a production-readiness claim.
+component tests have passed, and the complete reviewed-plan workflow through
+the real reviewer, Nightshift, AG, Docket and executor was qualified for one
+`reviewed-local-copy/v1` occurrence in 0.1.0-alpha.6. That is a qualified
+occurrence, not an installable deployment. The presence of these commands is
+not a completed integration recipe or a production-readiness claim.
 
 The daemon-oriented `agctl` surface is separately role-scoped. Its proposer
 profile can submit intent, while its effect-admin profile can inspect and

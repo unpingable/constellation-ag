@@ -1,5 +1,11 @@
 # Coherent three-store backup and restore
 
+Status: **earlier daemon line**. The `agd`, `ag-effectd`, `ag-providerd`, and
+`agctl` services described here are the earlier daemon line packaged by
+`debian/`. They are not the surface qualified in the 0.1.0-alpha.6 composed
+profile, which used `ag-loopctl` and `ag-operator-ui`; those are not packaged.
+See the [main-branch guide](public-guide.md) for the current path.
+
 An agd database backup, an effectd database backup, and a providerd database
 backup taken independently are not a system backup. A supported backup is one
 sealed `BackupCutV1` that proves those component states jointly existed behind
