@@ -19,7 +19,9 @@ image with only the three fixed options. It accepts no argv and passes an empty 
 mandate-store pathname remains mutable authority state and is deliberately not
 hashed; the canonical resolver rereads it for each request.
 
-The launcher uses an absolute Python shebang with isolated `-I` startup.
+The launcher uses an absolute Python shebang with isolated `-IS` startup:
+no user or system site directory and no `.pth` hooks, only the standard
+library.
 Enrollment records the exact
 interpreter hash, and deployment must verify it before AG profile sealing.
 Runtime relies on the deployed interpreter and its standard library remaining

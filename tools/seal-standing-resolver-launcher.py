@@ -85,7 +85,7 @@ def load(path):
 
 def launcher_bytes(value):
     embedded = repr({key: value[key] for key in sorted(value)})
-    source = f'''#!{value["python_interpreter"]} -I
+    source = f'''#!{value["python_interpreter"]} -IS
 import fcntl,hashlib,os,stat,sys
 C={embedded}
 if len(sys.argv)!=1:

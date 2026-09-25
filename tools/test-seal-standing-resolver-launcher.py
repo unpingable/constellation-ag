@@ -45,7 +45,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(b"len(sys.argv)!=1", output)
         self.assertIn(b"--mandate-store", output)
         self.assertIn(b"F_ADD_SEALS", output)
-        self.assertTrue(output.splitlines()[0].endswith(b" -I"))
+        self.assertTrue(output.splitlines()[0].endswith(b" -IS"))
         self.assertNotIn(b"os.environ", output)
 
     def test_changed_resolver_is_refused_before_seal(self):
