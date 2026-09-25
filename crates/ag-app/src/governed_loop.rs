@@ -469,6 +469,12 @@ pub enum CampaignEngineErrorV1 {
     /// Protected owner validation or verification boundary failed.
     #[error(transparent)]
     SharedPort(#[from] crate::governed_ports::GovernedPortErrorV1),
+    /// The retained issuance has passed its signed not-after, or is a
+    /// historical issuance without one. AG does not present it to Docket and
+    /// never remints it; Docket independently refuses it at the effect
+    /// boundary.
+    #[error("retained AG issuance is not current for dispatch (not-after passed or absent)")]
+    IssuanceNotCurrent,
 }
 
 /// One production-reachable canonical campaign engine.
@@ -1521,6 +1527,11 @@ impl CampaignEngineV1 {
             .issuance()
             .cloned()
             .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+        // Early refusal only: Docket enforces the signed not-after at its own
+        // effect boundary with its own clock. Retry never refreshes it.
+        if !issuance.is_current_at(now_unix_ms) {
+            return Err(CampaignEngineErrorV1::IssuanceNotCurrent);
+        }
         let custody = docket.accept_issuance(&issuance)?;
         let successor = GovernedLoopKernelV1::accept_docket_custody(&current, custody)?;
         self.store.commit(

@@ -161,6 +161,15 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     .unwrap();
     let work = plan.identity().unwrap();
 
+    // Docket enforces the signed issuance not-after with its own clock, so
+    // this cross-process scenario runs on wall-clock time.
+    let t0 = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     let campaign = CampaignId::from_digest(digest("campaign"));
     let occurrence = OccurrenceId::from_uuid(Uuid::from_u128(1));
     let database = root.path().join("ag-campaign.sqlite");
@@ -179,7 +188,7 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             escalation_limit: 1,
             escalations_used: 0,
         },
-        1,
+        t0 + 1,
     )
     .unwrap();
     let proposal = ExactWorkProposalV1::new(
@@ -212,10 +221,10 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             ProposalClassV1::Initial,
             &mut observation,
             OBSERVATION_RESOLVER_ID,
-            2,
+            t0 + 2,
         )
         .unwrap();
-    engine.require_standing(3).unwrap();
+    engine.require_standing(t0 + 3).unwrap();
     engine
         .decide(
             &mut observation,
@@ -225,7 +234,7 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             OBSERVATION_RESOLVER_ID,
             STANDING_RESOLVER_ID,
             MAX_STANDING_TTL_MS,
-            4,
+            t0 + 4,
         )
         .unwrap();
     engine
@@ -237,7 +246,7 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             OBSERVATION_RESOLVER_ID,
             STANDING_RESOLVER_ID,
             MAX_STANDING_TTL_MS,
-            5,
+            t0 + 5,
         )
         .unwrap();
 
@@ -275,9 +284,10 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
         signer,
     );
 
-    let dispatched = engine.dispatch(&mut custody, 6).unwrap();
+    let dispatched = engine.dispatch(&mut custody, t0 + 6).unwrap();
     assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
-    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut custody, 7).unwrap() else {
+    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut custody, t0 + 7).unwrap()
+    else {
         panic!("Docket must return its exact terminal executor settlement")
     };
     assert_eq!(
@@ -294,7 +304,7 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
 
     std::fs::write(&target_path, b"must-not-run-again\n").unwrap();
     assert!(matches!(
-        engine.poll_docket(&mut custody, 8).unwrap(),
+        engine.poll_docket(&mut custody, t0 + 8).unwrap(),
         DocketProgressV1::Settled(_)
     ));
     assert_eq!(

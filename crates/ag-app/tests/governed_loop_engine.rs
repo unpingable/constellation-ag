@@ -3962,3 +3962,112 @@ fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
         assert_eq!(engine.replay().unwrap().ag_spends, 1, "stage {}", index + 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Effect-time warrant: AG never presents an issuance past its signed not-after
+
+#[test]
+fn issuance_before_not_after_is_presented_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let spent = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let issuance = spent.issuance().unwrap();
+    assert_eq!(issuance.schema, AG_ISSUANCE_SCHEMA_V2);
+    // Spent at NOW + 4; both fixture premises last 1_000 ms from that clock.
+    let not_after = issuance.not_after_unix_ms.unwrap();
+    assert_eq!(not_after, NOW + 4 + 1_000);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, not_after - 1).unwrap();
+    assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
+    assert_eq!(docket.accept_calls(), 1);
+}
+
+#[test]
+fn expired_issuance_after_restart_is_refused_typed_never_presented_or_refreshed() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let spent = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let issuance = spent.issuance().unwrap().clone();
+    let not_after = issuance.not_after_unix_ms.unwrap();
+    // Crash after the spend, before Docket saw the issuance.
+    drop(engine);
+
+    let mut recovered = CampaignEngineV1::open(&database).unwrap();
+    let mut docket = FakeDocket::default();
+    // Recovery reconciles read-only and returns the identical retained issuance.
+    let CampaignRecoveryV1::IssuanceNotAccepted(retained) =
+        recovered.recover(&mut docket, not_after).unwrap()
+    else {
+        panic!("an unseen issuance must recover as not accepted")
+    };
+    assert_eq!(retained, issuance);
+    for now in [not_after, not_after + 1, not_after + 3_600_000] {
+        assert!(matches!(
+            recovered.dispatch(&mut docket, now),
+            Err(CampaignEngineErrorV1::IssuanceNotCurrent)
+        ));
+    }
+    assert_eq!(docket.accept_calls(), 0, "Docket must never see it");
+    // Retry refreshes nothing: same issuance, same state, one spend, and no
+    // path re-mints a replacement authorization.
+    let current = recovered.current().unwrap();
+    assert_eq!(
+        current.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
+    assert_eq!(current.issuance().unwrap(), &issuance);
+    assert!(
+        recovered
+            .authorize(
+                &mut observation,
+                &mut standing,
+                &catalog(),
+                None,
+                OBSERVATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                not_after + 2,
+            )
+            .is_err()
+    );
+    assert_eq!(recovered.replay().unwrap().ag_spends, 1);
+    assert_eq!(recovered.replay().unwrap().docket_attempts, 0);
+}
+
+#[test]
+fn custody_accepted_before_not_after_still_reconciles_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let spent = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let issuance = spent.issuance().unwrap().clone();
+    let not_after = issuance.not_after_unix_ms.unwrap();
+    let mut docket = FakeDocket::default();
+    docket.set_panic_after_accept();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _ = engine.dispatch(&mut docket, NOW + 5);
+        }))
+        .is_err()
+    );
+    drop(engine);
+    // Expiry bounds when an effect may begin, not when its facts may be read.
+    let mut recovered = CampaignEngineV1::open(&database).unwrap();
+    let CampaignRecoveryV1::Advanced(reconciling) =
+        recovered.recover(&mut docket, not_after + 60_000).unwrap()
+    else {
+        panic!("known custody must advance recovery after expiry")
+    };
+    assert_eq!(
+        reconciling.program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+    assert_eq!(docket.accept_calls(), 1);
+}

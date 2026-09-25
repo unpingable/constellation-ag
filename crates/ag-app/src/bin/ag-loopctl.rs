@@ -1336,13 +1336,16 @@ fn run_finite(
                         let mut docket =
                             docket_custody_from_profile(&profile, &material.executor_config)?
                                 .with_deadline(deadline_unix_ms);
-                        if engine.dispatch(&mut docket, now_unix_ms).is_err() {
-                            let status = terminal(
-                                "waiting",
-                                "docket_acceptance_indeterminate",
-                                steps,
-                                polls,
-                            );
+                        if let Err(error) = engine.dispatch(&mut docket, now_unix_ms) {
+                            // An expired issuance is never re-presented or
+                            // reminted; it stays a distinct, non-effecting wait.
+                            let reason =
+                                if matches!(error, CampaignEngineErrorV1::IssuanceNotCurrent) {
+                                    "issuance_not_current"
+                                } else {
+                                    "docket_acceptance_indeterminate"
+                                };
+                            let status = terminal("waiting", reason, steps, polls);
                             engine.record_run_observation(
                                 &run_id,
                                 &status,
