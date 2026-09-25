@@ -421,6 +421,10 @@ fn exact_submission_is_inspectable_restart_safe_and_idempotent() {
         nightshift: None,
         docket: None,
         maude_acquisition: None,
+        maude_objective: None,
+        objective_owner_projection: None,
+        public_objective_projection: None,
+        public_approved_receipt_urls: std::collections::BTreeSet::new(),
     })
     .unwrap();
     let detail = reader

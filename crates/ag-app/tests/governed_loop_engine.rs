@@ -772,6 +772,7 @@ fn operator_detail(
         },
         nightshift: Vec::new(),
         authoring_contexts: Vec::new(),
+        precompiled_workflow_lineage: Vec::new(),
         authoring_custody: Vec::new(),
         external_observations: Vec::new(),
         observation_acquisitions: Vec::new(),
@@ -1325,6 +1326,7 @@ fn build_operator_demo_corpus() -> DemoCorpusV1 {
         index,
         campaigns,
         semantic_link_targets,
+        objectives: Vec::new(),
     }
 }
 

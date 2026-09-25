@@ -240,6 +240,10 @@ fn profile_seal_reopen_inspect_and_missing_custody_fail_closed() {
         nightshift: None,
         docket: None,
         maude_acquisition: None,
+        maude_objective: None,
+        objective_owner_projection: None,
+        public_objective_projection: None,
+        public_approved_receipt_urls: std::collections::BTreeSet::new(),
     })
     .unwrap();
     let index = reader.campaign_index().unwrap();
