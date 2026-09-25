@@ -49,8 +49,12 @@ pub const OBSERVATION_RESOLUTION_SCHEMA_V3: &str = "ag.governed-loop.observation
 pub const TYPED_OBSERVATION_BASIS_SCHEMA_V1: &str = "ag.governed-loop.typed-observation-basis/v1";
 /// Wire schema for current standing resolutions.
 pub const STANDING_RESOLUTION_SCHEMA_V2: &str = "ag.governed-loop.standing-resolution/v2";
-/// Wire schema for AG issuances.
+/// Historical wire schema for AG issuances (alpha.6 and earlier). It carries
+/// no not-after; it remains verifiable as retained evidence but is never
+/// produced by a new spend and is not dispatchable.
 pub const AG_ISSUANCE_SCHEMA_V1: &str = "ag.governed-loop.issuance/v1";
+/// Wire schema for AG issuances that carry a signed, exclusive not-after.
+pub const AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.issuance/v2";
 /// Wire schema for Docket custody records.
 pub const DOCKET_CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 /// Wire schema for Docket settlements.
@@ -66,6 +70,7 @@ const PROPOSAL_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.proposal/v1";
 const AG_AUTHORIZATION_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.authorization/v1";
 const AG_SPEND_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.spend/v1";
 const AG_ISSUANCE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.issuance/v1";
+const AG_ISSUANCE_DIGEST_DOMAIN_V2: &str = "ag.governed-loop.issuance/v2";
 const GOVERNED_INTERVENTION_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.intervention-request/v1";
 
 fn digest_value<T: Serialize + ?Sized>(domain: &str, value: &T) -> Digest {
@@ -1060,6 +1065,58 @@ pub struct AgIssuanceV1 {
     pub mandate: MandateRefV1,
     /// Exact AG spend.
     pub spend: AgSpendRefV1,
+    /// Exclusive not-after of the effect this issuance permits (v2 only).
+    ///
+    /// Equal to `min(standing.expires_at, observation.fresh_until)` of the
+    /// consequence-time resolutions used at spend, so the issuance never
+    /// outlives either premise. It is part of the identity digest and of the
+    /// signed body. Absent only on retained historical v1 issuances, which
+    /// are evidence and never dispatchable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after_unix_ms: Option<u64>,
+}
+
+impl AgIssuanceV1 {
+    /// Recomputes the canonical identity digest from the carried fields under
+    /// the carried schema. This is the verification law shared with Docket:
+    /// v1 hashes the eleven-field body under `ag.governed-loop.issuance/v1`;
+    /// v2 additionally commits `not_after_unix_ms` under
+    /// `ag.governed-loop.issuance/v2`. A v1 issuance carrying not-after, or a
+    /// v2 issuance without one, is not an issuance of either schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ForeignSchema` for any other schema or field combination.
+    pub fn expected_identity(&self) -> Result<AgIssuanceRefV1, KernelErrorV1> {
+        issuance_identity(
+            &self.schema,
+            &IssuanceBodyV1 {
+                key: &self.key,
+                program: &self.program,
+                proposal: &self.proposal,
+                work_schema: &self.work_schema,
+                work: &self.work,
+                subject: &self.subject,
+                scope: &self.scope,
+                observation: &self.observation,
+                standing_resolution: &self.standing_resolution,
+                mandate: &self.mandate,
+                spend: &self.spend,
+                not_after_unix_ms: self.not_after_unix_ms,
+            },
+        )
+    }
+
+    /// Returns whether the effect this issuance permits may still begin at
+    /// `now_unix_ms`. A historical issuance without not-after is never
+    /// current; expiry is exclusive (`now >= not_after` is expired).
+    #[must_use]
+    pub fn is_current_at(&self, now_unix_ms: u64) -> bool {
+        self.schema == AG_ISSUANCE_SCHEMA_V2
+            && self
+                .not_after_unix_ms
+                .is_some_and(|not_after| now_unix_ms < not_after)
+    }
 }
 
 /// Spent authorization state; only exact Docket custody/reconciliation is legal.
@@ -2452,7 +2509,7 @@ impl GovernedLoopKernelV1 {
             admission_decision: admitted.decision.decision.clone(),
             consumed_at_unix_ms: now_unix_ms,
         };
-        let issuance = build_issuance(&admitted, &spend_ref);
+        let issuance = build_issuance(&admitted, &spend_ref, AG_ISSUANCE_SCHEMA_V2)?;
         let state = OccurrenceStateV1::AuthorizationConsumed(AuthorizationConsumedV1 {
             admitted,
             spend,
@@ -3365,22 +3422,59 @@ where
     }
 }
 
-fn build_issuance(admitted: &AdmissibleBasisV1, spend: &AgSpendRefV1) -> AgIssuanceV1 {
-    #[derive(Serialize)]
-    struct IssuanceBody<'a> {
-        key: &'a OccurrenceKeyV1,
-        program: &'a ProgramBasisRefV1,
-        proposal: &'a ProposalRefV1,
-        work_schema: &'a str,
-        work: &'a Digest,
-        subject: &'a Digest,
-        scope: &'a Digest,
-        observation: &'a ObservationRefV1,
-        standing_resolution: &'a StandingResolutionRefV1,
-        mandate: &'a MandateRefV1,
-        spend: &'a AgSpendRefV1,
-    }
-    let basis = IssuanceBody {
+/// Exclusive not-after of an issuance minted from `admitted`: the earlier of
+/// the standing answer's expiry and the observation's freshness deadline.
+/// Both were checked against the spend clock, so `not_after > consumed_at`,
+/// and the standing window cap bounds it by `consumed_at + max_standing_ttl_ms`.
+fn issuance_not_after(admitted: &AdmissibleBasisV1) -> u64 {
+    admitted
+        .standing
+        .expires_at_unix_ms
+        .min(admitted.proposal.observation.fresh_until_unix_ms())
+}
+
+/// Canonical identity body of an AG issuance (every field but `schema` and
+/// `issuance`). JCS orders keys; `not_after_unix_ms` is omitted for v1.
+#[derive(Serialize)]
+struct IssuanceBodyV1<'a> {
+    key: &'a OccurrenceKeyV1,
+    program: &'a ProgramBasisRefV1,
+    proposal: &'a ProposalRefV1,
+    work_schema: &'a str,
+    work: &'a Digest,
+    subject: &'a Digest,
+    scope: &'a Digest,
+    observation: &'a ObservationRefV1,
+    standing_resolution: &'a StandingResolutionRefV1,
+    mandate: &'a MandateRefV1,
+    spend: &'a AgSpendRefV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_after_unix_ms: Option<u64>,
+}
+
+fn issuance_identity(
+    schema: &str,
+    body: &IssuanceBodyV1<'_>,
+) -> Result<AgIssuanceRefV1, KernelErrorV1> {
+    let domain = match (schema, body.not_after_unix_ms) {
+        (AG_ISSUANCE_SCHEMA_V1, None) => AG_ISSUANCE_DIGEST_DOMAIN_V1,
+        (AG_ISSUANCE_SCHEMA_V2, Some(_)) => AG_ISSUANCE_DIGEST_DOMAIN_V2,
+        _ => return Err(KernelErrorV1::ForeignSchema("AG issuance")),
+    };
+    Ok(AgIssuanceRefV1::from_digest(digest_value(domain, body)))
+}
+
+fn build_issuance(
+    admitted: &AdmissibleBasisV1,
+    spend: &AgSpendRefV1,
+    schema: &str,
+) -> Result<AgIssuanceV1, KernelErrorV1> {
+    let not_after = match schema {
+        AG_ISSUANCE_SCHEMA_V1 => None,
+        AG_ISSUANCE_SCHEMA_V2 => Some(issuance_not_after(admitted)),
+        _ => return Err(KernelErrorV1::ForeignSchema("AG issuance")),
+    };
+    let basis = IssuanceBodyV1 {
         key: admitted.proposal.meta.key(),
         program: admitted.proposal.meta.program(),
         proposal: &admitted.proposal.proposal_ref,
@@ -3392,10 +3486,11 @@ fn build_issuance(admitted: &AdmissibleBasisV1, spend: &AgSpendRefV1) -> AgIssua
         standing_resolution: &admitted.standing.resolution,
         mandate: &admitted.standing.mandate,
         spend,
+        not_after_unix_ms: not_after,
     };
-    let issuance = AgIssuanceRefV1::from_digest(digest_value(AG_ISSUANCE_DIGEST_DOMAIN_V1, &basis));
-    AgIssuanceV1 {
-        schema: AG_ISSUANCE_SCHEMA_V1.to_owned(),
+    let issuance = issuance_identity(schema, &basis)?;
+    Ok(AgIssuanceV1 {
+        schema: schema.to_owned(),
         issuance,
         key: basis.key.clone(),
         program: basis.program.clone(),
@@ -3408,7 +3503,8 @@ fn build_issuance(admitted: &AdmissibleBasisV1, spend: &AgSpendRefV1) -> AgIssua
         standing_resolution: basis.standing_resolution.clone(),
         mandate: basis.mandate.clone(),
         spend: basis.spend.clone(),
-    }
+        not_after_unix_ms: not_after,
+    })
 }
 
 fn validate_custody(
@@ -3973,7 +4069,10 @@ fn validate_authorized(value: &AuthorizationConsumedV1) -> Result<(), KernelErro
     {
         return Err(KernelErrorV1::StateInvariant("AG authorization spend"));
     }
-    let expected_issuance = build_issuance(&value.admitted, &value.spend.spend);
+    // Rebuild under the retained schema: historical v1 issuances stay
+    // verifiable as evidence; every new spend is v2.
+    let expected_issuance =
+        build_issuance(&value.admitted, &value.spend.spend, &value.issuance.schema)?;
     if value.issuance != expected_issuance {
         return Err(KernelErrorV1::StateInvariant("AG issuance"));
     }

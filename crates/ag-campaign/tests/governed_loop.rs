@@ -2486,3 +2486,136 @@ fn intervention_presence_does_not_change_ag_authorization_or_issuance_material()
     assert_eq!(with_intent.state().meta().budget().probes_used, 1);
     assert_eq!(plain.state().meta().budget().probes_used, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Effect-time warrant: signed issuance not-after (issuance v2)
+
+fn spend_with_standing(standing: &mut StandingBoundary) -> OccurrenceSnapshotV1 {
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &initial(),
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let standing_required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+    let mut decider = Decider::admit();
+    let admissible = GovernedLoopKernelV1::record_admissible(
+        &standing_required,
+        &mut observation,
+        standing,
+        &mut decider,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    GovernedLoopKernelV1::consume_authorization(
+        &admissible,
+        &mut observation,
+        standing,
+        &mut decider,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap()
+}
+
+#[test]
+fn issuance_not_after_is_the_earlier_consequence_time_premise_and_is_bounded() {
+    // The observation fixture is fresh for 1_000 ms from the spend clock.
+    for (window_ms, expected) in [
+        (400, NOW + 400),     // standing expires first
+        (1_000, NOW + 1_000), // equal
+        (5_000, NOW + 1_000), // observation freshness expires first
+    ] {
+        let mut standing = StandingBoundary::current();
+        standing.window_ms = window_ms;
+        let spent = spend_with_standing(&mut standing);
+        let issuance = spent.issuance().unwrap();
+        assert_eq!(issuance.schema, AG_ISSUANCE_SCHEMA_V2);
+        assert_eq!(issuance.not_after_unix_ms, Some(expected));
+        // Strictly after the spend clock and never beyond the standing cap.
+        assert!(expected > NOW && expected <= NOW + MAX_STANDING_TTL_MS);
+        assert_eq!(issuance.expected_identity().unwrap(), issuance.issuance);
+        // Exclusive expiry: before is current, at and after are not.
+        assert!(issuance.is_current_at(NOW));
+        assert!(issuance.is_current_at(expected - 1));
+        assert!(!issuance.is_current_at(expected));
+        assert!(!issuance.is_current_at(expected + 1));
+        spent.validate_integrity().unwrap();
+    }
+}
+
+#[test]
+fn issuance_not_after_is_committed_by_identity_and_state_integrity() {
+    let spent = spend_with_standing(&mut StandingBoundary::current());
+    let issuance = spent.issuance().unwrap().clone();
+
+    // Identity commits not-after: any other value is a different issuance.
+    let mut extended = issuance.clone();
+    extended.not_after_unix_ms = Some(issuance.not_after_unix_ms.unwrap() + 60_000);
+    assert_ne!(extended.expected_identity().unwrap(), issuance.issuance);
+
+    // Schema and field must agree; neither direction is a valid issuance.
+    let mut v2_without = issuance.clone();
+    v2_without.not_after_unix_ms = None;
+    assert!(v2_without.expected_identity().is_err());
+    assert!(!v2_without.is_current_at(NOW));
+    let mut v1_with = issuance.clone();
+    v1_with.schema = AG_ISSUANCE_SCHEMA_V1.to_owned();
+    assert!(v1_with.expected_identity().is_err());
+
+    // A stored state whose not-after was rewritten does not verify: the
+    // issuance is reconstructed from the admitted basis, never trusted.
+    let mut value = serde_json::to_value(&spent).unwrap();
+    let not_after = &mut value["state"]["authorization_consumed"]["issuance"]["not_after_unix_ms"];
+    assert!(not_after.is_u64());
+    *not_after = serde_json::json!(issuance.not_after_unix_ms.unwrap() + 60_000);
+    let tampered: OccurrenceSnapshotV1 = serde_json::from_value(value).unwrap();
+    assert!(tampered.validate_integrity().is_err());
+}
+
+#[test]
+fn issuance_not_after_survives_dispatch_and_is_never_refreshed_by_the_kernel() {
+    let spent = spend_with_standing(&mut StandingBoundary::current());
+    let before = spent.issuance().unwrap().clone();
+    let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
+    assert_eq!(dispatched.issuance().unwrap(), &before);
+    let reconciling = GovernedLoopKernelV1::recover_dispatched(&dispatched).unwrap();
+    assert_eq!(reconciling.issuance().unwrap(), &before);
+}
+
+/// Retained alpha.6 public evidence (unpingable-site
+/// `constellation/releases/0.1.0-alpha.6/evidence/objective.json`,
+/// `occurrences[0].detail.inspect.raw.current`). Historical v1 issuances stay
+/// verifiable as evidence; verification is not dispatch.
+#[test]
+fn retained_alpha6_v1_issuance_state_still_verifies_but_is_never_current() {
+    let bytes = include_bytes!("fixtures/alpha6-retained-settled-occurrence.json");
+    let snapshot: OccurrenceSnapshotV1 = serde_json::from_slice(bytes).unwrap();
+    snapshot.validate_integrity().unwrap();
+    assert_eq!(
+        snapshot.state_digest().as_str(),
+        "sha256:c6b6988c7d9af6bc8780bde466d675e2c2427bb20375e8e15db5a9975568b87d"
+    );
+    let issuance = snapshot.issuance().unwrap();
+    assert_eq!(issuance.schema, AG_ISSUANCE_SCHEMA_V1);
+    assert_eq!(issuance.not_after_unix_ms, None);
+    assert_eq!(
+        issuance.issuance.as_str(),
+        "sha256:2f33d498a0753457402c2afe99ec05da25dd9c425a0f53adddc01fed640013d9"
+    );
+    assert_eq!(issuance.expected_identity().unwrap(), issuance.issuance);
+    assert!(!issuance.is_current_at(0));
+    assert!(!issuance.is_current_at(u64::MAX));
+}
