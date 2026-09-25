@@ -120,6 +120,32 @@ launcher/credential injection boundary that exposes only the exact canonical
 command, not the key. Adding such a service protocol is outside this
 qualification campaign and must not become an alternate transition API.
 
+## Authority validity at the effect boundary
+
+Every effect boundary has an explicit authority-validity rule. Authority is not
+assumed valid merely because it was valid when acquired. A boundary may use
+live revalidation at the effect, a deliberately frozen or snapshot basis with a
+declared bound, exclusive custody with an atomic check-and-effect, or another
+explicitly defined bounded rule. It may not rely on an unbounded earlier
+answer.
+
+For the governed loop, AG re-resolves observation currentness and standing at
+its spend. The issuance it mints (`ag.governed-loop.issuance/v2`) carries a
+signed exclusive `not_after_unix_ms` equal to the earlier of the standing
+answer's `expires_at` and the observation's `fresh_until` from that spend.
+Because the standing answer window is capped by `max_standing_ttl_ms`, the
+not-after is at most `max_standing_ttl_ms` after the spend; no separate
+lifetime setting exists. AG does not present an issuance at or after its
+not-after (`ag-loopctl` reports `waiting` / `issuance_not_current`). Docket
+enforces it independently, with its own clock, immediately before custody and
+again immediately before `execute`, and bounds its own standing snapshot
+(see Docket `docs/governed-runtime/local-execution-standing.md`). Retry,
+restart and reconciliation never refresh the not-after, and AG never re-mints.
+An occurrence whose issuance expired before Docket custody stays
+`AuthorizationConsumed` without effect; recovery still reconciles it read-only
+with Docket. Revocation of a spent issuance is not implemented: a short
+not-after limits exposure but is not revocation.
+
 ## Restart matrix
 
 A restart recovers facts and never creates permission.
@@ -130,7 +156,7 @@ A restart recovers facts and never creates permission.
 | `ProposalRecorded` | exact proposal and observation reference | none | enter standing-required; then resolve fresh currentness/standing |
 | `StandingRequired` | proposal awaits live judgment | none | resolve fresh currentness, standing, and catalog admissibility |
 | `AdmissiblePendingAuthorization` | positive prior decision only | none | re-resolve every consequence-time premise before one spend |
-| `AuthorizationConsumed` | one spend and exact issuance | consumed historical spend only | present the same issuance to Docket or reconcile; never remint |
+| `AuthorizationConsumed` | one spend and exact issuance | consumed historical spend only; the issuance permits an effect only before its signed not-after | reconcile; present the same issuance to Docket only before its not-after; never remint or refresh |
 | `Dispatched` | exact accepted Docket attempt | no reusable authority | poll/reconcile the exact attempt; never dispatch mechanics again |
 | `ReconciliationRequired` | exact attempt has unknown outcome | no reusable authority | exact settlement, read-only probe, human disposition, or halt |
 | `SettledObservationRequired` | durable exact receipt/settlement | no successor authority | fresh independent Nightshift cycle before a distinct occurrence |
@@ -145,7 +171,8 @@ restart cannot reopen them into an authority-bearing state.
   failure leaves no spend and no execution attempt. Reevaluation is allowed.
 - The spend and exact issuance commit atomically. A crash after that commit but
   before Docket custody leaves the spend consumed. Recovery presents the same
-  issuance; it does not create a replacement.
+  issuance only before its signed not-after; it does not create a replacement
+  or extend the not-after.
 - Once Docket has accepted an attempt, a missing or delayed receipt means the
   effect may have occurred. Repeat dispatch is forbidden. Exact polling or
   reconciliation is mandatory.

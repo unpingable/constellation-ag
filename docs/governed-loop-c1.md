@@ -62,6 +62,19 @@ at the consequence boundary. `authorize` atomically commits the one-use spend
 and exact Docket issuance before any dispatch. A spend cannot return to an
 unconsumed state and no recovery API constructs one.
 
+The issuance is `ag.governed-loop.issuance/v2`. Its identity digest (domain
+`ag.governed-loop.issuance/v2`) and signed body commit `not_after_unix_ms =
+min(standing.expires_at, observation.fresh_until)` from the spend's own
+resolutions, so the issuance cannot outlive either premise. Expiry is
+exclusive: an effect may begin only while `now < not_after`. The state
+integrity check rebuilds the issuance from the admitted basis, so a stored
+not-after cannot be rewritten. Historical `ag.governed-loop.issuance/v1`
+records (alpha.6 and earlier) carry no not-after; they still verify as
+retained evidence and are never dispatchable. The shared identity, canonical
+bytes and signature law is pinned by
+`conformance/governed-loop-issuance/v2-vectors.json`, which Docket mirrors byte
+for byte.
+
 ## Versioned observation-basis boundary
 
 Nightshift's historical `ag.governed-loop.observation-resolution/v2` wire and
@@ -146,7 +159,7 @@ authority or a transition by itself.
 | Last durable boundary | Meaning after restart | Legal next step |
 |---|---|---|
 | before spend | no authorization exists | repeat the read-only gate evaluation |
-| `AuthorizationConsumed` before custody | spend is historical; outcome not inferred | present the same issuance to Docket or reconcile it |
+| `AuthorizationConsumed` before custody | spend is historical; outcome not inferred | reconcile it; present the same issuance to Docket only before its not-after |
 | `Dispatched` without settlement | effect may have occurred | reconcile the exact issuance/attempt; never repeat mechanics |
 | `ReconciliationRequired` | consumed but outcome unknown | exact read-only attempt reconciliation request, typed human disposition after safe halt, or safe halt; never repeat dispatch |
 | `SettledObservationRequired` | receipt is durable, posture is not inferred | obtain a fresh qualified observation |
