@@ -78,12 +78,15 @@ CASES = [
     ("R-03", "refusal: wrong interpreter hash (and wrong resolver hash) refused by the sealer; nothing written"),
     ("R-04", "refusal: issuance past not-after never presented by AG; Docket refuses it directly as governed-issuance-expired"),
     ("U-01", "operator-ui: release ag-operator-ui serves the settled campaign on loopback only, read-only"),
+    ("K-01", "keyless: read-only commands reproduce V1 and V2 state without the issuer private key; tampered trust "
+             "or state refused; an absent enrolled file reported unavailable (exit 3); mutating commands still refuse"),
     ("P-01", "packaging: a corrupted tarball fails its checksum"),
 ]
 GUEST_CASES = {
     "S-01": "ports", "S-02": "python-origin", "S-03": "profile", "S-04": "v2-profile", "L-01": "spend",
     "L-02": "docket-view", "L-03": "issuance-law", "L-04": "join", "R-01": "refuse-profile",
     "R-02": "refuse-launcher", "R-03": "refuse-interpreter", "R-04": "expired", "U-01": "operator-ui",
+    "K-01": "keyless-inspect",
 }
 
 
@@ -468,11 +471,13 @@ users:
             for cid, fn in (("I-04", self.i04), ("I-05", self.i05), ("I-06", self.i06)):
                 self.case(cid, fn)
             order = ["S-01", "S-02", "S-03", "S-04", "L-01", "L-02", "L-03", "L-04",
-                     "R-01", "R-02", "R-03", "R-04", "U-01"]
+                     "R-01", "R-02", "R-03", "R-04", "U-01", "K-01"]
             for cid in order:
                 if cid != "S-01" and self.results["S-01"]["outcome"] != "PASS":
                     break
-                if cid in ("L-02", "L-03", "L-04", "U-01") and self.results["L-01"]["outcome"] != "PASS":
+                if cid in ("L-02", "L-03", "L-04", "U-01", "K-01") and self.results["L-01"]["outcome"] != "PASS":
+                    continue
+                if cid == "K-01" and self.results["S-04"]["outcome"] != "PASS":
                     continue
                 self.case(cid, self.guest_case, GUEST_CASES[cid])
             self.case("P-01", self.p01)

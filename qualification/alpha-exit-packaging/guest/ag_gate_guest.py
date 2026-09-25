@@ -762,11 +762,93 @@ def case_operator_ui(ctx: Ctx) -> dict:
     return {"non_loopback": refused[2].decode().strip()[-120:], "index": body, "post_status": posted}
 
 
+READ_ONLY_COMMANDS = ("inspect", "replay", "history", "status", "refusals")
+
+
+def read_only_outputs(ctx: Ctx, database: pathlib.Path) -> dict:
+    return {command: ctx.call([ctx.loopctl, command, "--database", database]) for command in READ_ONLY_COMMANDS}
+
+
+def case_keyless_inspect(ctx: Ctx) -> dict:
+    """G3 D-1: read-only commands verify V1 and V2 campaigns without the issuer private key."""
+    key = ctx.ports / "issuer.pk8"
+    aside = ctx.root / "issuer.pk8.withheld"
+    v2 = ctx.root / "v2"
+    databases = {"v1-settled": ctx.work / "main/ag.sqlite", "v2": v2 / "ag.sqlite"}
+    baseline = {}
+    for label, database in databases.items():
+        outputs = read_only_outputs(ctx, database)
+        for command, (code, out, err) in outputs.items():
+            expect(code == 0 and out and not err, f"{label} {command} with the key: exit {code}: {err[-300:]!r}")
+        baseline[label] = {command: out for command, (_, out, _) in outputs.items()}
+    digests = {label: json.loads(out["inspect"])["current"]["state_digest"] for label, out in baseline.items()}
+    observed: dict = {"state_digest": digests}
+    os.rename(key, aside)
+    try:
+        expect(not key.exists(), "issuer key still present")
+        for label, database in databases.items():
+            for command, (code, out, err) in read_only_outputs(ctx, database).items():
+                expect(code == 0 and out == baseline[label][command] and not err,
+                       f"keyless {label} {command}: exit {code}: {err[-300:]!r}")
+        observed["keyless_reads"] = {label: list(READ_ONLY_COMMANDS) for label in databases}
+        # Mutating and live-verification paths still require the key.
+        refusals = {}
+        for name, argv in (("require-standing", ["require-standing", "--database", databases["v2"]]),
+                           ("verify-runtime-profile-v2", ["verify-runtime-profile-v2", "--runtime-profile",
+                                                          v2 / "runtime-profile.json"])):
+            code, _, err = ctx.call([ctx.loopctl, *argv])
+            expect(code != 0 and b"No such file" in err, f"{name} without the key: exit {code}: {err[-300:]!r}")
+            refusals[name] = err.decode().strip()[-160:]
+        observed["mutating_refused_without_key"] = refusals
+        # Tampered public issuer material refuses as a mismatch.
+        trust = ctx.ports / "docket-trust.json"
+        original = trust.read_bytes()
+        tampered = json.loads(original)
+        tampered["issuers"][0]["public_key"] = base64.urlsafe_b64encode(bytes(32)).rstrip(b"=").decode()
+        trust.write_bytes(canonical(tampered))
+        try:
+            for command, (code, out, err) in read_only_outputs(ctx, databases["v2"]).items():
+                expect(code == 1 and not out and b"pinned file identity changed" in err,
+                       f"tampered trust {command}: exit {code}: {err[-300:]!r}")
+        finally:
+            trust.write_bytes(original)
+        observed["tampered_trust"] = "refused (exit 1, pinned file identity changed)"
+        # Tampered state refuses.
+        copy = v2 / "tampered.sqlite"
+        body = databases["v2"].read_bytes()
+        program = label_digest("program-v2").encode()
+        expect(program in body, "program digest not found in the V2 store")
+        copy.write_bytes(body.replace(program, label_digest("program-tampered").encode()))
+        for command, (code, out, err) in read_only_outputs(ctx, copy).items():
+            expect(code == 1 and not out, f"tampered state {command}: exit {code}: {err[-300:]!r}")
+        observed["tampered_state"] = err.decode().strip()[-160:]
+        # An absent enrolled file is reported typed; the read still verifies the rest.
+        validator = v2 / "plan-validator"
+        withheld = v2 / "plan-validator.withheld"
+        os.rename(validator, withheld)
+        try:
+            for command, (code, out, err) in read_only_outputs(ctx, databases["v2"]).items():
+                expect(code == 3 and out == baseline["v2"][command], f"unavailable {command}: exit {code}: {err[-300:]!r}")
+                prefix = b"enrolled file unavailable: "
+                expect(err.startswith(prefix), f"untyped diagnostic: {err[-300:]!r}")
+                report = json.loads(err[len(prefix):])
+                expect(report["schema"] == "ag.governed-loop.read-only-verification/v1"
+                       and report["status"] == "enrolled-file-unavailable"
+                       and [entry["path"] for entry in report["unavailable"]] == [str(validator)],
+                       f"unavailable report {report}")
+        finally:
+            os.rename(withheld, validator)
+        observed["unavailable_report"] = report
+    finally:
+        os.rename(aside, key)
+    return observed
+
+
 CASES = {
     "ports": case_ports, "profile": case_profile, "spend": case_spend, "docket-view": case_docket_view,
     "issuance-law": case_issuance_law, "expired": case_expired, "refuse-profile": case_refuse_profile,
     "refuse-launcher": case_refuse_launcher, "refuse-interpreter": case_refuse_interpreter, "v2-profile": case_v2_profile, "join": case_join,
-    "python-origin": case_python_origin, "operator-ui": case_operator_ui,
+    "python-origin": case_python_origin, "operator-ui": case_operator_ui, "keyless-inspect": case_keyless_inspect,
 }
 
 
