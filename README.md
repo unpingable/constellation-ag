@@ -143,3 +143,7 @@ Phosphor-ng is the read-only browser and terminal renderer for retained
 investigations. It renders posture, evidence, boundaries, and custody without
 granting authority or replacing owner interpretation. See the local
 [Operational ECAD journey](/data/git/operational-ecad/README.md).
+
+## Beta work planning
+
+See the [current beta work plan](docs/BETA-WORK.md) for owned requirements, exclusions, dependencies and GitHub issues. Plan publication does not start implementation or transfer qualification.
