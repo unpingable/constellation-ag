@@ -1,4 +1,4 @@
-//! Authority-neutral exact-effect adapter for Docket-custodied attempts.
+//! Exact-effect adapter for already-authorized, Docket-custodied attempts.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use ag_app::effect_executor_adapter::{
     audit_systemd_effect_store_cut, execute_effect_attempt, execute_systemd_effect_attempt,
     load_effect_executor_plan_any, reconcile_effect_attempt, reconcile_systemd_effect_attempt,
+    verify_authorized_dispatch_v2, verify_plan_deployment_v2, AuthorizedEffectDispatchV2,
     EffectExecutorDispatchV1, LoadedEffectExecutorPlan, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
 };
 use ag_primitives::JcsDocument;
@@ -17,7 +18,7 @@ use serde::de::DeserializeOwned;
 #[command(
     name = "ag-effectd",
     version,
-    about = "Authority-neutral Docket exact-effect adapter"
+    about = "Docket-custodied exact-effect adapter"
 )]
 struct Arguments {
     #[command(subcommand)]
@@ -62,11 +63,24 @@ fn main() -> anyhow::Result<()> {
     match arguments.command {
         Command::PlanId { plan } => {
             let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
+            if let LoadedEffectExecutorPlan::V1(inner) = &plan {
+                verify_plan_deployment_v2(inner).map_err(anyhow::Error::msg)?;
+            }
             println!("{}", plan.identity().map_err(anyhow::Error::msg)?);
         }
         Command::Execute { plan } => {
             let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
-            let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
+            let dispatch: EffectExecutorDispatchV1 = match &plan {
+                LoadedEffectExecutorPlan::V1(inner) => {
+                    if inner.authorization.is_none() {
+                        anyhow::bail!("effect-executor-v1-execute-not-current");
+                    }
+                    let authorized: AuthorizedEffectDispatchV2 = read_stdin_strict()?;
+                    verify_authorized_dispatch_v2(inner, &authorized, "execute")
+                        .map_err(anyhow::Error::msg)?
+                }
+                LoadedEffectExecutorPlan::SystemdV2(_) => read_stdin_strict()?,
+            };
             let outcome = match &plan {
                 LoadedEffectExecutorPlan::V1(plan) => execute_effect_attempt(plan, &dispatch),
                 LoadedEffectExecutorPlan::SystemdV2(plan) => {
@@ -78,7 +92,14 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Reconcile { plan } => {
             let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
-            let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
+            let dispatch: EffectExecutorDispatchV1 = match &plan {
+                LoadedEffectExecutorPlan::V1(inner) if inner.authorization.is_some() => {
+                    let authorized: AuthorizedEffectDispatchV2 = read_stdin_strict()?;
+                    verify_authorized_dispatch_v2(inner, &authorized, "reconcile")
+                        .map_err(anyhow::Error::msg)?
+                }
+                _ => read_stdin_strict()?,
+            };
             let outcome = match &plan {
                 LoadedEffectExecutorPlan::V1(plan) => reconcile_effect_attempt(plan, &dispatch),
                 LoadedEffectExecutorPlan::SystemdV2(plan) => {

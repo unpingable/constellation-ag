@@ -1428,7 +1428,7 @@ fn assert_demo_semantic_links(corpus: &DemoCorpusV1, reader: &OperatorReaderV1) 
         };
         let detail = reader.campaign_detail_for_link(&link).unwrap();
         render::campaign_detail_for_link_with_context(&detail, reader.mode_label(), &link)
-            .contains("historical occurrence")
+            .contains("historical run")
     }));
     let historical = corpus
         .semantic_link_targets
@@ -1775,7 +1775,7 @@ fn operator_views_render_every_canonical_counter_from_real_persisted_history() {
             }
             ProgramCounterV1::Dispatched => {
                 assert!(html.contains("outcome unknown"));
-                assert!(html.contains("Absence of a receipt is not failure"));
+                assert!(html.contains("A missing receipt is not a failure result"));
             }
             ProgramCounterV1::ReconciliationRequired => {
                 assert!(html.contains("Repeat dispatch is not authorized"));
@@ -1870,6 +1870,31 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     );
     assert_eq!(engine.current().unwrap(), before);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn standing_revocation_after_spend_is_prospective_and_preserves_exact_issuance() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let spent = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let spend = spent.ag_spend().unwrap().clone();
+    let issuance = spent.issuance().unwrap().clone();
+
+    // A later standing change governs future spends. The already committed
+    // exact spend and issuance remain the historical dispatch basis.
+    standing.status = StandingStatusV1::Revoked;
+    standing.available = false;
+    assert_eq!(standing.status, StandingStatusV1::Revoked);
+
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
+    assert_eq!(dispatched.ag_spend(), Some(&spend));
+    assert_eq!(dispatched.issuance(), Some(&issuance));
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+    assert_eq!(docket.accept_calls(), 1);
 }
 
 #[test]

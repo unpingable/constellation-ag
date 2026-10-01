@@ -62,6 +62,16 @@ at the consequence boundary. `authorize` atomically commits the one-use spend
 and exact Docket issuance before any dispatch. A spend cannot return to an
 unconsumed state and no recovery API constructs one.
 
+Authorization is evaluated against current observation, policy, and standing
+immediately before that one-use spend. Once the exact authorization spend and
+issuance are durably committed, later revocation is prospective: it prevents
+new authorization spends but does not retroactively erase or silently cancel
+the already-issued occurrence. The committed spend remains historical
+authorization evidence; it is not current standing and does not make successor
+work currently admissible. Successor work still requires its own fresh
+observation, current standing, policy decision, and authorization spend. This
+boundary does not claim instantaneous remote revocation without communication.
+
 ## Versioned observation-basis boundary
 
 Nightshift's historical `ag.governed-loop.observation-resolution/v2` wire and
@@ -208,6 +218,7 @@ timing assumptions.
 | 24 | typed basis/type/resolver substitution | `typed_v3_basis_type_identity_and_resolver_substitution_fail_closed`; `exact_typed_catalog_rejects_consistent_type_or_identity_substitution` |
 | 25 | typed unsupported/refused/stale evidence | `typed_v3_negative_support_statuses_stop_before_standing_or_policy` |
 | 26 | typed occurrence/work/replay | `typed_basis_cannot_bypass_the_occurrence_work_binding`; `typed_v3_authorization_is_one_use_for_one_occurrence`; `exact_typed_basis_catalog_admits_and_spends_once_without_atoms` |
+| 27 | standing revoked after durable spend | `standing_revocation_after_spend_is_prospective_and_preserves_exact_issuance` |
 
 The mechanical gate `scripts/check-governed-loop-authority-surface.sh` also
 fails if spend construction leaves the pure kernel, CampaignDriverNG enters

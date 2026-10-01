@@ -1,5 +1,8 @@
 # Agent Governor NG
 
+New here? Read the [component guide](docs/public-guide.md) for the supported
+entry points, deployment trust boundary, formal-claim scope, and recovery model.
+
 ## Implementation status (2026-08-10)
 
 AG-ng is the canonical durable governor of exact-work occurrences. The
@@ -42,13 +45,13 @@ context; it cannot deserialize or convert them into runtime authority. See
 `docs/formal-calculus-crosswalk.md` for correspondence and non-correspondence
 claims.
 
-AG-ng also produces authenticated authorization issuances for an external
-governed-work runtime. That producer is deliberately narrow: it decides through
-this office's own catalog and principal checks, burns its own decision authority
-once, and emits an immutable authenticated record. The record is not authority —
-`Authority` remains non-serializable and process-local — and it makes no claim
-that anything executed or that any downstream claim is admissible. See
-[`docs/docket-issuance.md`](docs/docket-issuance.md).
+AG-ng also retains the historical standalone producer and conformance fixtures
+for authenticated authorization issuances to an external governed-work runtime.
+That non-canonical example surface uses a caller-owned in-memory decision ledger;
+see [`docs/docket-issuance.md`](docs/docket-issuance.md). The durable production
+issuance path is the C1 `CampaignStoreV1` path described below. In both paths an
+issuance record is not authority, does not prove execution, and does not make a
+downstream claim admissible.
 
 The `ag-campaign` crate now contains the pure generic occurrence/FSM law; the
 transactional program counter and spend/attempt/settlement journals live in

@@ -1,8 +1,10 @@
 //! Opt-in adjacent-process development test for the canonical execution seam.
 //!
 //! The normal workspace suite does not build adjacent repositories. Run this
-//! ignored test with exact `AG_DOCKET_BIN` and `AG_EFFECTD_BIN` paths after
-//! building Docket and AG. It is development evidence, not qualification.
+//! ignored test requires an exact genesis-bound installed executor deployment
+//! sibling in addition to Docket/AG binaries. Its placeholder profile digest
+//! deliberately prevents activation until that fixture is completed; it is
+//! not a qualification or a ready positive test.
 
 #![allow(
     clippy::too_many_lines,
@@ -14,20 +16,20 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    EFFECT_EXECUTOR_PLAN_SCHEMA_V1, EFFECT_EXECUTOR_WORK_SCHEMA_V1, EffectArtifactFileV1,
-    EffectExecutorPlanV1, EffectFilePolicyV1,
+    EffectArtifactFileV1, EffectAuthorizationInputsV2, EffectExecutorPlanV1, EffectFilePolicyV1,
+    EFFECT_EXECUTOR_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_WORK_SCHEMA_V1,
 };
 use ag_app::governed_loop::{
-    CampaignEngineV1, DocketProgressV1, EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1,
-    ExactWorkCatalogV1, WorkPreconditionV1,
+    CampaignEngineV1, DocketProgressV1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
+    WorkPreconditionV1, EXACT_WORK_CATALOG_SCHEMA_V1,
 };
 use ag_app::governed_ports::{AgIssuanceSignerV1, CommandDocketCustodyPortV1};
-use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
+use ag_campaign::CampaignId;
 use ag_effect::{CanonicalEffectV1, TargetId};
 use ag_primitives::{Digest, JcsDocument};
-use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use uuid::Uuid;
@@ -112,7 +114,7 @@ impl StandingResolverV1 for Standing {
 }
 
 #[test]
-#[ignore = "requires adjacent Docket binary; see module documentation"]
+#[ignore = "requires genesis-bound installed executor profile and adjacent Docket binary"]
 fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     let docket = PathBuf::from(std::env::var_os("AG_DOCKET_BIN").expect("AG_DOCKET_BIN"));
     let effectd = PathBuf::from(std::env::var_os("AG_EFFECTD_BIN").expect("AG_EFFECTD_BIN"));
@@ -126,8 +128,19 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     let content = Digest::hash_bytes(b"governed-process-effect\n");
     let subject = digest("subject");
     let scope = digest("scope");
+    let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap();
+    let signer = AgIssuanceSignerV1::from_pkcs8("ag-test", "key-1", key_document.as_ref()).unwrap();
+    let trust_path = root.path().join("docket-trust.json");
+    let trust = serde_json::json!({"issuers":[{
+        "issuer_principal":"ag-test",
+        "key_id":"key-1",
+        "public_key":URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+    }]});
+    std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
+    let docket_state = root.path().join("docket-state");
     let plan = EffectExecutorPlanV1 {
-        schema: EFFECT_EXECUTOR_PLAN_SCHEMA_V1.to_owned(),
+        schema: EFFECT_EXECUTOR_PLAN_SCHEMA_V2.to_owned(),
         attempt_store: root.path().join("effect-attempts.sqlite"),
         subject: subject.clone(),
         scope: scope.clone(),
@@ -152,6 +165,9 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             require_private_parent_writes: true,
         },
         preparation_checkpoint: None,
+        authorization: Some(EffectAuthorizationInputsV2 {
+            expected_runtime_profile: digest("fixture-profile-needs-genesis-enrollment"),
+        }),
     };
     let plan_path = root.path().join("effect-plan.json");
     std::fs::write(
@@ -255,19 +271,9 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
     .unwrap();
     std::fs::set_permissions(&resolver_path, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    let pair = Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap();
-    let signer = AgIssuanceSignerV1::from_pkcs8("ag-test", "key-1", key_document.as_ref()).unwrap();
-    let trust_path = root.path().join("docket-trust.json");
-    let trust = serde_json::json!({"issuers":[{
-        "issuer_principal":"ag-test",
-        "key_id":"key-1",
-        "public_key":URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
-    }]});
-    std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
     let mut custody = CommandDocketCustodyPortV1::new(
         docket,
-        root.path().join("docket-state"),
+        docket_state,
         trust_path,
         resolver_path,
         effectd,

@@ -1,8 +1,19 @@
 # Docket issuance producer
 
+> **Status: historical conformance/example surface; non-canonical for
+> production orchestration.** This document and
+> `crates/ag-app/src/docket_issuance.rs` preserve the original standalone
+> `ag.docket-issuance:v1` producer and its conformance fixtures. Its
+> caller-owned in-memory `IssuanceDecisionLedger` is not the current durable
+> authorization-spend mechanism. The canonical production path is
+> `ag-loopctl` -> `CampaignEngineV1` -> `GovernedLoopKernelV1` ->
+> `CampaignStoreV1`, specified in [`governed-loop-c1.md`](governed-loop-c1.md).
+> Keep this surface for wire compatibility and examples; do not use it as the
+> production occurrence authority.
+
 AG-ng produces authenticated **authorization issuances** for an external governed-work
-runtime (Docket). This is the only AG-ng surface that speaks to that runtime, and it is
-deliberately narrow.
+runtime (Docket). This historical standalone producer is deliberately narrow.
+The durable C1 path is the current AG-ng production surface that speaks to that runtime.
 
 The wire contracts themselves — `gwr:authz-request:v1` and `ag.docket-issuance:v1` —
 are owned and versioned by the Docket product repository, which is their authoritative
@@ -73,7 +84,7 @@ Three digests are kept deliberately distinct and none is derived from another:
 | role | schema | status |
 |---|---|---|
 | consumed | `gwr:authz-request:v1` | supported; unknown schema refuses |
-| produced | `ag.docket-issuance:v1` | current |
+| produced | `ag.docket-issuance:v1` | current wire; historical standalone producer |
 | consumed effect class | `git-ref-update:v1` | the only class this office authorizes |
 
 This path has carried real governed work twice: the three-office vertical
@@ -99,5 +110,6 @@ receives an escalation, and none is inferred. See
 `IssuanceDecisionLedger` is an in-memory, caller-owned record. Within one ledger
 instance a decision's authority burns exactly once. It is **not** a durable authority
 ledger and claims no protection across process restarts or store rollback — the same
-limit the kernel's decision ledger states for itself. A durable issuance burn is
-deferred work, not a current property.
+limit the kernel's decision ledger states for itself. This limitation is why this
+standalone path is conformance/example-only. Durable production issuance burns are
+implemented by the C1 `CampaignStoreV1` path; they are not a property of this module.

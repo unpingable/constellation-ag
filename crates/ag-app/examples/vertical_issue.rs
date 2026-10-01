@@ -1,9 +1,12 @@
-//! Vertical harness: run one real authorization through AG ng's issuance path.
-//! Not part of the shipped surface; used to produce the vertical specimen.
+//! Historical vertical conformance harness for the standalone issuance wire.
+//! Not part of the canonical production path or shipped surface; its
+//! caller-owned in-memory ledger is used only to preserve the original
+//! vertical specimen. Production issuance uses the durable C1
+//! `CampaignStoreV1` path.
 use ag_app::docket_issuance::{
-    AuthorizationPremiseV1, DocketIssuanceOffice, DocketTargetCatalogV1, DocketTargetDefinitionV1,
-    IssuanceDecisionContextV1, IssuanceDecisionLedger, IssuanceSigner, ResidualObligationsV1,
-    ResidualStatusV1, decode_request,
+    decode_request, AuthorizationPremiseV1, DocketIssuanceOffice, DocketTargetCatalogV1,
+    DocketTargetDefinitionV1, IssuanceDecisionContextV1, IssuanceDecisionLedger, IssuanceSigner,
+    ResidualObligationsV1, ResidualStatusV1,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;

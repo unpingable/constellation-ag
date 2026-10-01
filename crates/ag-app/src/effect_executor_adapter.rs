@@ -1,16 +1,19 @@
 //! Authority-neutral `ag-effectd` adapter for Docket-custodied attempts.
 //!
-//! This module owns only exact-effect mechanics and an executor-local
-//! idempotency journal.  It consumes no AG authorization or standing, creates
-//! no campaign transition, and has no continuation operation.
+//! This module owns exact-effect mechanics and an executor-local idempotency
+//! journal. V2 additionally verifies an already-spent AG issuance and exact
+//! persisted Docket custody before mechanics; it does not grant standing,
+//! create a campaign transition, or perform continuation.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use ag_campaign::governed::{AgIssuanceV1, DocketCustodyV1, AG_ISSUANCE_SCHEMA_V1};
 use ag_effect::executor::{
     ArtifactReadErrorV1, ArtifactSourceV1, CapabilityFailureV1, CapabilityOutcomeV1,
     DocketCustodiedExecutionPermitV1, DocketEffectExecutionReceiptV1, EffectExecutorV1,
@@ -21,11 +24,15 @@ use ag_effect::executor::{
 };
 use ag_effect::CanonicalEffectV1;
 use ag_primitives::{Digest, JcsDocument};
-use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
-use serde::{Deserialize, Serialize};
 
 mod systemd_executor_v2;
 
+use ag_protocol::strict_json_from_slice;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use ring::signature::{UnparsedPublicKey, ED25519};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 pub use systemd_executor_v2::{
     audit_systemd_effect_store_cut, execute_systemd_effect_attempt,
     load_effect_executor_systemd_plan, reconcile_systemd_effect_attempt,
@@ -34,10 +41,24 @@ pub use systemd_executor_v2::{
 };
 use systemd_executor_v2::{decode_effect_executor_systemd_plan, MAX_PLAN_BYTES};
 
+use crate::governed_ports::{
+    GovernedDocketRootV1, GovernedRuntimeProfileV1, SignedAgIssuanceEnvelopeV1,
+    GOVERNED_DOCKET_ROOT_SCHEMA_V1, GOVERNED_RUNTIME_PROFILE_SCHEMA_V1,
+};
+
 /// Exact Docket work-schema accepted by this adapter.
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";
 /// Exact sealed executor-plan schema.
 pub const EFFECT_EXECUTOR_PLAN_SCHEMA_V1: &str = "ag-effectd.docket-executor-plan/v1";
+/// Authorization-carrying plan; V1 plan serialization and identity remain unchanged.
+pub const EFFECT_EXECUTOR_PLAN_SCHEMA_V2: &str = "ag-effectd.docket-executor-plan/v2";
+/// Docket's current, closed authorization-carrying executor input.
+pub const DOCKET_EXECUTOR_DISPATCH_SCHEMA_V2: &str = "docket.governed-executor-dispatch/v2";
+const DOCKET_INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
+const DOCKET_CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
+const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
+const EFFECT_EXECUTOR_DEPLOYMENT_SCHEMA_V1: &str = "ag-effectd.deployment/v1";
+const MAX_DEPLOYMENT_CONFIG_BYTES: u64 = 64 * 1024;
 /// External Docket-owned transport law implemented independently by `ag-effectd`.
 pub const DOCKET_EXECUTOR_TRANSPORT_SCHEMA_V1: &str = "docket.governed-executor-transport/v1";
 /// External Docket-owned dispatch schema implemented by `EffectExecutorDispatchV1`.
@@ -216,6 +237,76 @@ pub struct EffectFilePolicyV1 {
     pub require_private_parent_writes: bool,
 }
 
+/// Occurrence-work assertion of the existing genesis profile identity. It is
+/// never a selector for issuer trust, Docket program/state, or enrollment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectAuthorizationInputsV2 {
+    pub expected_runtime_profile: Digest,
+}
+
+/// Owner-installed sibling of the qualified `ag-effectd` binary. The binary
+/// chooses its path from `/proc/self/exe`; no work or CLI argument selects it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectExecutorDeploymentV1 {
+    schema: String,
+    campaign_database: PathBuf,
+    expected_runtime_profile: Digest,
+}
+
+struct EnrolledRuntimeV1 {
+    campaign: Digest,
+    profile_digest: Digest,
+    profile: GovernedRuntimeProfileV1,
+}
+
+/// Docket-owned V2 input, mirrored independently by the AG executor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedEffectDispatchV2 {
+    pub schema: String,
+    pub signed_issuance: SignedAgIssuanceEnvelopeV1,
+    pub custody: DocketCustodyV1,
+    pub dispatch: EffectExecutorDispatchV1,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedIssuerV1 {
+    issuer_principal: String,
+    key_id: String,
+    public_key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuerTrustV1 {
+    issuers: Vec<TrustedIssuerV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketInspectionV1 {
+    schema: String,
+    requested_issuance: String,
+    record: Option<DocketInspectionRecordV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketInspectionRecordV1 {
+    issuance: AgIssuanceV1,
+    authentication: crate::governed_ports::AgIssuanceAuthenticationV1,
+    custody: DocketCustodyV1,
+    status: String,
+    settlement: Option<serde_json::Value>,
+    indeterminate: Option<serde_json::Value>,
+    executor_binding: String,
+    executor_program_digest: String,
+    executor_plan: String,
+}
+
 impl From<EffectFilePolicyV1> for ManagedFilePolicyV1 {
     fn from(value: EffectFilePolicyV1) -> Self {
         Self {
@@ -249,6 +340,9 @@ pub struct EffectExecutorPlanV1 {
     pub file_policy: EffectFilePolicyV1,
     /// Required durable reversible-preparation checkpoint for pointer commit.
     pub preparation_checkpoint: Option<Digest>,
+    /// Absent in frozen V1. Present only in V2 and covered by the work identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<EffectAuthorizationInputsV2>,
 }
 
 impl EffectExecutorPlanV1 {
@@ -261,10 +355,7 @@ impl EffectExecutorPlanV1 {
         validate_plan(self)?;
         let bytes = JcsDocument::canonicalize(self)
             .map_err(|error| format!("effect-executor-plan-canonical:{error}"))?;
-        Ok(Digest::hash_domain(
-            EFFECT_EXECUTOR_PLAN_SCHEMA_V1,
-            bytes.as_bytes(),
-        ))
+        Ok(Digest::hash_domain(&self.schema, bytes.as_bytes()))
     }
 }
 
@@ -350,7 +441,7 @@ pub fn load_effect_executor_plan_any(path: &Path) -> Result<LoadedEffectExecutor
     let probe: EffectExecutorPlanSchemaProbe = serde_json::from_slice(canonical.as_bytes())
         .map_err(|error| format!("effect-executor-plan-schema-probe:{error}"))?;
     match probe.schema.as_str() {
-        EFFECT_EXECUTOR_PLAN_SCHEMA_V1 => {
+        EFFECT_EXECUTOR_PLAN_SCHEMA_V1 | EFFECT_EXECUTOR_PLAN_SCHEMA_V2 => {
             let plan: EffectExecutorPlanV1 = serde_json::from_slice(canonical.as_bytes())
                 .map_err(|error| format!("effect-executor-plan-decode:{error}"))?;
             validate_plan(&plan)?;
@@ -463,7 +554,10 @@ pub fn reconcile_effect_attempt(
 }
 
 fn validate_plan(plan: &EffectExecutorPlanV1) -> Result<(), String> {
-    if plan.schema != EFFECT_EXECUTOR_PLAN_SCHEMA_V1 {
+    if !matches!(
+        (plan.schema.as_str(), plan.authorization.is_some()),
+        (EFFECT_EXECUTOR_PLAN_SCHEMA_V1, false) | (EFFECT_EXECUTOR_PLAN_SCHEMA_V2, true)
+    ) {
         return Err("effect-executor-plan-schema".to_owned());
     }
     if !plan.attempt_store.is_absolute() || plan.file_policy.max_content_bytes == 0 {
@@ -502,6 +596,355 @@ fn validate_dispatch(
         return Err("effect-executor-dispatch-plan-binding".to_owned());
     }
     Ok(())
+}
+
+fn decode_base64_exact(value: &str, label: &str) -> Result<Vec<u8>, String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| format!("effect-executor-{label}-base64"))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        return Err(format!("effect-executor-{label}-noncanonical"));
+    }
+    Ok(bytes)
+}
+
+fn installed_deployment_path() -> Result<PathBuf, String> {
+    let executable = std::fs::read_link("/proc/self/exe")
+        .map_err(|error| format!("effect-executor-installed-exe:{error}"))?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "effect-executor-installed-parent-absent".to_owned())?;
+    Ok(parent.join("ag-effectd.deployment.json"))
+}
+
+fn load_enrolled_runtime(path: &Path) -> Result<EnrolledRuntimeV1, String> {
+    // This fixed sibling is an owner-installed deployment input, not a
+    // plan-selected authority. Same-UID replacement is outside this host's
+    // stated isolation claim; source-free installation must retain its custody.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("effect-executor-deployment-open:{error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("effect-executor-deployment-metadata:{error}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_DEPLOYMENT_CONFIG_BYTES {
+        return Err("effect-executor-deployment-shape".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("effect-executor-deployment-read:{error}"))?;
+    if bytes.len() as u64 > MAX_DEPLOYMENT_CONFIG_BYTES {
+        return Err("effect-executor-deployment-size".to_owned());
+    }
+    let document = JcsDocument::from_canonical_bytes(&bytes)
+        .map_err(|error| format!("effect-executor-deployment-canonical:{error}"))?;
+    let deployment: EffectExecutorDeploymentV1 = strict_json_from_slice(document.as_bytes())
+        .map_err(|error| format!("effect-executor-deployment-json:{error}"))?;
+    if deployment.schema != EFFECT_EXECUTOR_DEPLOYMENT_SCHEMA_V1
+        || !deployment.campaign_database.is_absolute()
+    {
+        return Err("effect-executor-deployment-schema-or-path".to_owned());
+    }
+    let connection = Connection::open_with_flags(
+        &deployment.campaign_database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| format!("effect-executor-campaign-open:{error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("effect-executor-campaign-timeout:{error}"))?;
+    let campaign_text: String = connection
+        .query_row("SELECT campaign_id FROM campaigns", [], |row| row.get(0))
+        .map_err(|error| format!("effect-executor-campaign-id:{error}"))?;
+    let campaign = Digest::parse(&campaign_text)
+        .map_err(|error| format!("effect-executor-campaign-identity:{error}"))?;
+    let (schema, digest_text, profile_bytes): (String, String, Vec<u8>) = connection
+        .query_row(
+            "SELECT schema,profile_digest,profile_jcs FROM runtime_profile WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("effect-executor-genesis-profile:{error}"))?;
+    if schema != GOVERNED_RUNTIME_PROFILE_SCHEMA_V1 {
+        return Err("effect-executor-genesis-profile-schema".to_owned());
+    }
+    let profile_digest = Digest::parse(&digest_text)
+        .map_err(|error| format!("effect-executor-genesis-profile-identity:{error}"))?;
+    let canonical = JcsDocument::from_canonical_bytes(&profile_bytes)
+        .map_err(|error| format!("effect-executor-genesis-profile-canonical:{error}"))?;
+    if profile_digest != Digest::hash_domain(&schema, canonical.as_bytes())
+        || profile_digest != deployment.expected_runtime_profile
+    {
+        return Err("effect-executor-genesis-profile-binding".to_owned());
+    }
+    let profile: GovernedRuntimeProfileV1 = strict_json_from_slice(canonical.as_bytes())
+        .map_err(|error| format!("effect-executor-genesis-profile-json:{error}"))?;
+    if profile.schema != schema {
+        return Err("effect-executor-genesis-profile-substitution".to_owned());
+    }
+    Ok(EnrolledRuntimeV1 {
+        campaign,
+        profile_digest,
+        profile,
+    })
+}
+
+fn bind_enrolled_docket<'a>(
+    plan: &EffectExecutorPlanV1,
+    enrolled: &'a EnrolledRuntimeV1,
+    executable_path: &Path,
+    executable_bytes: &[u8],
+) -> Result<(&'a GovernedDocketRootV1, Vec<u8>), String> {
+    let expected = plan
+        .authorization
+        .as_ref()
+        .ok_or_else(|| "effect-executor-v2-plan-required".to_owned())?;
+    if expected.expected_runtime_profile != enrolled.profile_digest {
+        return Err("effect-executor-plan-profile-substitution".to_owned());
+    }
+    let docket = &enrolled.profile.docket;
+    if docket.schema != GOVERNED_DOCKET_ROOT_SCHEMA_V1
+        || !docket.state_directory.is_absolute()
+        || docket.issuer_principal.is_empty()
+        || docket.issuer_key_id.is_empty()
+        || docket.executor_adapter.path != executable_path
+        || docket.executor_adapter.identity != Digest::hash_bytes(executable_bytes)
+    {
+        return Err("effect-executor-installed-docket-root-substitution".to_owned());
+    }
+    docket
+        .executor_adapter
+        .verify(true)
+        .map_err(|error| format!("effect-executor-installed-binary:{error}"))?;
+    docket
+        .docket_program
+        .verify(true)
+        .map_err(|error| format!("effect-executor-installed-docket:{error}"))?;
+    docket
+        .standing_resolver
+        .verify(true)
+        .map_err(|error| format!("effect-executor-installed-standing-resolver:{error}"))?;
+    let trust = docket
+        .trust_config
+        .verify(false)
+        .map_err(|error| format!("effect-executor-installed-trust:{error}"))?;
+    Ok((docket, trust))
+}
+
+/// Checks the installed V2 executor root before Docket accepts custody. The
+/// caller cannot present an alternate deployment path; V1 identities remain
+/// readable without this V2-only installation premise.
+pub fn verify_plan_deployment_v2(plan: &EffectExecutorPlanV1) -> Result<(), String> {
+    validate_plan(plan)?;
+    if plan.authorization.is_none() {
+        return Ok(());
+    }
+    let enrolled = load_enrolled_runtime(&installed_deployment_path()?)?;
+    let executable_path = std::fs::read_link("/proc/self/exe")
+        .map_err(|error| format!("effect-executor-self-path:{error}"))?;
+    let executable_bytes = std::fs::read("/proc/self/exe")
+        .map_err(|error| format!("effect-executor-self-identity:{error}"))?;
+    let _ = bind_enrolled_docket(plan, &enrolled, &executable_path, &executable_bytes)?;
+    Ok(())
+}
+
+/// Verifies V2 against the independently owner-installed C1 genesis profile
+/// and read-only persisted Docket custody. The work plan asserts only the
+/// expected profile identity; it cannot select the trust, inspector or state.
+pub fn verify_authorized_dispatch_v2(
+    plan: &EffectExecutorPlanV1,
+    input: &AuthorizedEffectDispatchV2,
+    operation: &str,
+) -> Result<EffectExecutorDispatchV1, String> {
+    validate_plan(plan)?;
+    let deployment_path = installed_deployment_path()?;
+    let enrolled = load_enrolled_runtime(&deployment_path)?;
+    let executable_path = std::fs::read_link("/proc/self/exe")
+        .map_err(|error| format!("effect-executor-self-path:{error}"))?;
+    let self_bytes = std::fs::read("/proc/self/exe")
+        .map_err(|error| format!("effect-executor-self-identity:{error}"))?;
+    let (authority, trust_bytes) =
+        bind_enrolled_docket(plan, &enrolled, &executable_path, &self_bytes)?;
+    if input.schema != DOCKET_EXECUTOR_DISPATCH_SCHEMA_V2 {
+        return Err("effect-executor-dispatch-schema".to_owned());
+    }
+    validate_dispatch(plan, &input.dispatch)?;
+
+    let trust: IssuerTrustV1 = strict_json_from_slice(&trust_bytes)
+        .map_err(|error| format!("effect-executor-issuer-trust-json:{error}"))?;
+    let authentication = &input.signed_issuance.authentication;
+    if input.signed_issuance.schema != "ag.governed-loop.signed-issuance/v1"
+        || authentication.issuer_principal != authority.issuer_principal
+        || authentication.signer_key_id != authority.issuer_key_id
+    {
+        return Err("effect-executor-untrusted-issuer".to_owned());
+    }
+    let trusted = trust
+        .issuers
+        .iter()
+        .filter(|issuer| {
+            issuer.issuer_principal == authority.issuer_principal
+                && issuer.key_id == authority.issuer_key_id
+        })
+        .collect::<Vec<_>>();
+    if trusted.len() != 1 || trusted[0].public_key != authentication.signer_public_key {
+        return Err("effect-executor-issuer-key-substitution".to_owned());
+    }
+    let body = decode_base64_exact(&input.signed_issuance.body_b64, "issuance-body")?;
+    let key = decode_base64_exact(&trusted[0].public_key, "issuer-key")?;
+    let signature = decode_base64_exact(&authentication.signature, "issuance-signature")?;
+    if key.len() != 32 || signature.len() != 64 {
+        return Err("effect-executor-issuer-signature-shape".to_owned());
+    }
+    let mut signed = Vec::with_capacity(SIGNATURE_PREFIX_V1.len() + body.len());
+    signed.extend_from_slice(SIGNATURE_PREFIX_V1);
+    signed.extend_from_slice(&body);
+    UnparsedPublicKey::new(&ED25519, &key)
+        .verify(&signed, &signature)
+        .map_err(|_| "effect-executor-issuance-signature".to_owned())?;
+    let canonical_body = JcsDocument::from_canonical_bytes(&body)
+        .map_err(|error| format!("effect-executor-issuance-canonical:{error}"))?;
+    let issuance: AgIssuanceV1 = strict_json_from_slice(canonical_body.as_bytes())
+        .map_err(|error| format!("effect-executor-issuance-json:{error}"))?;
+    if issuance.schema != AG_ISSUANCE_SCHEMA_V1 {
+        return Err("effect-executor-issuance-schema".to_owned());
+    }
+    if issuance.key.campaign.as_digest() != &enrolled.campaign {
+        return Err("effect-executor-campaign-substitution".to_owned());
+    }
+    let basis = serde_json::json!({
+        "key": issuance.key,
+        "program": issuance.program,
+        "proposal": issuance.proposal,
+        "work_schema": issuance.work_schema,
+        "work": issuance.work,
+        "subject": issuance.subject,
+        "scope": issuance.scope,
+        "observation": issuance.observation,
+        "standing_resolution": issuance.standing_resolution,
+        "mandate": issuance.mandate,
+        "spend": issuance.spend,
+    });
+    let basis = JcsDocument::canonicalize(&basis)
+        .map_err(|error| format!("effect-executor-issuance-basis:{error}"))?;
+    if Digest::hash_domain(AG_ISSUANCE_SCHEMA_V1, basis.as_bytes()).as_str()
+        != issuance.issuance.as_str()
+    {
+        return Err("effect-executor-issuance-identity".to_owned());
+    }
+    let custody = &input.custody;
+    if custody.schema != DOCKET_CUSTODY_SCHEMA_V1
+        || custody.issuance != issuance.issuance
+        || custody.ag_spend != issuance.spend
+        || input.dispatch.work != issuance.work
+        || input.dispatch.work_schema != issuance.work_schema
+        || input.dispatch.subject != issuance.subject
+        || input.dispatch.scope != issuance.scope
+        || input.dispatch.attempt.as_str() != custody.attempt.as_str()
+        || input.dispatch.marker.as_str() != custody.executor_marker.as_str()
+    {
+        return Err("effect-executor-issuance-custody-dispatch-binding".to_owned());
+    }
+    let attempt_basis = serde_json::to_vec(issuance.issuance.as_str())
+        .map_err(|error| format!("effect-executor-attempt-basis:{error}"))?;
+    let expected_attempt =
+        Digest::hash_domain("ag.governed-loop.docket-attempt/v1", &attempt_basis);
+    let expected_marker = Digest::hash_domain(
+        "docket.governed-loop.executor-marker/v1",
+        expected_attempt.as_str().as_bytes(),
+    );
+    if custody.attempt.as_str() != expected_attempt.as_str()
+        || custody.executor_marker.as_str() != expected_marker.as_str()
+    {
+        return Err("effect-executor-attempt-marker-binding".to_owned());
+    }
+
+    // The Docket accept transaction commits custody before executor delivery.
+    // The same read-only inspection is valid on historical reconciliation;
+    // neither branch asks for current standing or a new issuance window.
+    let mut inspector = Command::new(&authority.docket_program.path)
+        .args(["governed-loop", "inspect", "--state"])
+        .arg(&authority.state_directory)
+        .arg("--issuance")
+        .arg(issuance.issuance.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("effect-executor-docket-inspect:{error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match inspector.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = inspector.kill();
+                let _ = inspector.wait();
+                return Err(format!("effect-executor-docket-inspect-wait:{error}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = inspector.kill();
+            let _ = inspector.wait_with_output();
+            return Err("effect-executor-docket-inspect-timeout".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = inspector
+        .wait_with_output()
+        .map_err(|error| format!("effect-executor-docket-inspect-output:{error}"))?;
+    if !output.status.success() || output.stdout.len() as u64 > DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1 {
+        return Err("effect-executor-docket-inspect-refused".to_owned());
+    }
+    let inspected: DocketInspectionV1 = strict_json_from_slice(&output.stdout)
+        .map_err(|error| format!("effect-executor-docket-inspection-json:{error}"))?;
+    let record = inspected
+        .record
+        .ok_or_else(|| "effect-executor-docket-custody-absent".to_owned())?;
+    if inspected.schema != DOCKET_INSPECTION_SCHEMA_V1
+        || inspected.requested_issuance != issuance.issuance.as_str()
+        || record.issuance != issuance
+        || record.authentication != *authentication
+        || record.custody != *custody
+        || record.executor_plan != plan.identity()?.as_str()
+    {
+        return Err("effect-executor-docket-inspection-substitution".to_owned());
+    }
+    let program_digest =
+        Digest::hash_domain("docket.governed-loop.executor-program/v1", &self_bytes);
+    let binding = serde_json::json!({
+        "plan": record.executor_plan,
+        "program_digest": program_digest.as_str(),
+    });
+    let binding = JcsDocument::canonicalize(&binding)
+        .map_err(|error| format!("effect-executor-docket-binding:{error}"))?;
+    if record.executor_program_digest != program_digest.as_str()
+        || record.executor_binding
+            != Digest::hash_domain(
+                "docket.governed-loop.executor-binding/v1",
+                binding.as_bytes(),
+            )
+            .as_str()
+    {
+        return Err("effect-executor-docket-executor-substitution".to_owned());
+    }
+    match operation {
+        "execute"
+            if record.status == "accepted"
+                && record.settlement.is_none()
+                && record.indeterminate.is_none() => {}
+        "reconcile"
+            if matches!(
+                record.status.as_str(),
+                "accepted" | "indeterminate" | "settled"
+            ) => {}
+        _ => return Err("effect-executor-docket-status-not-admitting".to_owned()),
+    }
+    Ok(input.dispatch.clone())
 }
 
 struct PlanArtifactSourceV1 {
@@ -1021,6 +1464,7 @@ fn checkpoint(connection: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governed_ports::PinnedDeploymentFileV1;
     use ag_effect::{SystemdUnitActionV1, TargetId};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -1062,6 +1506,7 @@ mod tests {
                 require_private_parent_writes: true,
             },
             preparation_checkpoint: None,
+            authorization: None,
         };
         let dispatch = EffectExecutorDispatchV1 {
             attempt: Digest::hash_bytes(b"effect-attempt"),
@@ -1072,6 +1517,165 @@ mod tests {
             scope,
         };
         (directory, plan, dispatch)
+    }
+
+    #[test]
+    fn v2_work_cannot_select_an_alternate_trust_inspector_or_state() {
+        let (directory, mut plan, _) = fixture();
+        plan.schema = EFFECT_EXECUTOR_PLAN_SCHEMA_V2.to_owned();
+        plan.authorization = Some(EffectAuthorizationInputsV2 {
+            expected_runtime_profile: Digest::hash_bytes(b"enrolled-profile"),
+        });
+        let mut authored = serde_json::to_value(&plan).unwrap();
+        let authorization = authored["authorization"].as_object_mut().unwrap();
+        authorization.insert(
+            "issuer_trust".to_owned(),
+            serde_json::json!({"path":"/tmp/alternate-trust"}),
+        );
+        authorization.insert(
+            "docket_program".to_owned(),
+            serde_json::json!({"path":"/tmp/alternate-inspector"}),
+        );
+        authorization.insert(
+            "docket_state".to_owned(),
+            serde_json::json!("/tmp/alternate-state"),
+        );
+        assert!(serde_json::from_value::<EffectExecutorPlanV1>(authored).is_err());
+        assert!(!directory.path().join("attempt.sqlite3").exists());
+        assert!(!directory.path().join("target").exists());
+    }
+
+    #[test]
+    fn fixed_fixture_enrollment_matches_genesis_and_refuses_byte_substitution() {
+        let (directory, mut plan, _) = fixture();
+        let root = directory.path();
+        let test_program = root.join("installed-effectd-fixture");
+        let docket_program = root.join("installed-docket-fixture");
+        let resolver = root.join("installed-standing-fixture");
+        for path in [&test_program, &docket_program, &resolver] {
+            std::fs::write(path, b"non-deployable-fixture-executable").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let trust_path = root.join("fixture-trust.json");
+        std::fs::write(&trust_path, b"{\"issuers\":[]}").unwrap();
+        let key_path = root.join("unused-fixture-key-locator");
+        // Published all-01 seed in PKCS#8 v2 with its public key: test-only, never enroll.
+        let fixture_key = hex::decode("3051020101300506032b65700422042001010101010101010101010101010101010101010101010101010101010101018121008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c").unwrap();
+        std::fs::write(&key_path, fixture_key).unwrap();
+        let catalog = root.join("unused-fixture-catalog");
+        let catalog_document = serde_json::json!({
+            "schema": "ag.governed-loop.exact-work-catalog/v2",
+            "entries": {
+                (EFFECT_EXECUTOR_WORK_SCHEMA_V1): {
+                    "work_schema": EFFECT_EXECUTOR_WORK_SCHEMA_V1,
+                    "subject": plan.subject.clone(),
+                    "scope": plan.scope.clone(),
+                    "observation_basis": {
+                        "kind": "typed_basis",
+                        "requirement": {
+                            "schema": "ag.governed-loop.typed-observation-basis/v1",
+                            "basis_type": "fixture.source-only/v1",
+                            "basis_identity": Digest::hash_bytes(b"fixture-basis")
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            &catalog,
+            JcsDocument::canonicalize(&catalog_document)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let profile: GovernedRuntimeProfileV1 = serde_json::from_value(serde_json::json!({
+            "schema": GOVERNED_RUNTIME_PROFILE_SCHEMA_V1,
+            "profile_label": "fixture-only",
+            "observation_resolver": PinnedDeploymentFileV1::measure(&resolver, true).unwrap(),
+            "observation_resolver_id": "fixture-observation",
+            "standing_resolver": PinnedDeploymentFileV1::measure(&resolver, true).unwrap(),
+            "standing_resolver_id": "fixture-standing",
+            "max_standing_ttl_ms": 1000,
+            "exact_work_catalog": PinnedDeploymentFileV1::measure(&catalog, false).unwrap(),
+            "controlling_review": null,
+            "docket": {
+                "schema": GOVERNED_DOCKET_ROOT_SCHEMA_V1,
+                "docket_program": PinnedDeploymentFileV1::measure(&docket_program, true).unwrap(),
+                "state_directory": root.join("docket-state"),
+                "trust_config": PinnedDeploymentFileV1::measure(&trust_path, false).unwrap(),
+                "standing_resolver": PinnedDeploymentFileV1::measure(&resolver, true).unwrap(),
+                "executor_adapter": PinnedDeploymentFileV1::measure(&test_program, true).unwrap(),
+                "issuer_principal": "fixture-principal-never-enroll",
+                "issuer_key_id": "fixture-key-never-enroll",
+                "issuer_key": PinnedDeploymentFileV1::measure(&key_path, false).unwrap()
+            },
+            "human_verifier": null,
+            "intervention_ingress": null
+        }))
+        .unwrap();
+        profile.verify_genesis().unwrap();
+        let profile_bytes = JcsDocument::canonicalize(&profile).unwrap();
+        let profile_digest =
+            Digest::hash_domain(GOVERNED_RUNTIME_PROFILE_SCHEMA_V1, profile_bytes.as_bytes());
+        let campaign = Digest::hash_bytes(b"fixture-campaign");
+        let campaign_db = root.join("campaign.sqlite");
+        let db = Connection::open(&campaign_db).unwrap();
+        db.execute_batch("CREATE TABLE campaigns(campaign_id TEXT NOT NULL); CREATE TABLE runtime_profile(singleton INTEGER PRIMARY KEY,schema TEXT NOT NULL,profile_digest TEXT NOT NULL,profile_jcs BLOB NOT NULL);").unwrap();
+        db.execute(
+            "INSERT INTO campaigns(campaign_id) VALUES(?1)",
+            [campaign.as_str()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO runtime_profile(singleton,schema,profile_digest,profile_jcs) VALUES(1,?1,?2,?3)", params![GOVERNED_RUNTIME_PROFILE_SCHEMA_V1, profile_digest.as_str(), profile_bytes.as_bytes()]).unwrap();
+        drop(db);
+        let deployment_path = root.join("ag-effectd.deployment.json");
+        let deployment = EffectExecutorDeploymentV1 {
+            schema: EFFECT_EXECUTOR_DEPLOYMENT_SCHEMA_V1.to_owned(),
+            campaign_database: campaign_db,
+            expected_runtime_profile: profile_digest.clone(),
+        };
+        std::fs::write(
+            &deployment_path,
+            JcsDocument::canonicalize(&deployment).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let enrolled = load_enrolled_runtime(&deployment_path).unwrap();
+        assert_eq!(enrolled.campaign, campaign);
+        plan.schema = EFFECT_EXECUTOR_PLAN_SCHEMA_V2.to_owned();
+        plan.authorization = Some(EffectAuthorizationInputsV2 {
+            expected_runtime_profile: profile_digest,
+        });
+        let work = plan.identity().unwrap();
+        assert_eq!(work, plan.identity().unwrap());
+        assert!(!catalog_document.to_string().contains(work.as_str()));
+        assert!(bind_enrolled_docket(
+            &plan,
+            &enrolled,
+            &test_program,
+            b"non-deployable-fixture-executable"
+        )
+        .is_ok());
+        let mut wrong_plan = plan.clone();
+        wrong_plan.authorization = Some(EffectAuthorizationInputsV2 {
+            expected_runtime_profile: Digest::hash_bytes(b"alternate-profile"),
+        });
+        assert!(bind_enrolled_docket(
+            &wrong_plan,
+            &enrolled,
+            &test_program,
+            b"non-deployable-fixture-executable"
+        )
+        .is_err());
+        std::fs::write(&trust_path, b"{\"issuers\":[{}]}").unwrap();
+        assert!(bind_enrolled_docket(
+            &plan,
+            &enrolled,
+            &test_program,
+            b"non-deployable-fixture-executable"
+        )
+        .is_err());
+        assert!(!root.join("attempt.sqlite3").exists());
+        assert!(!root.join("target").exists());
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! `ag.docket-issuance:v1` — authenticated issuance for an exact Docket
 //! prepared attempt.
 //!
+//! **Status.** This module is the historical standalone conformance/example
+//! producer. Its [`IssuanceDecisionLedger`] is caller-owned and in-memory, so
+//! it is not the canonical production occurrence authority. Production uses
+//! `CampaignEngineV1` and `CampaignStoreV1` through the governed C1 loop. This
+//! module remains exported for wire compatibility and retained fixtures.
+//!
 //! Docket prepares an exact attempt and projects it as a
 //! `gwr:authz-request:v1` request. This module evaluates that request through
 //! AG's existing decision path and, for an admitted decision only, emits one
@@ -35,10 +41,10 @@
 //! never recompute.
 
 use ag_primitives::Digest;
-use ag_protocol::{ProtocolError, canonical_json, strict_json_from_slice};
-use base64::Engine as _;
+use ag_protocol::{canonical_json, strict_json_from_slice, ProtocolError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
+use base64::Engine as _;
+use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
