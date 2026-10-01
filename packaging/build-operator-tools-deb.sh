@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Assemble the governed-loop CLI and existing systemd executor payloads.
-# This does not promote the composed runtime or change the executor dependency floor.
+# This does not promote the composed runtime.
 set -euo pipefail
 export LC_ALL=C TZ=UTC
 umask 022
@@ -28,9 +28,9 @@ for package in agent-governor-ng-operator-tools agent-governor-ng-systemd-execut
     else
         install -d -m 0755 "$d/usr/libexec/agent-governor-ng"
         install -m 0755 "$bin_dir/ag-effectd" "$d/usr/libexec/agent-governor-ng/"
-        # Preserve the existing debian/control contract. Ubuntu 22.04's systemd
-        # 249 does not satisfy this; a build is not an installability claim.
-        depends='libc6 (>= 2.35), systemd (>= 252)'
+        # The standalone executor uses interfaces present in systemd 249.
+        # Daemon credential units retain their separate >=252 contract.
+        depends='libc6 (>= 2.35), systemd (>= 249)'
         description='Agent Governor target-local systemd effect process adapter'
         install -m 0644 "$root/docs/operator-beta-systemd-dbus-backend-v1.md" "$d/usr/share/doc/$package/"
     fi

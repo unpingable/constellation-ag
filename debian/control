@@ -36,7 +36,7 @@ Architecture: amd64 arm64
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
- systemd (>= 252)
+ systemd (>= 249)
 Description: target-local systemd effect process adapter for Agent Governor NG
  This package contains the feature-enabled, authority-neutral process adapter
  used for one exact Docket-custodied systemd attempt. It installs no service,
