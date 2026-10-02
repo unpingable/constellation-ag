@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path};
 
 use rustix::fd::OwnedFd;
-use rustix::fs::{Mode, OFlags, ResolveFlags};
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 /// Open one normalized relative path beneath an already trusted descriptor.
@@ -35,14 +35,40 @@ pub fn open_beneath(
 ) -> Result<OwnedFd, Errno> {
     validate_relative(relative)?;
     let flags = flags | OFlags::NOFOLLOW;
-    let attempted = rustix::fs::openat2(
-        &parent,
+    let attempted = attempt_openat2(&parent, relative, flags, mode);
+    finish_open_beneath(parent, relative, flags, mode, attempted)
+}
+
+/// `openat2(2)` with beneath/no-symlink resolution where the kernel has it.
+///
+/// Kernels without `openat2(2)` report `ENOSYS`, which selects the
+/// component-wise `openat(2)` path that this module already defines as the
+/// semantic equivalent (see the module documentation).
+#[cfg(target_os = "linux")]
+fn attempt_openat2(
+    parent: impl AsFd,
+    relative: &Path,
+    flags: OFlags,
+    mode: Mode,
+) -> Result<OwnedFd, Errno> {
+    use rustix::fs::ResolveFlags;
+    rustix::fs::openat2(
+        parent,
         relative,
         flags,
         mode,
         ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
-    );
-    finish_open_beneath(parent, relative, flags, mode, attempted)
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attempt_openat2(
+    _parent: impl AsFd,
+    _relative: &Path,
+    _flags: OFlags,
+    _mode: Mode,
+) -> Result<OwnedFd, Errno> {
+    Err(Errno::NOSYS)
 }
 
 fn finish_open_beneath(
@@ -193,8 +219,12 @@ mod tests {
             Err(Errno::NOSYS),
         )
         .unwrap_err();
-        assert!(matches!(intermediate_symlink, Errno::LOOP | Errno::NOTDIR));
-        assert_eq!(
+        // Linux reports ELOOP for O_NOFOLLOW on a symlink; FreeBSD reports EMLINK.
+        assert!(matches!(
+            intermediate_symlink,
+            Errno::LOOP | Errno::MLINK | Errno::NOTDIR
+        ));
+        assert!(matches!(
             finish_open_beneath(
                 &root,
                 Path::new("safe/link"),
@@ -203,8 +233,8 @@ mod tests {
                 Err(Errno::NOSYS),
             )
             .unwrap_err(),
-            Errno::LOOP
-        );
+            Errno::LOOP | Errno::MLINK
+        ));
         for hostile in [
             "",
             "/safe/value",

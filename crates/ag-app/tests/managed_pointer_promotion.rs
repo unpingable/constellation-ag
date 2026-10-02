@@ -1,5 +1,9 @@
 //! End-to-end broker coverage for one exact managed-Git-reference promotion.
 
+// Exercises the Linux daemon surface (ag-effectd executor, managed pointers,
+// Linux effect adapter); it is compiled only where that surface exists.
+#![cfg(target_os = "linux")]
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;

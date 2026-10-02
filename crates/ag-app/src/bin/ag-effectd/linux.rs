@@ -57,7 +57,7 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+pub(crate) fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     match arguments.command {
         Command::PlanId { plan } => {

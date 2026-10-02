@@ -12,7 +12,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 
 use ag_primitives::{Digest, JcsDocument, JcsError};
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -610,18 +610,54 @@ fn open_root(root: &Path) -> Result<OwnedFd, MigrationError> {
 
 fn verify_bound_file(root: &OwnedFd, binding: &FileBindingV1) -> Result<Vec<u8>, MigrationError> {
     validate_binding(binding, MAX_ARCHIVE_FILE_BYTES)?;
-    let fd = rustix::fs::openat2(
+    let fd = open_bound_beneath(root, binding.path.as_str()).map_err(|source| {
+        MigrationError::OpenBoundFile {
+            path: binding.path.clone(),
+            source,
+        }
+    })?;
+    read_checked_fd(fd, binding.length, Some((&binding.path, &binding.digest)))
+}
+
+/// Open `path` strictly beneath `root` without following any symbolic link.
+///
+/// On Linux this is `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
+/// | RESOLVE_NO_SYMLINKS`. Other Unix kernels have no single-call equivalent,
+/// so the same contract is enforced by walking the already validated relative
+/// components one `openat(2)` at a time with `O_NOFOLLOW` (directories opened
+/// with `O_DIRECTORY`). `validate_binding` has rejected absolute paths and
+/// every non-normal component before this is reached, so the walk cannot
+/// leave `root`.
+#[cfg(target_os = "linux")]
+fn open_bound_beneath(root: &OwnedFd, path: &str) -> Result<OwnedFd, rustix::io::Errno> {
+    use rustix::fs::ResolveFlags;
+    rustix::fs::openat2(
         root,
-        binding.path.as_str(),
+        path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
         ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
-    .map_err(|source| MigrationError::OpenBoundFile {
-        path: binding.path.clone(),
-        source,
-    })?;
-    read_checked_fd(fd, binding.length, Some((&binding.path, &binding.digest)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_bound_beneath(root: &OwnedFd, path: &str) -> Result<OwnedFd, rustix::io::Errno> {
+    let mut components = Path::new(path).components().peekable();
+    let mut current: Option<OwnedFd> = None;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(rustix::io::Errno::INVAL);
+        };
+        let directory = current.as_ref().unwrap_or(root);
+        let flags = if components.peek().is_some() {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
+        };
+        let next = rustix::fs::openat(directory, name, flags, Mode::empty())?;
+        current = Some(next);
+    }
+    current.ok_or(rustix::io::Errno::INVAL)
 }
 
 fn read_checked_fd(

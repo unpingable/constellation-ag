@@ -1,5 +1,9 @@
 //! Independent AG effect-adapter runner for Docket's external V1 corpus.
 
+// Exercises the Linux daemon surface (ag-effectd executor, managed pointers,
+// Linux effect adapter); it is compiled only where that surface exists.
+#![cfg(target_os = "linux")]
+
 use ag_app::effect_executor_adapter::{
     DOCKET_EXECUTOR_DISPATCH_SCHEMA_V1, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
     DOCKET_EXECUTOR_OUTCOME_SCHEMA_V1, DOCKET_EXECUTOR_TRANSPORT_SCHEMA_V1,

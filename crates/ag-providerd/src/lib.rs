@@ -2,6 +2,10 @@
 //!
 //! This package is deliberately outside the `ag-app` dependency graph so the
 //! effect broker cannot acquire HTTP/TLS client code through shared linkage.
+//
+// The provider daemon is part of the Linux daemon surface (signed Unix-socket
+// RPC with `SO_PEERCRED`, the daemon API); it is compiled only there.
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::fs::File;

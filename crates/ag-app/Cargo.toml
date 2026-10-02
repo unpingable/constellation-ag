@@ -17,19 +17,19 @@ systemd-dbus = ["dep:async-io", "dep:futures-util", "dep:zbus"]
 
 [[bin]]
 name = "agd"
-path = "src/bin/agd.rs"
+path = "src/bin/agd/main.rs"
 
 [[bin]]
 name = "ag-effectd"
-path = "src/bin/ag-effectd.rs"
+path = "src/bin/ag-effectd/main.rs"
 
 [[bin]]
 name = "agctl"
-path = "src/bin/agctl.rs"
+path = "src/bin/agctl/main.rs"
 
 [[bin]]
 name = "ag-worker-fixture"
-path = "src/bin/ag-worker-fixture.rs"
+path = "src/bin/ag-worker-fixture/main.rs"
 required-features = ["worker-fixture"]
 
 [[bin]]

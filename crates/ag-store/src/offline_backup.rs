@@ -12,7 +12,6 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::path::{Path, PathBuf};
 
 use ag_primitives::{AuthorityDomainId, Digest, EpochId, JcsDocument};
-use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 
@@ -733,7 +732,15 @@ fn seal_tree_directories(root: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Publish a staged backup tree only if the destination name is absent.
+///
+/// Atomic no-replace renaming of a directory tree needs `renameat2(2)` with
+/// `RENAME_NOREPLACE`. Kernels without it (FreeBSD among them) cannot express
+/// this operation for directories, so publication refuses explicitly instead
+/// of degrading to a replacing rename.
+#[cfg(target_os = "linux")]
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), StoreError> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
     renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(|error| {
         if error == rustix::io::Errno::EXIST {
             StoreError::BackupPublicationDestinationExists(destination.to_owned())
@@ -741,6 +748,13 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), StoreError>
             StoreError::Io(io::Error::from_raw_os_error(error.raw_os_error()))
         }
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_source: &Path, destination: &Path) -> Result<(), StoreError> {
+    Err(StoreError::BackupPublicationNoReplaceUnsupported(
+        destination.to_owned(),
+    ))
 }
 
 fn copy_publication_tree(
@@ -989,6 +1003,24 @@ mod tests {
         assert!(verify_backup_publication(&staging).is_err());
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn publication_refuses_where_no_replace_rename_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("staged");
+        let destination = root.path().join("published");
+        std::fs::create_dir(&source).unwrap();
+        match rename_noreplace(&source, &destination) {
+            Err(StoreError::BackupPublicationNoReplaceUnsupported(path)) => {
+                assert_eq!(path, destination);
+            }
+            other => panic!("expected explicit platform refusal, got {other:?}"),
+        }
+        assert!(source.is_dir(), "staged tree must be left untouched");
+        assert!(!destination.exists(), "nothing may be published");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn publication_and_evidence_restore_are_atomic_and_never_replace() {
         let (_fixtures, _stores, publication_parent, publication) = sealed_publication();

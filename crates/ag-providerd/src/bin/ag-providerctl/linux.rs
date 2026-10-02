@@ -345,7 +345,7 @@ fn write_result<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+pub(crate) fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     let config: ProviderctlConfigV1 = load_config(&arguments.config, true)?;
     let policy = config.validate()?;
@@ -406,7 +406,7 @@ rpc_replay_capacity = 4096
 
     fn policy() -> ProviderdConfigV1 {
         let mut policy: ProviderdConfigV1 =
-            toml::from_str(include_str!("../../../../config/providerd.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../../../config/providerd.example.toml")).unwrap();
         policy.caller_peer.principal_kind = PrincipalKindV1::Service;
         policy
     }

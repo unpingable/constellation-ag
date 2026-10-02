@@ -32,7 +32,6 @@ use ag_primitives::{Digest, SessionId};
 use ag_protocol::{RequestId, canonical_json, strict_json_from_slice};
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -365,7 +364,7 @@ impl ClientV1 {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+pub(crate) fn main() -> anyhow::Result<()> {
     let Arguments {
         config,
         check_config,
@@ -882,8 +881,7 @@ fn atomic_write_new_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         {
             bail!("enrollment staging file has unexpected custody");
         }
-        renameat_with(CWD, &temporary, CWD, path, RenameFlags::NOREPLACE)
-            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        publish_file_noreplace(&temporary, path)?;
         parent.sync_all()?;
         let final_bytes = std::fs::read(path)?;
         if final_bytes != bytes {
@@ -1469,10 +1467,10 @@ mod tests {
     #[test]
     fn command_profiles_reject_every_opposite_plane_operation() {
         let effect_admin: AgctlConfigV1 =
-            toml::from_str(include_str!("../../../../config/agctl.example.toml"))
+            toml::from_str(include_str!("../../../../../config/agctl.example.toml"))
                 .expect("effect-admin example");
         let proposer: AgctlConfigV1 = toml::from_str(include_str!(
-            "../../../../config/agctl-proposer.example.toml"
+            "../../../../../config/agctl-proposer.example.toml"
         ))
         .expect("proposer example");
         let proposal = Digest::hash_bytes(b"proposal");
@@ -1869,7 +1867,7 @@ mod tests {
     #[test]
     fn generated_effectd_config_and_unit_drop_in_are_complete_and_exact() {
         let mut config: EffectdConfigV1 =
-            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+            toml::from_str(include_str!("../../../../../config/effectd.example.toml"))
                 .expect("effectd example");
         config.targets.push(EffectTargetConfigV1::ManagedPointer {
             id: "service-repository".to_owned(),
@@ -1924,16 +1922,16 @@ mod tests {
     #[test]
     fn packaged_genesis_example_has_complete_static_host_scaffolding() {
         let request: ManagedPointerGenesisRequestV1 = toml::from_str(include_str!(
-            "../../../../config/managed-pointer-genesis-request.example.toml"
+            "../../../../../config/managed-pointer-genesis-request.example.toml"
         ))
         .expect("strict packaged genesis request");
         request.validate().expect("valid packaged genesis request");
         let effectd: EffectdConfigV1 =
-            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+            toml::from_str(include_str!("../../../../../config/effectd.example.toml"))
                 .expect("strict packaged effectd template");
 
         let tmpfiles =
-            include_str!("../../../../packaging/systemd/tmpfiles.d/agent-governor-ng.conf");
+            include_str!("../../../../../packaging/systemd/tmpfiles.d/agent-governor-ng.conf");
         let entry_for = |path: &Path| {
             let expected = path.to_str().expect("example path is UTF-8");
             tmpfiles
@@ -1956,12 +1954,12 @@ mod tests {
         }
 
         assert!(
-            include_str!("../../../../debian/agent-governor-ng.dirs")
+            include_str!("../../../../../debian/agent-governor-ng.dirs")
                 .lines()
                 .any(|line| line == "etc/systemd/system/ag-effectd.service.d")
         );
         assert!(
-            include_str!("../../../../docs/clean-host-activation-qualification.md")
+            include_str!("../../../../../docs/clean-host-activation-qualification.md")
                 .contains("systemctl daemon-reload")
         );
     }
@@ -1969,10 +1967,10 @@ mod tests {
     #[test]
     fn genesis_artifacts_cannot_overlap_store_staging_or_repository_roots() {
         let template: EffectdConfigV1 =
-            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+            toml::from_str(include_str!("../../../../../config/effectd.example.toml"))
                 .expect("effectd template");
         let request: ManagedPointerGenesisRequestV1 = toml::from_str(include_str!(
-            "../../../../config/managed-pointer-genesis-request.example.toml"
+            "../../../../../config/managed-pointer-genesis-request.example.toml"
         ))
         .expect("genesis request");
         require_genesis_artifact_isolation(
@@ -2011,7 +2009,7 @@ mod tests {
             .expect("object mode");
         let metadata = std::fs::metadata(directory.path()).expect("root metadata");
         let mut config: EffectdConfigV1 =
-            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+            toml::from_str(include_str!("../../../../../config/effectd.example.toml"))
                 .expect("effectd example");
         config.store.database = directory.path().join("effectd.db");
         config.store.object_store = object_store.clone();
@@ -2063,4 +2061,23 @@ mod tests {
             },
         )
     }
+}
+
+/// Move a staged regular file to `path` only if `path` is absent.
+///
+/// Linux uses `renameat2(RENAME_NOREPLACE)`. Other Unix kernels get the same
+/// no-replace guarantee for a regular file from `link(2)`, which fails with
+/// `EEXIST` when the destination exists, followed by unlinking the staging
+/// name. The published inode is the fsynced staging inode in both cases.
+#[cfg(target_os = "linux")]
+fn publish_file_noreplace(temporary: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, temporary, CWD, path, RenameFlags::NOREPLACE)
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_file_noreplace(temporary: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, path)?;
+    std::fs::remove_file(temporary)
 }

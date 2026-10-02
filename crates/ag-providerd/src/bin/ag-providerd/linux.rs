@@ -33,7 +33,7 @@ struct Arguments {
     check_config: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+pub(crate) fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     ag_app::init_logging("ag-providerd");
     let LoadedConfigV1 {

@@ -398,7 +398,7 @@ fn require_absolute_executable(path: &Path, label: &str) -> Result<PathBuf, Stri
     Ok(path)
 }
 
-fn main() {
+pub(crate) fn main() {
     if let Err(error) = run() {
         eprintln!("adoption example failed: {error}");
         std::process::exit(1);

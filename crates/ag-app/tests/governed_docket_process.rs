@@ -4,6 +4,10 @@
 //! ignored test with exact `AG_DOCKET_BIN` and `AG_EFFECTD_BIN` paths after
 //! building Docket and AG. It is development evidence, not qualification.
 
+// Exercises the Linux daemon surface (ag-effectd executor, managed pointers,
+// Linux effect adapter); it is compiled only where that surface exists.
+#![cfg(target_os = "linux")]
+
 #![allow(
     clippy::too_many_lines,
     reason = "the opt-in cross-process test keeps the entire authority chain visible in one scenario"

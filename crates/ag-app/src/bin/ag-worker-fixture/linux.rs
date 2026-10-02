@@ -18,7 +18,7 @@ use ag_app::worker_protocol::{
     write_signed_worker_candidate,
 };
 
-fn main() {
+pub(crate) fn main() {
     if run().is_err() {
         let _ = std::fs::write("/work/fixture-error", b"fixture-refusal-v1");
         std::process::exit(1);
