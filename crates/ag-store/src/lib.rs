@@ -1058,11 +1058,13 @@ pub enum StoreError {
     /// Immutable publications and restore evidence never replace an existing path.
     #[error("backup publication destination already exists: {0}")]
     BackupPublicationDestinationExists(PathBuf),
-    /// This kernel cannot publish a directory tree without replacing an
-    /// existing destination (no `renameat2(RENAME_NOREPLACE)`), so offline
-    /// backup publication is refused on this platform.
-    #[error("offline backup publication requires no-replace rename, unsupported on this platform: {0}")]
-    BackupPublicationNoReplaceUnsupported(PathBuf),
+    /// This kernel cannot install a directory tree under a previously absent
+    /// name atomically (no `renameat2(RENAME_NOREPLACE)`), so offline backup
+    /// publication and restore are refused on this platform before copying.
+    #[error(
+        "offline backup publication and restore require no-replace rename, unsupported on this platform: {0}"
+    )]
+    BackupNoReplaceRenameUnsupported(PathBuf),
     /// Blob bytes or size do not match their descriptor.
     #[error("blob mismatch: expected {expected:?}, observed {actual:?}")]
     BlobMismatch {

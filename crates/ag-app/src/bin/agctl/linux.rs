@@ -881,7 +881,14 @@ fn atomic_write_new_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         {
             bail!("enrollment staging file has unexpected custody");
         }
-        publish_file_noreplace(&temporary, path)?;
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &temporary,
+            rustix::fs::CWD,
+            path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         parent.sync_all()?;
         let final_bytes = std::fs::read(path)?;
         if final_bytes != bytes {
@@ -2061,23 +2068,4 @@ mod tests {
             },
         )
     }
-}
-
-/// Move a staged regular file to `path` only if `path` is absent.
-///
-/// Linux uses `renameat2(RENAME_NOREPLACE)`. Other Unix kernels get the same
-/// no-replace guarantee for a regular file from `link(2)`, which fails with
-/// `EEXIST` when the destination exists, followed by unlinking the staging
-/// name. The published inode is the fsynced staging inode in both cases.
-#[cfg(target_os = "linux")]
-fn publish_file_noreplace(temporary: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
-    use rustix::fs::{CWD, RenameFlags, renameat_with};
-    renameat_with(CWD, temporary, CWD, path, RenameFlags::NOREPLACE)
-        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn publish_file_noreplace(temporary: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::hard_link(temporary, path)?;
-    std::fs::remove_file(temporary)
 }

@@ -13,6 +13,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ag-effectd: unsupported on this platform; it is the Linux daemon surface of Agent Governor");
+    eprintln!(
+        "ag-effectd: unsupported on this platform; it is the Linux daemon surface of Agent Governor"
+    );
     std::process::exit(78);
 }

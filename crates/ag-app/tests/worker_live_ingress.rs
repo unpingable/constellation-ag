@@ -1,6 +1,6 @@
 //! Live, feature-gated fixture coverage for the generic worker ingress substrate.
 
-#![cfg(feature = "worker-fixture")]
+#![cfg(all(target_os = "linux", feature = "worker-fixture"))]
 
 use std::ffi::OsString;
 use std::fs;

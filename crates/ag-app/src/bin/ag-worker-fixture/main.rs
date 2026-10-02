@@ -7,12 +7,14 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-fn main() -> () {
+fn main() {
     linux::main()
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ag-worker-fixture: unsupported on this platform; it is the Linux daemon surface of Agent Governor");
+    eprintln!(
+        "ag-worker-fixture: unsupported on this platform; it is the Linux daemon surface of Agent Governor"
+    );
     std::process::exit(78);
 }

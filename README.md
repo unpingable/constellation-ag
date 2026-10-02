@@ -35,6 +35,15 @@ minimal privileged effect broker. The initial production target is a
 single-host Linux service for contained batch work, Git managed-ref promotion,
 managed files, and systemd units.
 
+Platform boundary: the governed loop (`ag-loopctl`, `ag-standing-resolver`,
+`ag-gcl-v1-glass-heron`, the campaign engine, store and ports) builds and
+runs on Linux and FreeBSD. The daemon surface (`agd`, `agctl`, `ag-effectd`,
+`ag-worker-fixture`, `ag-providerd`, `ag-providerctl`, the Linux effect
+executor, Landlock exact exec, managed pointers and `SO_PEERCRED` transport)
+is Linux-only; on other kernels those binaries exist and exit 78
+(`EX_CONFIG`) naming the boundary, and offline backup publication and
+restore refuse because the kernel has no no-replace directory rename.
+
 The pure kernel is crosswalked against the public Governed Admissibility
 Calculus v14 through an explicit, non-authorizing adapter. The adapter binds
 native Rust decisions to a reviewed specification revision and operational

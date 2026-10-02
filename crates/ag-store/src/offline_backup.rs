@@ -418,6 +418,7 @@ pub fn publish_backup_staging(
     if fs::symlink_metadata(&destination).is_ok() {
         return Err(StoreError::BackupPublicationDestinationExists(destination));
     }
+    require_noreplace_rename(&destination)?;
     rename_noreplace(&staging_root, &destination)?;
     File::open(publication_parent)?.sync_all()?;
     let published = verify_backup_publication(&destination)?;
@@ -451,6 +452,7 @@ pub fn restore_backup_evidence(
     if fs::symlink_metadata(&destination).is_ok() {
         return Err(StoreError::BackupPublicationDestinationExists(destination));
     }
+    require_noreplace_rename(&destination)?;
     let temporary = TempBuilder::new()
         .prefix(".ag-restore-")
         .tempdir_in(parent)?;
@@ -732,12 +734,27 @@ fn seal_tree_directories(root: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Publish a staged backup tree only if the destination name is absent.
+/// Refuse, before any copying, on kernels that cannot install a directory
+/// tree under a previously absent name atomically.
 ///
-/// Atomic no-replace renaming of a directory tree needs `renameat2(2)` with
-/// `RENAME_NOREPLACE`. Kernels without it (FreeBSD among them) cannot express
-/// this operation for directories, so publication refuses explicitly instead
-/// of degrading to a replacing rename.
+/// Publication and restore both end in `renameat2(2)` with
+/// `RENAME_NOREPLACE` on a directory tree. Kernels without it (FreeBSD among
+/// them) have no equivalent, so both operations refuse explicitly up front
+/// instead of staging a tree they cannot install or degrading to a replacing
+/// rename.
+#[cfg(target_os = "linux")]
+fn require_noreplace_rename(_destination: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_noreplace_rename(destination: &Path) -> Result<(), StoreError> {
+    Err(StoreError::BackupNoReplaceRenameUnsupported(
+        destination.to_owned(),
+    ))
+}
+
+/// Install a staged backup tree only if the destination name is absent.
 #[cfg(target_os = "linux")]
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), StoreError> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -752,7 +769,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), StoreError>
 
 #[cfg(not(target_os = "linux"))]
 fn rename_noreplace(_source: &Path, destination: &Path) -> Result<(), StoreError> {
-    Err(StoreError::BackupPublicationNoReplaceUnsupported(
+    Err(StoreError::BackupNoReplaceRenameUnsupported(
         destination.to_owned(),
     ))
 }
@@ -1005,19 +1022,30 @@ mod tests {
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn publication_refuses_where_no_replace_rename_is_unavailable() {
+    fn publication_and_restore_refuse_where_no_replace_rename_is_unavailable() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("staged");
         let destination = root.path().join("published");
         std::fs::create_dir(&source).unwrap();
         match rename_noreplace(&source, &destination) {
-            Err(StoreError::BackupPublicationNoReplaceUnsupported(path)) => {
+            Err(StoreError::BackupNoReplaceRenameUnsupported(path)) => {
                 assert_eq!(path, destination);
             }
             other => panic!("expected explicit platform refusal, got {other:?}"),
         }
+        match require_noreplace_rename(&destination) {
+            Err(StoreError::BackupNoReplaceRenameUnsupported(path)) => {
+                assert_eq!(path, destination);
+            }
+            other => panic!("expected up-front platform refusal, got {other:?}"),
+        }
         assert!(source.is_dir(), "staged tree must be left untouched");
         assert!(!destination.exists(), "nothing may be published");
+        let leftovers: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("staged")]);
     }
 
     #[cfg(target_os = "linux")]

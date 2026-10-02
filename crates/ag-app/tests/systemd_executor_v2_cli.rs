@@ -1,6 +1,6 @@
 //! Process-bound qualification for the V2 systemd executor CLI.
 
-#![cfg(feature = "systemd-dbus")]
+#![cfg(all(target_os = "linux", feature = "systemd-dbus"))]
 
 use std::fs::OpenOptions;
 use std::io::Write as _;

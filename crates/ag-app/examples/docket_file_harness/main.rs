@@ -5,12 +5,14 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-fn main() -> () {
+fn main() {
     linux::main()
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("docket_file_harness: unsupported on this platform; it drives the Linux effect executor");
+    eprintln!(
+        "docket_file_harness: unsupported on this platform; it drives the Linux effect executor"
+    );
     std::process::exit(78);
 }
