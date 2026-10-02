@@ -60,6 +60,7 @@ fn immutable_store_audit_cli_returns_owner_outcome_and_refuses_wrong_digest() {
             require_private_parent_writes: true,
         },
         systemd_machine_identity: "00000000000000000000000000000000".to_owned(),
+        authorization: None,
         execution_lock_timeout_ms: 5_000,
         job_timeout_ms: 30_000,
     };
@@ -127,7 +128,7 @@ fn immutable_store_audit_cli_returns_owner_outcome_and_refuses_wrong_digest() {
 }
 
 #[test]
-fn lock_deadline_is_exact_exit_75_with_no_stdout_outcome() {
+fn bare_dispatch_is_refused_before_locked_systemd_mechanics() {
     let directory = tempfile::tempdir().unwrap();
     let subject = Digest::hash_bytes(b"cli-systemd-subject");
     let scope = Digest::hash_bytes(b"cli-systemd-scope");
@@ -151,6 +152,7 @@ fn lock_deadline_is_exact_exit_75_with_no_stdout_outcome() {
             require_private_parent_writes: true,
         },
         systemd_machine_identity: "0123456789abcdef0123456789abcdef".to_owned(),
+        authorization: None,
         execution_lock_timeout_ms: 1,
         job_timeout_ms: 30_000,
     };
@@ -195,7 +197,32 @@ fn lock_deadline_is_exact_exit_75_with_no_stdout_outcome() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
 
-    assert_eq!(output.status.code(), Some(75));
+    assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"systemd_attempt_in_progress\n");
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("unknown field `attempt`"));
+    assert_eq!(std::fs::metadata(&plan.attempt_store).unwrap().len(), 0);
+    assert_eq!(
+        execute_systemd_effect_attempt(&plan, &dispatch).unwrap_err(),
+        "systemd_attempt_in_progress"
+    );
+}
+
+#[test]
+fn current_systemd_identity_matches_shared_nightshift_vector() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/systemd-plan-identity-v2.json")).unwrap();
+    let plan: EffectExecutorSystemdPlanV2 = serde_json::from_value(vector["plan"].clone()).unwrap();
+    assert_eq!(
+        plan.identity().unwrap().as_str(),
+        vector["identity"].as_str().unwrap()
+    );
+    let mut substituted = plan.clone();
+    substituted
+        .authorization
+        .as_mut()
+        .unwrap()
+        .expected_runtime_profile = Digest::hash_bytes(b"alternate");
+    assert_ne!(substituted.identity().unwrap(), plan.identity().unwrap());
 }

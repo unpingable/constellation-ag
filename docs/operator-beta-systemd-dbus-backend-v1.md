@@ -278,3 +278,9 @@ The bounded executable M1A owner result directly qualifies:
 The exact result and retained run-004 evidence require independent result audit
 before publication. Current gate:
 `M1A_OWNER_RESULT_QUALIFIED__INDEPENDENT_RESULT_AUDIT_REQUIRED`.
+
+## Current signed dispatch enrollment
+
+The Systemd V2 CLI consumes only `docket.governed-executor-dispatch/v2` for execute and reconcile. The complete signed issuance, Docket custody and inner dispatch are validated through the same installed runtime-profile, issuer trust and read-only persisted Docket inspection used by the current generic executor. Signature/authority, campaign, exact work/subject/scope, attempt/marker, installed executor bytes and operation-admitting custody state must agree before mechanics. Reconciliation never asks for new standing or dispatches a new effect.
+
+The sealed Systemd plan carries `authorization.expected_runtime_profile`, binding its work identity to the independently installed profile. Absent authorization remains readable for retained identity/audit queries but cannot execute or reconcile through the current production CLI. Bare inner dispatch is refused. The plan cannot select trust files, an inspector, a state root or an alternate profile. Shared current identity vectors live in `crates/ag-app/tests/fixtures/systemd-plan-identity-v2.json` and the corresponding Nightshift fixture.

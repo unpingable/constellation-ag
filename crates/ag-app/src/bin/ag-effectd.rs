@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use ag_app::effect_executor_adapter::{
     audit_systemd_effect_store_cut, execute_effect_attempt, execute_systemd_effect_attempt,
     load_effect_executor_plan_any, reconcile_effect_attempt, reconcile_systemd_effect_attempt,
-    verify_authorized_dispatch_v2, verify_plan_deployment_v2, AuthorizedEffectDispatchV2,
-    EffectExecutorDispatchV1, LoadedEffectExecutorPlan, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
+    verify_authorized_dispatch_v2, verify_authorized_systemd_dispatch_v2,
+    verify_plan_deployment_v2, AuthorizedEffectDispatchV2, EffectExecutorDispatchV1,
+    LoadedEffectExecutorPlan, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
@@ -79,7 +80,11 @@ fn main() -> anyhow::Result<()> {
                     verify_authorized_dispatch_v2(inner, &authorized, "execute")
                         .map_err(anyhow::Error::msg)?
                 }
-                LoadedEffectExecutorPlan::SystemdV2(_) => read_stdin_strict()?,
+                LoadedEffectExecutorPlan::SystemdV2(inner) => {
+                    let authorized: AuthorizedEffectDispatchV2 = read_stdin_strict()?;
+                    verify_authorized_systemd_dispatch_v2(inner, &authorized, "execute")
+                        .map_err(anyhow::Error::msg)?
+                }
             };
             let outcome = match &plan {
                 LoadedEffectExecutorPlan::V1(plan) => execute_effect_attempt(plan, &dispatch),
@@ -96,6 +101,11 @@ fn main() -> anyhow::Result<()> {
                 LoadedEffectExecutorPlan::V1(inner) if inner.authorization.is_some() => {
                     let authorized: AuthorizedEffectDispatchV2 = read_stdin_strict()?;
                     verify_authorized_dispatch_v2(inner, &authorized, "reconcile")
+                        .map_err(anyhow::Error::msg)?
+                }
+                LoadedEffectExecutorPlan::SystemdV2(inner) => {
+                    let authorized: AuthorizedEffectDispatchV2 = read_stdin_strict()?;
+                    verify_authorized_systemd_dispatch_v2(inner, &authorized, "reconcile")
                         .map_err(anyhow::Error::msg)?
                 }
                 _ => read_stdin_strict()?,

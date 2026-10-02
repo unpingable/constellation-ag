@@ -1,0 +1,30 @@
+{
+  "plan": {
+    "schema": "ag-effectd.docket-executor-systemd-plan/v2",
+    "attempt_store": "/var/lib/constellation-m2/effect-attempts.sqlite",
+    "subject": "sha256:6262626262626262626262626262626262626262626262626262626262626262",
+    "scope": "sha256:3131313131313131313131313131313131313131313131313131313131313131",
+    "effect_index": 0,
+    "effect": {
+      "kind": "systemd_unit",
+      "target": "constellation-beta-http-fixture",
+      "unit": "constellation-beta-http-fixture.service",
+      "action": "start",
+      "expected_active_state": "inactive",
+      "expected_unit_file_state": "disabled"
+    },
+    "file_policy": {
+      "max_content_bytes": 1024,
+      "trusted_ancestor_uid": 0,
+      "trusted_parent_uid": 0,
+      "require_private_parent_writes": true
+    },
+    "systemd_machine_identity": "0123456789abcdef0123456789abcdef",
+    "authorization": {
+      "expected_runtime_profile": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "execution_lock_timeout_ms": 5000,
+    "job_timeout_ms": 30000
+  },
+  "identity": "sha256:11e7e7ec216ea023de71e20ec5db71fa1997a0ade014e5da2136910b90572e08"
+}

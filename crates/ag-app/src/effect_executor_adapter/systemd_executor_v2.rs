@@ -69,6 +69,9 @@ pub struct EffectExecutorSystemdPlanV2 {
     pub file_policy: EffectFilePolicyV1,
     /// Exact lowercase system-bus machine identity.
     pub systemd_machine_identity: String,
+    /// Assert the independently installed runtime profile. Absent plans are query-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<super::EffectAuthorizationInputsV2>,
     /// Maximum wait for the local exclusive execution lock.
     pub execution_lock_timeout_ms: u64,
     /// Maximum wait after `StartUnit` transmission begins.
@@ -182,7 +185,7 @@ fn validate_systemd_plan(plan: &EffectExecutorSystemdPlanV2) -> Result<(), Strin
     Ok(())
 }
 
-fn validate_dispatch(
+pub(super) fn validate_dispatch(
     plan: &EffectExecutorSystemdPlanV2,
     dispatch: &EffectExecutorDispatchV1,
 ) -> Result<(), String> {
@@ -1627,6 +1630,7 @@ mod tests {
                 require_private_parent_writes: true,
             },
             systemd_machine_identity: "0123456789abcdef0123456789abcdef".to_owned(),
+            authorization: None,
             execution_lock_timeout_ms: 5_000,
             job_timeout_ms: 30_000,
         };

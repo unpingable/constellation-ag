@@ -22,7 +22,9 @@ for package in agent-governor-ng-operator-tools agent-governor-ng-systemd-execut
     if [[ $package == agent-governor-ng-operator-tools ]]; then
         install -d -m 0755 "$d/usr/bin"
         install -m 0755 "$bin_dir/ag-loopctl" "$bin_dir/ag-standing-resolver" "$bin_dir/ag-operator-ui" "$d/usr/bin/"
-        depends='libc6 (>= 2.35), git'
+        # These binaries use current local process/SQLite boundaries; Git is not
+        # a runtime dependency of this selected package.
+        depends='libc6 (>= 2.35)'
         description='Agent Governor governed-loop operator tools'
         install -m 0644 "$root/docs/governed-loop-c1.md" "$d/usr/share/doc/$package/"
     else

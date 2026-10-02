@@ -52,6 +52,7 @@ fn fixture() -> (
             require_private_parent_writes: true,
         },
         systemd_machine_identity: "0123456789abcdef0123456789abcdef".to_owned(),
+        authorization: None,
         execution_lock_timeout_ms: 5_000,
         job_timeout_ms: 30_000,
     };

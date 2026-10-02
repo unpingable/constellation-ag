@@ -694,15 +694,11 @@ fn load_enrolled_runtime(path: &Path) -> Result<EnrolledRuntimeV1, String> {
 }
 
 fn bind_enrolled_docket<'a>(
-    plan: &EffectExecutorPlanV1,
+    expected: &EffectAuthorizationInputsV2,
     enrolled: &'a EnrolledRuntimeV1,
     executable_path: &Path,
     executable_bytes: &[u8],
 ) -> Result<(&'a GovernedDocketRootV1, Vec<u8>), String> {
-    let expected = plan
-        .authorization
-        .as_ref()
-        .ok_or_else(|| "effect-executor-v2-plan-required".to_owned())?;
     if expected.expected_runtime_profile != enrolled.profile_digest {
         return Err("effect-executor-plan-profile-substitution".to_owned());
     }
@@ -748,7 +744,12 @@ pub fn verify_plan_deployment_v2(plan: &EffectExecutorPlanV1) -> Result<(), Stri
         .map_err(|error| format!("effect-executor-self-path:{error}"))?;
     let executable_bytes = std::fs::read("/proc/self/exe")
         .map_err(|error| format!("effect-executor-self-identity:{error}"))?;
-    let _ = bind_enrolled_docket(plan, &enrolled, &executable_path, &executable_bytes)?;
+    let _ = bind_enrolled_docket(
+        plan.authorization.as_ref().expect("checked authorization"),
+        &enrolled,
+        &executable_path,
+        &executable_bytes,
+    )?;
     Ok(())
 }
 
@@ -761,6 +762,46 @@ pub fn verify_authorized_dispatch_v2(
     operation: &str,
 ) -> Result<EffectExecutorDispatchV1, String> {
     validate_plan(plan)?;
+    validate_dispatch(plan, &input.dispatch)?;
+    verify_authorized_dispatch(
+        plan.authorization
+            .as_ref()
+            .ok_or_else(|| "effect-executor-v2-plan-required".to_owned())?,
+        &plan.identity()?,
+        &input.dispatch,
+        input,
+        operation,
+    )
+}
+
+/// Verify current signed Docket transport before any Systemd mechanics.
+///
+/// # Errors
+/// Refuses absent enrollment, signature/authority or exact custody mismatches.
+pub fn verify_authorized_systemd_dispatch_v2(
+    plan: &EffectExecutorSystemdPlanV2,
+    input: &AuthorizedEffectDispatchV2,
+    operation: &str,
+) -> Result<EffectExecutorDispatchV1, String> {
+    systemd_executor_v2::validate_dispatch(plan, &input.dispatch)?;
+    verify_authorized_dispatch(
+        plan.authorization
+            .as_ref()
+            .ok_or_else(|| "systemd-executor-authorization-required".to_owned())?,
+        &plan.identity()?,
+        &input.dispatch,
+        input,
+        operation,
+    )
+}
+
+fn verify_authorized_dispatch(
+    expected: &EffectAuthorizationInputsV2,
+    plan_identity: &Digest,
+    _dispatch: &EffectExecutorDispatchV1,
+    input: &AuthorizedEffectDispatchV2,
+    operation: &str,
+) -> Result<EffectExecutorDispatchV1, String> {
     let deployment_path = installed_deployment_path()?;
     let enrolled = load_enrolled_runtime(&deployment_path)?;
     let executable_path = std::fs::read_link("/proc/self/exe")
@@ -768,11 +809,10 @@ pub fn verify_authorized_dispatch_v2(
     let self_bytes = std::fs::read("/proc/self/exe")
         .map_err(|error| format!("effect-executor-self-identity:{error}"))?;
     let (authority, trust_bytes) =
-        bind_enrolled_docket(plan, &enrolled, &executable_path, &self_bytes)?;
+        bind_enrolled_docket(expected, &enrolled, &executable_path, &self_bytes)?;
     if input.schema != DOCKET_EXECUTOR_DISPATCH_SCHEMA_V2 {
         return Err("effect-executor-dispatch-schema".to_owned());
     }
-    validate_dispatch(plan, &input.dispatch)?;
 
     let trust: IssuerTrustV1 = strict_json_from_slice(&trust_bytes)
         .map_err(|error| format!("effect-executor-issuer-trust-json:{error}"))?;
@@ -897,7 +937,9 @@ pub fn verify_authorized_dispatch_v2(
     let output = inspector
         .wait_with_output()
         .map_err(|error| format!("effect-executor-docket-inspect-output:{error}"))?;
-    if !output.status.success() || output.stdout.len() as u64 > DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1 {
+    if !output.status.success()
+        || output.stdout.len() as u64 > DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1
+    {
         return Err("effect-executor-docket-inspect-refused".to_owned());
     }
     let inspected: DocketInspectionV1 = strict_json_from_slice(&output.stdout)
@@ -910,7 +952,7 @@ pub fn verify_authorized_dispatch_v2(
         || record.issuance != issuance
         || record.authentication != *authentication
         || record.custody != *custody
-        || record.executor_plan != plan.identity()?.as_str()
+        || record.executor_plan != plan_identity.as_str()
     {
         return Err("effect-executor-docket-inspection-substitution".to_owned());
     }
@@ -1649,7 +1691,7 @@ mod tests {
         assert_eq!(work, plan.identity().unwrap());
         assert!(!catalog_document.to_string().contains(work.as_str()));
         assert!(bind_enrolled_docket(
-            &plan,
+            plan.authorization.as_ref().unwrap(),
             &enrolled,
             &test_program,
             b"non-deployable-fixture-executable"
@@ -1660,7 +1702,7 @@ mod tests {
             expected_runtime_profile: Digest::hash_bytes(b"alternate-profile"),
         });
         assert!(bind_enrolled_docket(
-            &wrong_plan,
+            wrong_plan.authorization.as_ref().unwrap(),
             &enrolled,
             &test_program,
             b"non-deployable-fixture-executable"
@@ -1668,7 +1710,7 @@ mod tests {
         .is_err());
         std::fs::write(&trust_path, b"{\"issuers\":[{}]}").unwrap();
         assert!(bind_enrolled_docket(
-            &plan,
+            plan.authorization.as_ref().unwrap(),
             &enrolled,
             &test_program,
             b"non-deployable-fixture-executable"
