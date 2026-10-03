@@ -242,6 +242,14 @@ pub struct GovernedRuntimeProfileV1 {
     /// Optional authenticated non-browser intervention submission ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_ingress: Option<GovernedInterventionIngressV1>,
+    /// Optional separate resolver for completion under an enrolled
+    /// postcondition basis; the precondition resolver never completes such
+    /// work. Absent profiles serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_resolver: Option<PinnedDeploymentFileV1>,
+    /// Exact identity accepted from the postcondition resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_resolver_id: Option<String>,
 }
 
 impl GovernedRuntimeProfileV1 {
@@ -261,6 +269,25 @@ impl GovernedRuntimeProfileV1 {
         }
         let _ = self.observation_resolver.verify(true)?;
         let _ = self.standing_resolver.verify(true)?;
+        match (
+            &self.postcondition_resolver,
+            &self.postcondition_resolver_id,
+        ) {
+            (None, None) => {}
+            (Some(resolver), Some(id))
+                if !id.is_empty()
+                    && id.len() <= 256
+                    && !id.chars().any(char::is_control)
+                    && *id != self.observation_resolver_id =>
+            {
+                let _ = resolver.verify(true)?;
+            }
+            _ => {
+                return Err(GovernedPortErrorV1::InvalidConfiguration(
+                    "invalid governed postcondition resolver",
+                ));
+            }
+        }
         let catalog = self.exact_work_catalog.verify(false)?;
         let document =
             JcsDocument::from_canonical_bytes(catalog.strip_suffix(b"\n").unwrap_or(&catalog))
@@ -380,6 +407,12 @@ pub struct GovernedRuntimeProfileEnrollmentV1 {
     /// Optional intervention submitting-service enrollment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervention_ingress: Option<GovernedInterventionIngressEnrollmentV1>,
+    /// Optional postcondition resolver executable path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_resolver: Option<PathBuf>,
+    /// Exact expected postcondition resolver identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_resolver_id: Option<String>,
 }
 
 /// Deployment input for one authenticated non-browser intervention submitter.
@@ -464,6 +497,11 @@ impl GovernedRuntimeProfileEnrollmentV1 {
                     })
                 })
                 .transpose()?,
+            postcondition_resolver: self
+                .postcondition_resolver
+                .map(|path| PinnedDeploymentFileV1::measure(path, true))
+                .transpose()?,
+            postcondition_resolver_id: self.postcondition_resolver_id,
         };
         profile.verify_genesis()?;
         Ok(profile)

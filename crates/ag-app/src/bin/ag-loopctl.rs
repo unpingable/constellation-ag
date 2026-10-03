@@ -798,22 +798,42 @@ fn main() -> anyhow::Result<()> {
         } => {
             let input: CompletionInputV1 = read_exact_record(&input)?;
             let (mut engine, profile, profile_digest) = open_bound_with_digest(&database)?;
-            let _ = profile
-                .observation_resolver
-                .verify_presented(&observation_resolver, true)?;
-            if expected_observation_resolver_id != profile.observation_resolver_id {
-                bail!("caller substituted the genesis-pinned observation resolver identity");
-            }
             let catalog = pinned_catalog(&profile)?;
             let plan = plan_witness(executor_plan.as_deref(), &profile_digest)?;
-            let mut observation =
-                CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
+            // Work governed by an enrolled postcondition basis completes only
+            // through the genesis-pinned postcondition resolver; all other
+            // work only through the precondition resolver.
+            let current = engine.current()?;
+            let (pinned, resolver_id) = if catalog.completion_requires_postcondition(
+                current.state().meta().expected_work(),
+                plan.as_ref(),
+            )? {
+                match (
+                    &profile.postcondition_resolver,
+                    &profile.postcondition_resolver_id,
+                ) {
+                    (Some(resolver), Some(id)) => (resolver, id),
+                    _ => bail!(
+                        "the catalog enrolls a postcondition basis but the runtime profile pins no postcondition resolver"
+                    ),
+                }
+            } else {
+                (
+                    &profile.observation_resolver,
+                    &profile.observation_resolver_id,
+                )
+            };
+            let _ = pinned.verify_presented(&observation_resolver, true)?;
+            if expected_observation_resolver_id != *resolver_id {
+                bail!("caller substituted the genesis-pinned completion resolver identity");
+            }
+            let mut observation = CommandObservationResolverV1::new(pinned.path.clone());
             write_exact(&engine.complete_with_catalog(
                 input.observation,
                 &input.subject,
                 input.terminal_witness,
                 &mut observation,
-                &profile.observation_resolver_id,
+                resolver_id,
                 &catalog,
                 plan.as_ref(),
                 now()?,

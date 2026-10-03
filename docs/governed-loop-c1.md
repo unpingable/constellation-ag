@@ -154,6 +154,15 @@ occurrence's work. A current precondition answer never completes the work;
 stale, superseded or contradictory answers from either basis neither
 authorize nor complete.
 
+The postcondition answer comes from its own resolver, pinned at genesis like
+the precondition resolver: the runtime-profile enrollment may name
+`postcondition_resolver` (path, byte-pinned) and `postcondition_resolver_id`
+(both or neither; the identity must differ from `observation_resolver_id`;
+profiles without them serialize as before). `complete` for work whose entry
+enrolls a `postcondition_basis` accepts only that pinned path and identity
+and refuses when the profile pins none; completion of any other work accepts
+only the precondition resolver.
+
 Neither observation generation grants standing. Proposal/work, subject,
 scope, occurrence, current standing, current catalog, and one-use spend remain
 independent gates. A typed basis has no atoms, and AG does not import civild

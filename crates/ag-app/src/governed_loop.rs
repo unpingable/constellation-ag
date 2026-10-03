@@ -348,6 +348,22 @@ impl VersionedExactWorkCatalogV1 {
             Self::ExactBasisV2(catalog) => catalog.validate(),
         }
     }
+
+    /// True when completion of an occurrence opened for `expected_work` is
+    /// governed by an enrolled postcondition basis, which only the profile's
+    /// separate postcondition resolver can establish.
+    pub fn completion_requires_postcondition(
+        &self,
+        expected_work: &Digest,
+        plan: Option<&ExactPlanWitnessV1>,
+    ) -> Result<bool, CampaignEngineErrorV1> {
+        match self {
+            Self::NightshiftV1(_) => Ok(false),
+            Self::ExactBasisV2(catalog) => Ok(catalog
+                .completion_entry(expected_work, plan)?
+                .is_some_and(|entry| entry.postcondition_basis.is_some())),
+        }
+    }
 }
 
 impl ExactWorkCatalogV2 {

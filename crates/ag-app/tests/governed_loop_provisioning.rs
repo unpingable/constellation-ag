@@ -648,3 +648,290 @@ fn owner_enrolls_exact_canary_plans_and_genesis_refuses_other_work() {
         assert!(!database.exists(), "{name} must not create a campaign");
     }
 }
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one completion-resolver selection trace keeps sealing, init and the three refusals adjacent"
+)]
+fn completion_under_a_postcondition_basis_uses_only_the_pinned_postcondition_resolver() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let config = root.join("config");
+    let state = root.join("state");
+    let secrets = root.join("secrets");
+    for path in [&config, &state, &secrets] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let template = config.join("plan-template.json");
+    write_jcs(
+        &template,
+        &canary_plan_json("attention-canary.service", "inactive", None),
+    );
+    let enrolled = value(&invoke(&args(&[
+        "systemd-plan-enrollment",
+        "--template",
+        &template.display().to_string(),
+        "--unit",
+        "attention-canary.service",
+        "--prestate",
+        "inactive",
+    ])));
+    let command = config.join("boundary-command");
+    write_executable(&command);
+    // Each resolver leaves a trace when AG runs it, then refuses.
+    let resolver = |name: &str| {
+        let path = config.join(name);
+        let trace = state.join(format!("{name}.ran"));
+        fs::write(
+            &path,
+            format!("#!/bin/sh\n: > '{}'\nexit 3\n", trace.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        (path, trace)
+    };
+    let (pre, pre_trace) = resolver("pre-resolver");
+    let (post, post_trace) = resolver("post-resolver");
+    let basis = |basis_type: &str, byte: char| {
+        json!({
+            "kind": "typed_basis",
+            "requirement": {
+                "schema": "ag.governed-loop.typed-observation-basis/v1",
+                "basis_type": basis_type,
+                "basis_identity": digest(byte)
+            }
+        })
+    };
+    let catalog = config.join("catalog.json");
+    write_jcs(
+        &catalog,
+        &json!({
+            "schema": "ag.governed-loop.exact-work-catalog/v2",
+            "entries": {
+                "ag-effectd.docket-executor-systemd-work/v2": {
+                    "work_schema": "ag-effectd.docket-executor-systemd-work/v2",
+                    "subject": digest('d'),
+                    "scope": digest('e'),
+                    "observation_basis": basis("constellation.remediation.systemd-not-active/v1", '1'),
+                    "admitted_plans": enrolled["admitted_plans"],
+                    "postcondition_basis": basis("constellation.remediation.systemd-active/v1", '2')
+                }
+            }
+        }),
+    );
+    let trust = config.join("docket-trust.json");
+    write_jcs(&trust, &json!({}));
+    let issuer_key = secrets.join("issuer.pk8");
+    let key_bytes: Vec<u8> = (0..ISSUER_PKCS8_HEX.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&ISSUER_PKCS8_HEX[offset..offset + 2], 16).unwrap())
+        .collect();
+    fs::write(&issuer_key, key_bytes).unwrap();
+    fs::set_permissions(&issuer_key, fs::Permissions::from_mode(0o600)).unwrap();
+    let seal = |name: &str, with_post: bool| {
+        let mut enrollment = json!({
+            "schema": "ag.governed-loop.runtime-profile-enrollment/v1",
+            "profile_label": "remediation-completion-resolver",
+            "observation_resolver": pre,
+            "observation_resolver_id": "fixture-precondition/v1",
+            "standing_resolver": command,
+            "standing_resolver_id": "fixture-standing/v1",
+            "max_standing_ttl_ms": 60000,
+            "exact_work_catalog": catalog,
+            "controlling_review": null,
+            "docket": {
+                "schema": "ag.governed-loop.docket-root-enrollment/v1",
+                "docket_program": command,
+                "state_directory": state.join("docket"),
+                "trust_config": trust,
+                "standing_resolver": command,
+                "executor_adapter": command,
+                "issuer_principal": "fixture-ag",
+                "issuer_key_id": "fixture-key-1",
+                "issuer_key": issuer_key
+            },
+            "human_verifier": null
+        });
+        if with_post {
+            enrollment["postcondition_resolver"] = json!(post);
+            enrollment["postcondition_resolver_id"] = json!("fixture-postcondition/v1");
+        }
+        let path = config.join(format!("{name}-enrollment.json"));
+        write_jcs(&path, &enrollment);
+        let profile = config.join(format!("{name}-profile.json"));
+        let sealed = value(&invoke(&args(&[
+            "seal-runtime-profile",
+            "--enrollment",
+            &path.display().to_string(),
+            "--output",
+            &profile.display().to_string(),
+        ])));
+        (
+            profile,
+            sealed["profile_digest"].as_str().unwrap().to_owned(),
+        )
+    };
+    // The precondition and postcondition identities must differ.
+    let mut same = json!({
+        "schema": "ag.governed-loop.runtime-profile-enrollment/v1",
+        "profile_label": "remediation-completion-resolver",
+        "observation_resolver": pre,
+        "observation_resolver_id": "fixture-precondition/v1",
+        "standing_resolver": command,
+        "standing_resolver_id": "fixture-standing/v1",
+        "max_standing_ttl_ms": 60000,
+        "exact_work_catalog": catalog,
+        "controlling_review": null,
+        "docket": {
+            "schema": "ag.governed-loop.docket-root-enrollment/v1",
+            "docket_program": command,
+            "state_directory": state.join("docket"),
+            "trust_config": trust,
+            "standing_resolver": command,
+            "executor_adapter": command,
+            "issuer_principal": "fixture-ag",
+            "issuer_key_id": "fixture-key-1",
+            "issuer_key": issuer_key
+        },
+        "human_verifier": null,
+        "postcondition_resolver": post,
+        "postcondition_resolver_id": "fixture-precondition/v1"
+    });
+    let same_path = config.join("same-enrollment.json");
+    write_jcs(&same_path, &same);
+    assert!(
+        !invoke(&args(&[
+            "seal-runtime-profile",
+            "--enrollment",
+            &same_path.display().to_string(),
+            "--output",
+            &config.join("same-profile.json").display().to_string(),
+        ]))
+        .status
+        .success()
+    );
+    same["postcondition_resolver_id"] = json!(null);
+    write_jcs(&same_path, &same);
+    assert!(
+        !invoke(&args(&[
+            "seal-runtime-profile",
+            "--enrollment",
+            &same_path.display().to_string(),
+            "--output",
+            &config.join("half-profile.json").display().to_string(),
+        ]))
+        .status
+        .success(),
+        "a postcondition resolver without its identity must refuse"
+    );
+
+    let campaign = |name: &str, with_post: bool| {
+        let (profile, profile_digest) = seal(name, with_post);
+        let plan = canary_plan_json(
+            "attention-canary.service",
+            "inactive",
+            Some(&profile_digest),
+        );
+        let plan_path = config.join(format!("{name}-plan.json"));
+        write_jcs(&plan_path, &plan);
+        let genesis = config.join(format!("{name}-genesis.json"));
+        write_jcs(
+            &genesis,
+            &json!({
+                "campaign": digest('a'),
+                "occurrence": "00000000-0000-4000-8000-000000000001",
+                "program": digest('b'),
+                "expected_ag_work": plan_work(&plan),
+                "residuals": [],
+                "budget": {
+                    "retry_limit": 0, "retries_used": 0,
+                    "probe_limit": 0, "probes_used": 0,
+                    "escalation_limit": 0, "escalations_used": 0
+                }
+            }),
+        );
+        let database = state.join(format!("{name}.sqlite"));
+        let _ = value(&invoke(&args(&[
+            "init",
+            "--database",
+            &database.display().to_string(),
+            "--genesis",
+            &genesis.display().to_string(),
+            "--runtime-profile",
+            &profile.display().to_string(),
+            "--executor-plan",
+            &plan_path.display().to_string(),
+        ])));
+        (database, plan_path)
+    };
+    let completion = config.join("complete.json");
+    write_jcs(
+        &completion,
+        &json!({
+            "observation": digest('7'),
+            "subject": digest('d'),
+            "terminal_witness": digest('8')
+        }),
+    );
+    let complete = |database: &Path, plan: &Path, resolver: &Path, id: &str| {
+        invoke(&args(&[
+            "complete",
+            "--database",
+            &database.display().to_string(),
+            "--input",
+            &completion.display().to_string(),
+            "--observation-resolver",
+            &resolver.display().to_string(),
+            "--expected-observation-resolver-id",
+            id,
+            "--executor-plan",
+            &plan.display().to_string(),
+        ]))
+    };
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let (database, plan) = campaign("pinned", true);
+    // The precondition resolver cannot complete postcondition-governed work.
+    let refused = complete(&database, &plan, &pre, "fixture-precondition/v1");
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("caller substituted pinned path"),
+        "{}",
+        stderr(&refused)
+    );
+    let refused = complete(&database, &plan, &post, "fixture-precondition/v1");
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("completion resolver identity"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!pre_trace.exists() && !post_trace.exists());
+    // The pinned postcondition resolver is the one AG runs.
+    let ran = complete(&database, &plan, &post, "fixture-postcondition/v1");
+    assert!(!ran.status.success(), "the fixture resolver refuses");
+    assert!(
+        post_trace.exists(),
+        "AG ran the pinned postcondition resolver"
+    );
+    assert!(!pre_trace.exists());
+    let status = value(&invoke(&args(&[
+        "status",
+        "--database",
+        &database.display().to_string(),
+    ])));
+    assert!(status["state"]["observation_required"].is_object());
+
+    // Without a pinned postcondition resolver such work cannot complete.
+    let (database, plan) = campaign("unpinned", false);
+    let refused = complete(&database, &plan, &pre, "fixture-precondition/v1");
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("pins no postcondition resolver"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!pre_trace.exists());
+}
