@@ -162,6 +162,7 @@ impl Scenario {
                 require_private_parent_writes: true,
             },
             preparation_checkpoint: None,
+            authorization: None,
         };
         let plan_path = root.join("executor-plan.json");
         std::fs::write(
