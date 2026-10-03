@@ -311,6 +311,8 @@ fn catalog(
                     )
                     .map_err(anyhow::Error::msg)?,
                 ),
+                admitted_plans: None,
+                postcondition_basis: None,
             },
         )]),
     })

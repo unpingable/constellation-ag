@@ -338,6 +338,8 @@ fn catalog(
                 subject: Digest::parse(&stage.subject).unwrap(),
                 scope: Digest::parse(&stage.scope).unwrap(),
                 observation_basis: ExactObservationBasisRequirementV1::TypedBasis(basis),
+                admitted_plans: None,
+                postcondition_basis: None,
             },
         )]),
     }

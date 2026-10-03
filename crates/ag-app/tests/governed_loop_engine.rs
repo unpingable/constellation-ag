@@ -5,14 +5,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Barrier, Mutex};
 
+use ag_app::effect_executor_adapter::{
+    EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
+    EffectAuthorizationInputsV2, EffectExecutorSystemdPlanV2, EffectFilePolicyV1,
+};
 use ag_app::governed_loop::{
     CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, DocketProgressV1,
     EXACT_WORK_CATALOG_SCHEMA_V1, EXACT_WORK_CATALOG_SCHEMA_V2, ExactObservationBasisRequirementV1,
-    ExactWorkCatalogEntryV1, ExactWorkCatalogEntryV2, ExactWorkCatalogV1, ExactWorkCatalogV2,
-    WorkPreconditionV1,
+    ExactPlanWitnessV1, ExactWorkCatalogEntryV1, ExactWorkCatalogEntryV2, ExactWorkCatalogV1,
+    ExactWorkCatalogV2, VersionedExactWorkCatalogV1, WorkPreconditionV1,
+    systemd_plan_enrollment_identity,
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
+use ag_effect::{CanonicalEffectV1, SystemdUnitActionV1, TargetId};
 use ag_operator_ui::links::GovernedRuntimeLinkV1;
 use ag_operator_ui::model::{
     AgInspectV1, CAMPAIGN_DETAIL_SCHEMA_V1, CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1,
@@ -32,7 +38,7 @@ use ag_primitives::Digest;
 use ag_store::campaign::{
     CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1, CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1,
     CampaignRefusalHistoryV1, CampaignReplayReportV1, CampaignTransitionEvidenceV1,
-    CampaignTransitionHistoryV1,
+    CampaignTransitionHistoryV1, RUNTIME_PROFILE_DIGEST_DOMAIN_V1,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -178,6 +184,8 @@ fn typed_catalog(basis: TypedOpaqueObservationBasisV1) -> ExactWorkCatalogV2 {
                 subject: digest("subject"),
                 scope: digest("scope"),
                 observation_basis: ExactObservationBasisRequirementV1::TypedBasis(basis),
+                admitted_plans: None,
+                postcondition_basis: None,
             },
         )]),
     }
@@ -3882,4 +3890,782 @@ fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
             index + 1
         );
     }
+}
+
+// --- Exact-plan catalog pin and postcondition basis (remediation) ---
+
+const CANARY_UNIT: &str = "attention-canary.service";
+const PIN_PROFILE_JCS: &[u8] = br#"{"fixture":"remediation-runtime-profile"}"#;
+
+fn pin_profile_digest() -> Digest {
+    Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, PIN_PROFILE_JCS)
+}
+
+fn remediation_basis(kind: &str) -> TypedOpaqueObservationBasisV1 {
+    TypedOpaqueObservationBasisV1::new(
+        format!("constellation.remediation.{kind}/v1"),
+        digest(&format!("{kind}:{CANARY_UNIT}")),
+    )
+    .unwrap()
+}
+
+fn systemd_plan(
+    unit: &str,
+    prestate: &str,
+    profile: Option<Digest>,
+) -> EffectExecutorSystemdPlanV2 {
+    EffectExecutorSystemdPlanV2 {
+        schema: EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2.to_owned(),
+        attempt_store: "/var/lib/remediation/effect-attempts.sqlite".into(),
+        subject: digest("subject"),
+        scope: digest("scope"),
+        effect_index: 0,
+        effect: CanonicalEffectV1::SystemdUnit {
+            target: TargetId::parse("attention-canary").unwrap(),
+            unit: unit.to_owned(),
+            action: SystemdUnitActionV1::Start,
+            expected_active_state: prestate.to_owned(),
+            expected_unit_file_state: "enabled".to_owned(),
+        },
+        file_policy: EffectFilePolicyV1 {
+            max_content_bytes: 1024,
+            trusted_ancestor_uid: 0,
+            trusted_parent_uid: 0,
+            require_private_parent_writes: true,
+        },
+        systemd_machine_identity: "0123456789abcdef0123456789abcdef".to_owned(),
+        authorization: profile.map(|expected_runtime_profile| EffectAuthorizationInputsV2 {
+            expected_runtime_profile,
+        }),
+        execution_lock_timeout_ms: 5_000,
+        job_timeout_ms: 30_000,
+    }
+}
+
+fn executable_plan(unit: &str, prestate: &str) -> EffectExecutorSystemdPlanV2 {
+    systemd_plan(unit, prestate, Some(pin_profile_digest()))
+}
+
+fn plan_witness(plan: &EffectExecutorSystemdPlanV2) -> ExactPlanWitnessV1 {
+    ExactPlanWitnessV1::from_systemd_plan(plan, &pin_profile_digest()).unwrap()
+}
+
+/// Enrollment computed before the profile exists: the template carries no
+/// authorization, exactly as the owner computes it.
+fn admitted_canary_plans() -> BTreeSet<Digest> {
+    ["inactive", "failed"]
+        .into_iter()
+        .map(|prestate| {
+            systemd_plan_enrollment_identity(&systemd_plan(CANARY_UNIT, prestate, None)).unwrap()
+        })
+        .collect()
+}
+
+fn remediation_catalog() -> ExactWorkCatalogV2 {
+    ExactWorkCatalogV2 {
+        schema: EXACT_WORK_CATALOG_SCHEMA_V2.to_owned(),
+        entries: BTreeMap::from([(
+            EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2.to_owned(),
+            ExactWorkCatalogEntryV2 {
+                work_schema: EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2.to_owned(),
+                subject: digest("subject"),
+                scope: digest("scope"),
+                observation_basis: ExactObservationBasisRequirementV1::TypedBasis(
+                    remediation_basis("systemd-not-active"),
+                ),
+                admitted_plans: Some(admitted_canary_plans()),
+                postcondition_basis: Some(ExactObservationBasisRequirementV1::TypedBasis(
+                    remediation_basis("systemd-active"),
+                )),
+            },
+        )]),
+    }
+}
+
+fn remediation_proposal(plan: &EffectExecutorSystemdPlanV2) -> ExactWorkProposalV1 {
+    ExactWorkProposalV1::new(
+        campaign(),
+        digest("subject"),
+        digest("scope"),
+        EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2.to_owned(),
+        plan.identity().unwrap(),
+        None,
+    )
+    .unwrap()
+}
+
+fn remediation_engine(directory: &TempDir, plan: &EffectExecutorSystemdPlanV2) -> CampaignEngineV1 {
+    CampaignEngineV1::create_with_runtime_profile(
+        &directory.path().join("campaign.sqlite"),
+        campaign(),
+        occurrence(1),
+        ProgramBasisRefV1::from_digest(digest("program")),
+        plan.identity().unwrap(),
+        ResidualSetV1::default(),
+        budget(),
+        "ag.governed-loop.runtime-profile/v1",
+        PIN_PROFILE_JCS,
+        NOW,
+    )
+    .unwrap()
+}
+
+fn remediation_resolver(
+    basis: TypedOpaqueObservationBasisV1,
+    status: TypedObservationStatusV1,
+) -> RepositoryQualificationBoundary {
+    let mut resolver = RepositoryQualificationBoundary::current(basis);
+    OBSERVATION_RESOLVER_ID.clone_into(&mut resolver.resolver_id);
+    resolver.status = status;
+    resolver
+}
+
+fn record_remediation_proposal<O: ObservationResolverV1>(
+    engine: &mut CampaignEngineV1,
+    plan: &EffectExecutorSystemdPlanV2,
+    observation: &mut O,
+) {
+    engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("canary-down")),
+            remediation_proposal(plan),
+            ProposalClassV1::Initial,
+            observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap();
+    engine.require_standing(NOW + 2).unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_pinned<O: ObservationResolverV1>(
+    engine: &mut CampaignEngineV1,
+    observation: &mut O,
+    standing: &mut StandingBoundary,
+    catalog: &ExactWorkCatalogV2,
+    plan: Option<&ExactPlanWitnessV1>,
+    at: u64,
+) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+    engine.decide_with_catalog_v2_and_plan(
+        observation,
+        standing,
+        catalog,
+        plan,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        at,
+    )
+}
+
+fn authorize_pinned<O: ObservationResolverV1>(
+    engine: &mut CampaignEngineV1,
+    observation: &mut O,
+    standing: &mut StandingBoundary,
+    catalog: &ExactWorkCatalogV2,
+    plan: Option<&ExactPlanWitnessV1>,
+    at: u64,
+) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+    engine.authorize_with_catalog_v2_and_plan(
+        observation,
+        standing,
+        catalog,
+        plan,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        at,
+    )
+}
+
+#[test]
+fn pinned_plan_is_admitted_and_spends_once() {
+    let catalog = remediation_catalog();
+    catalog.validate().unwrap();
+    for prestate in ["inactive", "failed"] {
+        let plan = executable_plan(CANARY_UNIT, prestate);
+        let witness = plan_witness(&plan);
+        catalog
+            .check_expected_work(&plan.identity().unwrap(), Some(&witness))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = remediation_engine(&directory, &plan);
+        let mut observation = remediation_resolver(
+            remediation_basis("systemd-not-active"),
+            TypedObservationStatusV1::Current,
+        );
+        let mut standing = StandingBoundary::current();
+        record_remediation_proposal(&mut engine, &plan, &mut observation);
+        let admitted = decide_pinned(
+            &mut engine,
+            &mut observation,
+            &mut standing,
+            &catalog,
+            Some(&witness),
+            NOW + 3,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.admission_decision().unwrap().policy_basis,
+            catalog.policy_basis().unwrap()
+        );
+        let spent = authorize_pinned(
+            &mut engine,
+            &mut observation,
+            &mut standing,
+            &catalog,
+            Some(&witness),
+            NOW + 4,
+        )
+        .unwrap();
+        assert_eq!(
+            spent.program_counter(),
+            ProgramCounterV1::AuthorizationConsumed
+        );
+        assert_eq!(engine.replay().unwrap().ag_spends, 1);
+    }
+}
+
+#[test]
+fn another_unit_with_copied_subject_and_scope_is_refused() {
+    let catalog = remediation_catalog();
+    let plan = executable_plan("sshd.service", "inactive");
+    let witness = plan_witness(&plan);
+    assert!(matches!(
+        catalog.check_expected_work(&plan.identity().unwrap(), Some(&witness)),
+        Err(CampaignEngineErrorV1::WorkNotAdmitted)
+    ));
+    assert!(matches!(
+        catalog.check_expected_work(&plan.identity().unwrap(), None),
+        Err(CampaignEngineErrorV1::PlanWitnessRequired)
+    ));
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_engine(&directory, &plan);
+    let mut observation = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    let mut standing = StandingBoundary::current();
+    record_remediation_proposal(&mut engine, &plan, &mut observation);
+    let before = engine.current().unwrap();
+    let calls = (observation.calls, standing.calls);
+
+    let refused = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&witness),
+        NOW + 3,
+    )
+    .unwrap_err();
+    assert!(matches!(refused, CampaignEngineErrorV1::WorkNotAdmitted));
+    // The historical v2 API presents no plan and refuses as well.
+    let refused = engine
+        .decide_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        CampaignEngineErrorV1::PlanWitnessRequired
+    ));
+    let refused = engine
+        .authorize_versioned_with_plan(
+            &mut observation,
+            &mut standing,
+            &VersionedExactWorkCatalogV1::ExactBasisV2(catalog.clone()),
+            Some(&witness),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap_err();
+    assert!(matches!(refused, CampaignEngineErrorV1::WorkNotAdmitted));
+
+    // Refusal precedes every external resolution and changes nothing.
+    assert_eq!((observation.calls, standing.calls), calls);
+    assert_eq!(engine.current().unwrap(), before);
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn unenrolled_prestate_is_refused() {
+    let catalog = remediation_catalog();
+    let plan = executable_plan(CANARY_UNIT, "deactivating");
+    let witness = plan_witness(&plan);
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_engine(&directory, &plan);
+    let mut observation = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    let mut standing = StandingBoundary::current();
+    record_remediation_proposal(&mut engine, &plan, &mut observation);
+    let error = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&witness),
+        NOW + 3,
+    )
+    .unwrap_err();
+    assert!(matches!(error, CampaignEngineErrorV1::WorkNotAdmitted));
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn presented_plan_must_bind_the_work_and_the_campaign_profile() {
+    let catalog = remediation_catalog();
+    let plan = executable_plan(CANARY_UNIT, "inactive");
+    // A plan serving another profile cannot be presented for this one.
+    assert!(matches!(
+        ExactPlanWitnessV1::from_systemd_plan(
+            &systemd_plan(CANARY_UNIT, "inactive", Some(digest("other-profile"))),
+            &pin_profile_digest(),
+        ),
+        Err(CampaignEngineErrorV1::PlanWitnessMismatch)
+    ));
+    assert!(matches!(
+        ExactPlanWitnessV1::from_systemd_plan(
+            &systemd_plan(CANARY_UNIT, "inactive", None),
+            &pin_profile_digest(),
+        ),
+        Err(CampaignEngineErrorV1::PlanWitnessMismatch)
+    ));
+    // An enrolled plan cannot vouch for different work.
+    let other = plan_witness(&executable_plan(CANARY_UNIT, "failed"));
+    assert!(matches!(
+        catalog.check_expected_work(&plan.identity().unwrap(), Some(&other)),
+        Err(CampaignEngineErrorV1::PlanWitnessMismatch)
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_engine(&directory, &plan);
+    let mut observation = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    let mut standing = StandingBoundary::current();
+    record_remediation_proposal(&mut engine, &plan, &mut observation);
+    let error = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&other),
+        NOW + 3,
+    )
+    .unwrap_err();
+    assert!(matches!(error, CampaignEngineErrorV1::PlanWitnessMismatch));
+    // A witness for a different profile than this campaign's genesis.
+    let foreign = ExactPlanWitnessV1::from_systemd_plan(
+        &systemd_plan(CANARY_UNIT, "inactive", Some(digest("other-profile"))),
+        &digest("other-profile"),
+    )
+    .unwrap();
+    let error = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&foreign),
+        NOW + 3,
+    )
+    .unwrap_err();
+    assert!(matches!(error, CampaignEngineErrorV1::PlanWitnessMismatch));
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn admitted_plan_list_is_part_of_the_sealed_catalog_identity() {
+    let pinned = remediation_catalog();
+    let mut tampered = pinned.clone();
+    let entry = tampered
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap();
+    entry.admitted_plans.as_mut().unwrap().insert(
+        systemd_plan_enrollment_identity(&systemd_plan("sshd.service", "inactive", None)).unwrap(),
+    );
+    assert_ne!(
+        pinned.policy_basis().unwrap(),
+        tampered.policy_basis().unwrap()
+    );
+    let mut narrowed = pinned.clone();
+    let entry = narrowed
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap();
+    let first = entry
+        .admitted_plans
+        .as_ref()
+        .unwrap()
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    entry.admitted_plans.as_mut().unwrap().remove(&first);
+    assert_ne!(
+        pinned.policy_basis().unwrap(),
+        narrowed.policy_basis().unwrap()
+    );
+    let mut unpinned = pinned.clone();
+    let entry = unpinned
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap();
+    entry.postcondition_basis = None;
+    entry.admitted_plans = None;
+    assert_ne!(
+        pinned.policy_basis().unwrap(),
+        unpinned.policy_basis().unwrap()
+    );
+
+    // The enrollment identity binds the exact unit and prestate, and omits
+    // only the profile back-reference.
+    assert_eq!(
+        systemd_plan_enrollment_identity(&executable_plan(CANARY_UNIT, "inactive")).unwrap(),
+        systemd_plan_enrollment_identity(&systemd_plan(CANARY_UNIT, "inactive", None)).unwrap()
+    );
+    assert_ne!(
+        systemd_plan_enrollment_identity(&systemd_plan(CANARY_UNIT, "inactive", None)).unwrap(),
+        systemd_plan(CANARY_UNIT, "inactive", None)
+            .identity()
+            .unwrap()
+    );
+}
+
+#[test]
+fn pin_and_postcondition_validation_is_closed() {
+    let mut empty = remediation_catalog();
+    empty
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap()
+        .admitted_plans = Some(BTreeSet::new());
+    assert!(matches!(
+        empty.validate(),
+        Err(CampaignEngineErrorV1::InvalidCatalog)
+    ));
+
+    let mut foreign_schema = typed_catalog(typed_basis("civil-basis-a"));
+    foreign_schema
+        .entries
+        .get_mut("test.engine-work/v1")
+        .unwrap()
+        .admitted_plans = Some(admitted_canary_plans());
+    assert!(matches!(
+        foreign_schema.validate(),
+        Err(CampaignEngineErrorV1::InvalidCatalog)
+    ));
+
+    let mut unpinned_postcondition = remediation_catalog();
+    unpinned_postcondition
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap()
+        .admitted_plans = None;
+    assert!(matches!(
+        unpinned_postcondition.validate(),
+        Err(CampaignEngineErrorV1::InvalidCatalog)
+    ));
+
+    let mut same_basis = remediation_catalog();
+    let entry = same_basis
+        .entries
+        .get_mut(EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        .unwrap();
+    entry.postcondition_basis = Some(entry.observation_basis.clone());
+    assert!(matches!(
+        same_basis.validate(),
+        Err(CampaignEngineErrorV1::InvalidCatalog)
+    ));
+}
+
+#[test]
+fn entries_without_pins_serialize_and_admit_exactly_as_before() {
+    let catalog = typed_catalog(typed_basis("civil-basis-a"));
+    let historical = serde_json::json!({
+        "schema": EXACT_WORK_CATALOG_SCHEMA_V2,
+        "entries": {
+            "test.engine-work/v1": {
+                "work_schema": "test.engine-work/v1",
+                "subject": digest("subject"),
+                "scope": digest("scope"),
+                "observation_basis": {
+                    "kind": "typed_basis",
+                    "requirement": typed_basis("civil-basis-a"),
+                },
+            }
+        }
+    });
+    let historical_bytes = serde_jcs::to_vec(&historical).unwrap();
+    assert_eq!(serde_jcs::to_vec(&catalog).unwrap(), historical_bytes);
+    let parsed: VersionedExactWorkCatalogV1 = serde_json::from_slice(&historical_bytes).unwrap();
+    assert_eq!(
+        parsed,
+        VersionedExactWorkCatalogV1::ExactBasisV2(catalog.clone())
+    );
+    // Unpinned entries open, admit and complete without any plan.
+    catalog
+        .check_expected_work(&digest("work-1"), None)
+        .unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let expected = typed_basis("civil-basis-a");
+    let mut observation = TypedObservationBoundary::current(expected);
+    let mut standing = StandingBoundary::current();
+    advance_to_standing_required(&mut engine, &mut observation);
+    let _ = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        None,
+        NOW + 3,
+    )
+    .unwrap();
+    let _ = authorize_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        None,
+        NOW + 4,
+    )
+    .unwrap();
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    docket.settle(
+        &dispatched.issuance().unwrap().issuance,
+        KnownOutcomeV1::Success,
+    );
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    let _ = engine
+        .open_continuation(occurrence(2), digest("work-1"), NOW + 7)
+        .unwrap();
+    let completed = engine
+        .complete_with_catalog(
+            ObservationRefV1::from_digest(digest("terminal")),
+            &digest("subject"),
+            TerminalWitnessRefV1::from_digest(digest("terminal-witness")),
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            &VersionedExactWorkCatalogV1::ExactBasisV2(catalog),
+            None,
+            NOW + 8,
+        )
+        .unwrap();
+    assert_eq!(completed.program_counter(), ProgramCounterV1::Completed);
+}
+
+/// Spend, dispatch and settle one pinned canary attempt, then open the
+/// continuation occurrence that must establish the postcondition.
+fn remediation_settled_continuation(
+    directory: &TempDir,
+    plan: &EffectExecutorSystemdPlanV2,
+) -> CampaignEngineV1 {
+    let catalog = remediation_catalog();
+    let witness = plan_witness(plan);
+    let mut engine = remediation_engine(directory, plan);
+    let mut observation = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    let mut standing = StandingBoundary::current();
+    record_remediation_proposal(&mut engine, plan, &mut observation);
+    let _ = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&witness),
+        NOW + 3,
+    )
+    .unwrap();
+    let _ = authorize_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&witness),
+        NOW + 4,
+    )
+    .unwrap();
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    docket.settle(
+        &dispatched.issuance().unwrap().issuance,
+        KnownOutcomeV1::Success,
+    );
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    catalog
+        .check_expected_work(&plan.identity().unwrap(), Some(&witness))
+        .unwrap();
+    let _ = engine
+        .open_continuation(occurrence(2), plan.identity().unwrap(), NOW + 7)
+        .unwrap();
+    engine
+}
+
+fn complete_remediation<O: ObservationResolverV1>(
+    engine: &mut CampaignEngineV1,
+    observation: &mut O,
+    plan: Option<&ExactPlanWitnessV1>,
+) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+    engine.complete_with_catalog(
+        ObservationRefV1::from_digest(digest("canary-after")),
+        &digest("subject"),
+        TerminalWitnessRefV1::from_digest(digest("canary-terminal-witness")),
+        observation,
+        OBSERVATION_RESOLVER_ID,
+        &VersionedExactWorkCatalogV1::ExactBasisV2(remediation_catalog()),
+        plan,
+        NOW + 8,
+    )
+}
+
+#[test]
+fn current_postcondition_basis_completes_the_occurrence() {
+    let plan = executable_plan(CANARY_UNIT, "inactive");
+    let witness = plan_witness(&plan);
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_settled_continuation(&directory, &plan);
+    let before = engine.current().unwrap();
+
+    // The precondition basis, even current, never completes the work.
+    let mut still_down = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    assert!(matches!(
+        complete_remediation(&mut engine, &mut still_down, Some(&witness)),
+        Err(CampaignEngineErrorV1::PostconditionNotEstablished)
+    ));
+    // Completion under an enrolled postcondition requires the exact plan.
+    let mut recovered = remediation_resolver(
+        remediation_basis("systemd-active"),
+        TypedObservationStatusV1::Current,
+    );
+    assert!(matches!(
+        complete_remediation(&mut engine, &mut recovered, None),
+        Err(CampaignEngineErrorV1::PlanWitnessRequired)
+    ));
+    // A stale postcondition answer does not complete either.
+    let mut stale = remediation_resolver(
+        remediation_basis("systemd-active"),
+        TypedObservationStatusV1::Stale,
+    );
+    assert!(matches!(
+        complete_remediation(&mut engine, &mut stale, Some(&witness)),
+        Err(CampaignEngineErrorV1::Kernel(
+            KernelErrorV1::ObservationNotCurrent
+        ))
+    ));
+    assert_eq!(engine.current().unwrap(), before);
+
+    let completed = complete_remediation(&mut engine, &mut recovered, Some(&witness)).unwrap();
+    assert_eq!(completed.program_counter(), ProgramCounterV1::Completed);
+    assert_eq!(
+        completed
+            .completed()
+            .unwrap()
+            .terminal_observation()
+            .typed_basis(),
+        Some(&remediation_basis("systemd-active"))
+    );
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+}
+
+#[test]
+fn contradictory_precondition_neither_authorizes_nor_completes() {
+    let catalog = remediation_catalog();
+    let plan = executable_plan(CANARY_UNIT, "failed");
+    let witness = plan_witness(&plan);
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_engine(&directory, &plan);
+    let mut observation = remediation_resolver(
+        remediation_basis("systemd-not-active"),
+        TypedObservationStatusV1::Current,
+    );
+    let mut standing = StandingBoundary::current();
+    record_remediation_proposal(&mut engine, &plan, &mut observation);
+    let before = engine.current().unwrap();
+    // The unit recovered on its own: "not active" is now contradictory.
+    observation.status = TypedObservationStatusV1::Contradictory;
+    assert!(matches!(
+        decide_pinned(
+            &mut engine,
+            &mut observation,
+            &mut standing,
+            &catalog,
+            Some(&witness),
+            NOW + 3,
+        ),
+        Err(CampaignEngineErrorV1::Kernel(
+            KernelErrorV1::ObservationContradiction
+        ))
+    ));
+    assert_eq!(engine.current().unwrap(), before);
+    // Recovery between decision and spend also refuses the spend.
+    observation.status = TypedObservationStatusV1::Current;
+    let admitted = decide_pinned(
+        &mut engine,
+        &mut observation,
+        &mut standing,
+        &catalog,
+        Some(&witness),
+        NOW + 3,
+    )
+    .unwrap();
+    observation.status = TypedObservationStatusV1::Contradictory;
+    assert!(matches!(
+        authorize_pinned(
+            &mut engine,
+            &mut observation,
+            &mut standing,
+            &catalog,
+            Some(&witness),
+            NOW + 4,
+        ),
+        Err(CampaignEngineErrorV1::Kernel(
+            KernelErrorV1::ObservationContradiction
+        ))
+    ));
+    assert_eq!(engine.current().unwrap(), admitted);
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+
+    // After a settled attempt, a contradictory answer from either basis
+    // cannot complete the occurrence.
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = remediation_settled_continuation(&directory, &plan);
+    let before = engine.current().unwrap();
+    for basis in ["systemd-not-active", "systemd-active"] {
+        let mut contradictory = remediation_resolver(
+            remediation_basis(basis),
+            TypedObservationStatusV1::Contradictory,
+        );
+        assert!(matches!(
+            complete_remediation(&mut engine, &mut contradictory, Some(&witness)),
+            Err(CampaignEngineErrorV1::Kernel(
+                KernelErrorV1::ObservationContradiction
+            ))
+        ));
+    }
+    assert_eq!(engine.current().unwrap(), before);
 }

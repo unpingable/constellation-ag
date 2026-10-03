@@ -107,6 +107,53 @@ The catalog is not a registry or plugin interface. A consistently substituted
 foreign basis therefore refuses admission even if its resolver repeats that
 basis at every consequence boundary.
 
+### Exact-plan pin and postcondition basis
+
+Subject, scope and work schema do not name the unit: the unit lives only in
+the executor plan, whose digest is the proposal's work. A v2 entry may
+therefore carry two optional owner-enrolled members. Entries without them
+serialize byte-for-byte as before and behave as before; remediation
+enrollments must use `admitted_plans`.
+
+`admitted_plans` is a closed non-empty set of plan *enrollment identities*,
+valid only for `ag-effectd.docket-executor-systemd-work/v2`. An executable
+plan names the runtime profile it serves (`authorization.
+expected_runtime_profile`), and that profile byte-pins the catalog, so the
+catalog cannot contain the executable plan's own digest. The enrollment
+identity is the domain-separated
+(`ag.governed-loop.systemd-plan-enrollment/v1`) identity of the same exact
+plan with that one back-reference omitted; unit, action, prestate, unit-file
+state, machine, subject, scope, store and limits all stay bound. When an
+entry pins plans, `decide` and `authorize` require `--executor-plan PLAN`:
+AG refuses before any resolver call unless the plan's content identity is the
+proposal's work, the plan names this campaign's genesis profile, and its
+enrollment identity is in the set (typed errors: plan required, plan does not
+bind work/profile, work not admitted). `init` and `continue` take the same
+flag and refuse unadmitted work at once; without it they refuse only when
+every entry pins its plans. The set is part of the catalog bytes, so changing
+it changes the catalog policy basis and requires a new owner seal.
+
+The owner computes the set from a plan template, one identity per enrolled
+prestate:
+
+```text
+ag-loopctl systemd-plan-enrollment --template PLAN --unit attention-canary.service \
+  --prestate inactive --prestate failed
+```
+
+The template's `authorization`, if any, is ignored; only the qualified Start
+action is enrollable; the output's `admitted_plans` is pasted into the entry.
+
+`postcondition_basis` is a second closed basis, distinct from
+`observation_basis` and allowed only with `admitted_plans`. The precondition
+(`observation_basis`, e.g. "unit not active") gates proposal admission and the
+spend; completion of an occurrence governing an admitted plan requires a
+fresh `current` terminal observation that satisfies the postcondition basis
+(e.g. "unit active"), and `complete` then needs `--executor-plan` for the
+occurrence's work. A current precondition answer never completes the work;
+stale, superseded or contradictory answers from either basis neither
+authorize nor complete.
+
 Neither observation generation grants standing. Proposal/work, subject,
 scope, occurrence, current standing, current catalog, and one-use spend remain
 independent gates. A typed basis has no atoms, and AG does not import civild

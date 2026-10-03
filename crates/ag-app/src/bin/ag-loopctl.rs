@@ -13,13 +13,20 @@
 //! records and invokes external currentness/authority owners at each live
 //! boundary.  The `SQLite` campaign store is the sole program-counter owner.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1, VersionedExactWorkCatalogV1};
+use ag_app::effect_executor_adapter::{
+    EffectExecutorSystemdPlanV2, load_effect_executor_systemd_plan,
+};
+use ag_app::governed_loop::{
+    CampaignEngineErrorV1, CampaignEngineV1, EXACT_WORK_CATALOG_SCHEMA_V2, ExactPlanWitnessV1,
+    VersionedExactWorkCatalogV1, systemd_plan_enrollment_identity,
+};
 use ag_app::governed_ports::{
     AgIssuanceSignerV1, CommandDocketCustodyPortV1, CommandDocketReconciliationPortV1,
     CommandGovernedInterventionVerifierV1, CommandHumanDispositionVerifierV1,
@@ -29,6 +36,7 @@ use ag_app::governed_ports::{
 use ag_app::intervention_ingress::*;
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
+use ag_effect::{CanonicalEffectV1, SystemdUnitActionV1};
 use ag_primitives::{Digest, JcsDocument};
 use ag_protocol::strict_json_from_slice;
 use ag_store::campaign::{CampaignReplayReportV1, CampaignTransitionEvidenceV1};
@@ -60,6 +68,19 @@ enum Command {
     VerifyRuntimeProfile {
         #[arg(long)]
         runtime_profile: PathBuf,
+    },
+    /// Compute owner-enrollable `admitted_plans` identities for exact
+    /// `SystemdUnit` Start plans of one unit, one per enrolled prestate.
+    SystemdPlanEnrollment {
+        /// Systemd V2 plan template; its `authorization`, if any, is omitted.
+        #[arg(long)]
+        template: PathBuf,
+        /// Exact unit the template must name.
+        #[arg(long)]
+        unit: String,
+        /// Enrolled `ActiveState` prestate; repeat once per admitted prestate.
+        #[arg(long = "prestate", required = true)]
+        prestates: Vec<String>,
     },
     /// Construct canonical intervention-request bytes from one exact typed draft.
     PrepareInterventionRequest {
@@ -101,6 +122,10 @@ enum Command {
         /// Deployment-owned policy and Docket boundary, pinned at genesis.
         #[arg(long)]
         runtime_profile: PathBuf,
+        /// Exact executor plan for `expected_ag_work`; required when every
+        /// catalog entry pins `admitted_plans`.
+        #[arg(long)]
+        executor_plan: Option<PathBuf>,
     },
     /// Print the exact authoritative current occurrence.
     Status {
@@ -184,6 +209,10 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
+        /// Exact executor plan for `expected_ag_work`; required when every
+        /// catalog entry pins `admitted_plans`.
+        #[arg(long)]
+        executor_plan: Option<PathBuf>,
     },
     /// Persist one read-only probe-count fact.
     NoteProbe {
@@ -249,6 +278,10 @@ enum Command {
         observation_resolver: PathBuf,
         #[arg(long)]
         expected_observation_resolver_id: String,
+        /// Exact executor plan of this occurrence's work; required when the
+        /// catalog enrolls any `postcondition_basis`.
+        #[arg(long)]
+        executor_plan: Option<PathBuf>,
     },
     /// Record a typed non-authorizing refusal without advancing the PC.
     Refuse {
@@ -276,6 +309,10 @@ struct GateArguments {
     max_standing_ttl_ms: u64,
     #[arg(long)]
     controlling_review: Option<PathBuf>,
+    /// Exact executor plan of the proposal's work; required when its catalog
+    /// entry pins `admitted_plans`.
+    #[arg(long)]
+    executor_plan: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -360,6 +397,29 @@ struct RefusalInputV1 {
     evidence: Option<Digest>,
 }
 
+const SYSTEMD_PLAN_ENROLLMENT_SCHEMA_V1: &str = "ag.governed-loop.systemd-plan-enrollment/v1";
+const MAX_PLAN_TEMPLATE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemdPlanEnrollmentEntryV1 {
+    expected_active_state: String,
+    enrolled_plan: Digest,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemdPlanEnrollmentV1 {
+    schema: &'static str,
+    catalog_schema: &'static str,
+    work_schema: &'static str,
+    unit: String,
+    action: &'static str,
+    expected_unit_file_state: String,
+    plans: Vec<SystemdPlanEnrollmentEntryV1>,
+    admitted_plans: BTreeSet<Digest>,
+}
+
 const RUNTIME_PROFILE_SEAL_RECEIPT_SCHEMA_V1: &str =
     "ag.governed-loop.runtime-profile-seal-receipt/v1";
 const OPERATIONAL_SNAPSHOT_SCHEMA_V1: &str = "ag.governed-loop.operational-snapshot/v1";
@@ -411,6 +471,11 @@ fn main() -> anyhow::Result<()> {
             let canonical = JcsDocument::canonicalize(&profile)?;
             write_exact(&runtime_profile_receipt(&profile, canonical.as_bytes()))
         }
+        Command::SystemdPlanEnrollment {
+            template,
+            unit,
+            prestates,
+        } => write_exact(&systemd_plan_enrollment(&template, &unit, &prestates)?),
         Command::PrepareInterventionRequest { input, output } => {
             let draft: GovernedInterventionRequestDraftV1 = read_exact_record(&input)?;
             let request = draft.construct()?;
@@ -466,11 +531,18 @@ fn main() -> anyhow::Result<()> {
             database,
             genesis,
             runtime_profile,
+            executor_plan,
         } => {
             let input: GenesisInputV1 = read_exact_record(&genesis)?;
             let profile: GovernedRuntimeProfileV1 = read_exact_record(&runtime_profile)?;
             profile.verify_genesis()?;
             let profile_jcs = JcsDocument::canonicalize(&profile)?;
+            check_expected_work(
+                &profile,
+                &runtime_profile_digest(profile_jcs.as_bytes()),
+                &input.expected_ag_work,
+                executor_plan.as_deref(),
+            )?;
             let engine = CampaignEngineV1::create_with_runtime_profile(
                 &database,
                 input.campaign,
@@ -552,13 +624,15 @@ fn main() -> anyhow::Result<()> {
             write_exact(&engine.require_standing(now()?)?)
         }
         Command::Decide { database, gate } => {
-            let (mut engine, profile) = open_bound(&database)?;
+            let (mut engine, profile, profile_digest) = open_bound_with_digest(&database)?;
             let (mut observation, mut standing, catalog, review) =
                 gate_components(&profile, &gate)?;
-            write_exact(&engine.decide_versioned(
+            let plan = plan_witness(gate.executor_plan.as_deref(), &profile_digest)?;
+            write_exact(&engine.decide_versioned_with_plan(
                 &mut observation,
                 &mut standing,
                 &catalog,
+                plan.as_ref(),
                 review.as_ref(),
                 &profile.observation_resolver_id,
                 &profile.standing_resolver_id,
@@ -567,13 +641,15 @@ fn main() -> anyhow::Result<()> {
             )?)
         }
         Command::Authorize { database, gate } => {
-            let (mut engine, profile) = open_bound(&database)?;
+            let (mut engine, profile, profile_digest) = open_bound_with_digest(&database)?;
             let (mut observation, mut standing, catalog, review) =
                 gate_components(&profile, &gate)?;
-            write_exact(&engine.authorize_versioned(
+            let plan = plan_witness(gate.executor_plan.as_deref(), &profile_digest)?;
+            write_exact(&engine.authorize_versioned_with_plan(
                 &mut observation,
                 &mut standing,
                 &catalog,
+                plan.as_ref(),
                 review.as_ref(),
                 &profile.observation_resolver_id,
                 &profile.standing_resolver_id,
@@ -597,9 +673,19 @@ fn main() -> anyhow::Result<()> {
             let mut docket = docket_port(&profile, &docket)?;
             write_exact(&engine.recover(&mut docket, now()?)?)
         }
-        Command::Continue { database, input } => {
+        Command::Continue {
+            database,
+            input,
+            executor_plan,
+        } => {
             let input: ContinuationInputV1 = read_exact_record(&input)?;
-            let (mut engine, _) = open_bound(&database)?;
+            let (mut engine, profile, profile_digest) = open_bound_with_digest(&database)?;
+            check_expected_work(
+                &profile,
+                &profile_digest,
+                &input.expected_ag_work,
+                executor_plan.as_deref(),
+            )?;
             write_exact(&engine.open_continuation(
                 input.occurrence,
                 input.expected_ag_work,
@@ -708,23 +794,28 @@ fn main() -> anyhow::Result<()> {
             input,
             observation_resolver,
             expected_observation_resolver_id,
+            executor_plan,
         } => {
             let input: CompletionInputV1 = read_exact_record(&input)?;
-            let (mut engine, profile) = open_bound(&database)?;
+            let (mut engine, profile, profile_digest) = open_bound_with_digest(&database)?;
             let _ = profile
                 .observation_resolver
                 .verify_presented(&observation_resolver, true)?;
             if expected_observation_resolver_id != profile.observation_resolver_id {
                 bail!("caller substituted the genesis-pinned observation resolver identity");
             }
+            let catalog = pinned_catalog(&profile)?;
+            let plan = plan_witness(executor_plan.as_deref(), &profile_digest)?;
             let mut observation =
                 CommandObservationResolverV1::new(profile.observation_resolver.path.clone());
-            write_exact(&engine.complete(
+            write_exact(&engine.complete_with_catalog(
                 input.observation,
                 &input.subject,
                 input.terminal_witness,
                 &mut observation,
                 &profile.observation_resolver_id,
+                &catalog,
+                plan.as_ref(),
                 now()?,
             )?)
         }
@@ -735,6 +826,98 @@ fn main() -> anyhow::Result<()> {
             write_exact(&refusal)
         }
     }
+}
+
+/// Reads the genesis-pinned catalog from its remeasured bytes.
+fn pinned_catalog(
+    profile: &GovernedRuntimeProfileV1,
+) -> anyhow::Result<VersionedExactWorkCatalogV1> {
+    let bytes = profile.exact_work_catalog.verify(false)?;
+    parse_exact_bytes(&bytes, &profile.exact_work_catalog.path)
+}
+
+fn plan_witness(
+    path: Option<&Path>,
+    runtime_profile: &Digest,
+) -> anyhow::Result<Option<ExactPlanWitnessV1>> {
+    path.map(|path| {
+        let plan = load_effect_executor_systemd_plan(path).map_err(anyhow::Error::msg)?;
+        Ok(ExactPlanWitnessV1::from_systemd_plan(
+            &plan,
+            runtime_profile,
+        )?)
+    })
+    .transpose()
+}
+
+fn check_expected_work(
+    profile: &GovernedRuntimeProfileV1,
+    runtime_profile: &Digest,
+    expected_work: &Digest,
+    executor_plan: Option<&Path>,
+) -> anyhow::Result<()> {
+    let plan = plan_witness(executor_plan, runtime_profile)?;
+    if let VersionedExactWorkCatalogV1::ExactBasisV2(catalog) = pinned_catalog(profile)? {
+        catalog.check_expected_work(expected_work, plan.as_ref())?;
+    }
+    Ok(())
+}
+
+fn systemd_plan_enrollment(
+    template: &Path,
+    unit: &str,
+    prestates: &[String],
+) -> anyhow::Result<SystemdPlanEnrollmentV1> {
+    let bytes = read_exact_input(template, MAX_PLAN_TEMPLATE_BYTES)?;
+    let mut plan: EffectExecutorSystemdPlanV2 =
+        strict_json_from_slice(&bytes).context("parse systemd plan template")?;
+    let CanonicalEffectV1::SystemdUnit {
+        unit: template_unit,
+        action,
+        expected_unit_file_state,
+        ..
+    } = &plan.effect
+    else {
+        bail!("template effect is not one SystemdUnit effect");
+    };
+    if template_unit != unit {
+        bail!("template names a different unit than --unit");
+    }
+    if *action != SystemdUnitActionV1::Start {
+        bail!("only the qualified Start action is enrollable");
+    }
+    let expected_unit_file_state = expected_unit_file_state.clone();
+    let mut seen = BTreeSet::new();
+    let mut plans = Vec::with_capacity(prestates.len());
+    for prestate in prestates {
+        if prestate.is_empty() || !seen.insert(prestate.clone()) {
+            bail!("prestates must be non-empty and distinct");
+        }
+        if let CanonicalEffectV1::SystemdUnit {
+            expected_active_state,
+            ..
+        } = &mut plan.effect
+        {
+            expected_active_state.clone_from(prestate);
+        }
+        plans.push(SystemdPlanEnrollmentEntryV1 {
+            expected_active_state: prestate.clone(),
+            enrolled_plan: systemd_plan_enrollment_identity(&plan)?,
+        });
+    }
+    Ok(SystemdPlanEnrollmentV1 {
+        schema: SYSTEMD_PLAN_ENROLLMENT_SCHEMA_V1,
+        catalog_schema: EXACT_WORK_CATALOG_SCHEMA_V2,
+        work_schema: ag_app::effect_executor_adapter::EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
+        unit: unit.to_owned(),
+        action: "start",
+        expected_unit_file_state,
+        admitted_plans: plans
+            .iter()
+            .map(|entry| entry.enrolled_plan.clone())
+            .collect(),
+        plans,
+    })
 }
 
 fn open_bound(database: &Path) -> anyhow::Result<(CampaignEngineV1, GovernedRuntimeProfileV1)> {
@@ -1097,7 +1280,14 @@ where
     T: DeserializeOwned + Serialize,
 {
     let bytes = fs::read(path).with_context(|| format!("read exact record {}", path.display()))?;
-    let value: T = strict_json_from_slice(&bytes)
+    parse_exact_bytes(&bytes, path)
+}
+
+fn parse_exact_bytes<T>(bytes: &[u8], path: &Path) -> anyhow::Result<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let value: T = strict_json_from_slice(bytes)
         .with_context(|| format!("parse exact record {}", path.display()))?;
     let canonical = JcsDocument::canonicalize(&value)?;
     if bytes != canonical.as_bytes()

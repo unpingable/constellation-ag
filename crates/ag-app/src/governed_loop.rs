@@ -40,6 +40,10 @@ use ag_store::campaign::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::effect_executor_adapter::{
+    EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2, EffectExecutorSystemdPlanV2,
+};
+
 /// Root-owned exact-work catalog schema.
 pub const EXACT_WORK_CATALOG_SCHEMA_V1: &str = "ag.governed-loop.exact-work-catalog/v1";
 /// Root-owned exact-work catalog schema with an explicit closed observation-
@@ -144,6 +148,12 @@ pub struct ExactWorkCatalogEntryV1 {
 }
 
 /// One exact v2 catalog entry with an explicit observation-basis requirement.
+///
+/// `admitted_plans` and `postcondition_basis` are optional owner-enrolled
+/// members. An entry without them serializes byte-for-byte as before and
+/// behaves as before. Remediation enrollments must carry `admitted_plans`:
+/// without it, subject/scope/work-schema equality is the only AG-side bound
+/// and the exact unit lives only in a consumer-written plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactWorkCatalogEntryV2 {
@@ -153,8 +163,143 @@ pub struct ExactWorkCatalogEntryV2 {
     pub subject: Digest,
     /// Exact governed scope.
     pub scope: Digest,
-    /// Closed exact observation-basis requirement.
+    /// Closed exact observation-basis requirement. When
+    /// `postcondition_basis` is present this is the precondition that gates
+    /// proposal admission and the one-use spend.
     pub observation_basis: ExactObservationBasisRequirementV1,
+    /// Closed non-empty set of owner-enrolled executor-plan identities
+    /// (see [`systemd_plan_enrollment_identity`]). When present, AG admits
+    /// and spends only for an exact presented plan whose content identity is
+    /// the proposal's work and whose enrollment identity is in this set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_plans: Option<BTreeSet<Digest>>,
+    /// Separate closed basis that a fresh current terminal observation must
+    /// satisfy to complete an occurrence governing one of `admitted_plans`.
+    /// Requires `admitted_plans` and must differ from `observation_basis`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcondition_basis: Option<ExactObservationBasisRequirementV1>,
+}
+
+impl ExactWorkCatalogEntryV2 {
+    fn validate(&self, key: &str) -> Result<(), CampaignEngineErrorV1> {
+        if key != self.work_schema || key.is_empty() {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        self.observation_basis.validate()?;
+        if let Some(admitted) = &self.admitted_plans
+            && (admitted.is_empty() || self.work_schema != EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2)
+        {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        if let Some(postcondition) = &self.postcondition_basis {
+            if self.admitted_plans.is_none() || postcondition == &self.observation_basis {
+                return Err(CampaignEngineErrorV1::InvalidCatalog);
+            }
+            postcondition.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Exact plan pin. Entries without `admitted_plans` keep the historical
+    /// subject/scope/work-schema admission unchanged.
+    fn admits_plan(
+        &self,
+        work: &Digest,
+        plan: Option<&ExactPlanWitnessV1>,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        let Some(admitted) = &self.admitted_plans else {
+            return Ok(());
+        };
+        let plan = plan.ok_or(CampaignEngineErrorV1::PlanWitnessRequired)?;
+        if plan.work != *work {
+            return Err(CampaignEngineErrorV1::PlanWitnessMismatch);
+        }
+        if admitted.contains(&plan.enrolled_plan) {
+            Ok(())
+        } else {
+            Err(CampaignEngineErrorV1::WorkNotAdmitted)
+        }
+    }
+}
+
+/// Domain of the owner-enrollable identity of one systemd executor plan.
+pub const SYSTEMD_PLAN_ENROLLMENT_DOMAIN_V1: &str = "ag.governed-loop.systemd-plan-enrollment/v1";
+
+/// Owner-enrollable identity of one exact systemd executor plan.
+///
+/// An executable plan names the runtime profile it serves
+/// (`authorization.expected_runtime_profile`), and that profile byte-pins the
+/// exact-work catalog. A catalog therefore cannot contain the executable
+/// plan's own identity. The enrollment identity is the domain-separated
+/// identity of the same exact plan with that one back-reference omitted:
+/// every other member (unit, action, prestate, unit-file state, machine,
+/// subject, scope, store, limits) remains bound. AG separately requires the
+/// presented plan to name the campaign's own genesis profile.
+pub fn systemd_plan_enrollment_identity(
+    plan: &EffectExecutorSystemdPlanV2,
+) -> Result<Digest, CampaignEngineErrorV1> {
+    let mut unbound = plan.clone();
+    unbound.authorization = None;
+    let identity = unbound
+        .identity()
+        .map_err(|_| CampaignEngineErrorV1::PlanWitnessMismatch)?;
+    Ok(Digest::hash_domain(
+        SYSTEMD_PLAN_ENROLLMENT_DOMAIN_V1,
+        identity.as_str().as_bytes(),
+    ))
+}
+
+/// Verified correspondence between one exact presented executor plan, its
+/// work identity, its enrollment identity and the runtime profile it serves.
+/// It is constructed only from a validated plan and grants nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactPlanWitnessV1 {
+    work: Digest,
+    enrolled_plan: Digest,
+    runtime_profile: Digest,
+}
+
+impl ExactPlanWitnessV1 {
+    /// Binds one exact systemd V2 plan that names `runtime_profile`.
+    pub fn from_systemd_plan(
+        plan: &EffectExecutorSystemdPlanV2,
+        runtime_profile: &Digest,
+    ) -> Result<Self, CampaignEngineErrorV1> {
+        if plan
+            .authorization
+            .as_ref()
+            .map(|value| &value.expected_runtime_profile)
+            != Some(runtime_profile)
+        {
+            return Err(CampaignEngineErrorV1::PlanWitnessMismatch);
+        }
+        let work = plan
+            .identity()
+            .map_err(|_| CampaignEngineErrorV1::PlanWitnessMismatch)?;
+        Ok(Self {
+            work,
+            enrolled_plan: systemd_plan_enrollment_identity(plan)?,
+            runtime_profile: runtime_profile.clone(),
+        })
+    }
+
+    /// Exact executable work identity of the presented plan.
+    #[must_use]
+    pub const fn work(&self) -> &Digest {
+        &self.work
+    }
+
+    /// Owner-enrollable identity of the presented plan.
+    #[must_use]
+    pub const fn enrolled_plan(&self) -> &Digest {
+        &self.enrolled_plan
+    }
+
+    /// Runtime profile the presented plan serves.
+    #[must_use]
+    pub const fn runtime_profile(&self) -> &Digest {
+        &self.runtime_profile
+    }
 }
 
 /// Root-owned exact admissibility policy basis.
@@ -211,14 +356,84 @@ impl ExactWorkCatalogV2 {
         if self.schema != EXACT_WORK_CATALOG_SCHEMA_V2 || self.entries.is_empty() {
             return Err(CampaignEngineErrorV1::InvalidCatalog);
         }
-        if self.entries.iter().any(|(key, entry)| {
-            key != &entry.work_schema
-                || key.is_empty()
-                || entry.observation_basis.validate().is_err()
-        }) {
-            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        for (key, entry) in &self.entries {
+            entry.validate(key)?;
         }
         Ok(())
+    }
+
+    /// Genesis/continuation gate on the exact work an occurrence is opened
+    /// to govern. A presented plan must bind that work and be enrolled by
+    /// some entry. Without a plan, opening is refused only when every entry
+    /// pins its plans; otherwise the historical behavior is unchanged and
+    /// decide/authorize remain the authoritative check.
+    pub fn check_expected_work(
+        &self,
+        expected_work: &Digest,
+        plan: Option<&ExactPlanWitnessV1>,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        self.validate()?;
+        match plan {
+            Some(plan) => {
+                if plan.work != *expected_work {
+                    return Err(CampaignEngineErrorV1::PlanWitnessMismatch);
+                }
+                if self.entries.values().any(|entry| {
+                    entry
+                        .admitted_plans
+                        .as_ref()
+                        .is_some_and(|admitted| admitted.contains(&plan.enrolled_plan))
+                }) {
+                    Ok(())
+                } else {
+                    Err(CampaignEngineErrorV1::WorkNotAdmitted)
+                }
+            }
+            None if self
+                .entries
+                .values()
+                .all(|entry| entry.admitted_plans.is_some()) =>
+            {
+                Err(CampaignEngineErrorV1::PlanWitnessRequired)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Selects the entry whose postcondition governs completion of an
+    /// occurrence opened for `expected_work`. A catalog that enrolls any
+    /// postcondition basis requires the exact plan at completion.
+    fn completion_entry(
+        &self,
+        expected_work: &Digest,
+        plan: Option<&ExactPlanWitnessV1>,
+    ) -> Result<Option<&ExactWorkCatalogEntryV2>, CampaignEngineErrorV1> {
+        self.validate()?;
+        match plan {
+            Some(plan) => {
+                if plan.work != *expected_work {
+                    return Err(CampaignEngineErrorV1::PlanWitnessMismatch);
+                }
+                self.entries
+                    .values()
+                    .find(|entry| {
+                        entry
+                            .admitted_plans
+                            .as_ref()
+                            .is_some_and(|admitted| admitted.contains(&plan.enrolled_plan))
+                    })
+                    .map(Some)
+                    .ok_or(CampaignEngineErrorV1::WorkNotAdmitted)
+            }
+            None if self
+                .entries
+                .values()
+                .any(|entry| entry.postcondition_basis.is_some()) =>
+            {
+                Err(CampaignEngineErrorV1::PlanWitnessRequired)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Returns the canonical identity of the complete v2 catalog.
@@ -350,15 +565,26 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
 pub struct CatalogAdmissibilityDeciderV2<'a> {
     catalog: &'a ExactWorkCatalogV2,
     policy_basis: Digest,
+    plan: Option<&'a ExactPlanWitnessV1>,
 }
 
 impl<'a> CatalogAdmissibilityDeciderV2<'a> {
     /// Binds one consequence-time decision pass to an exact v2 catalog.
     pub fn new(catalog: &'a ExactWorkCatalogV2) -> Result<Self, CampaignEngineErrorV1> {
+        Self::with_plan(catalog, None)
+    }
+
+    /// Binds one decision pass to an exact v2 catalog and the exact plan
+    /// presented for the proposal's work.
+    pub fn with_plan(
+        catalog: &'a ExactWorkCatalogV2,
+        plan: Option<&'a ExactPlanWitnessV1>,
+    ) -> Result<Self, CampaignEngineErrorV1> {
         let policy_basis = catalog.policy_basis()?;
         Ok(Self {
             catalog,
             policy_basis,
+            plan,
         })
     }
 }
@@ -376,6 +602,9 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV2<'_> {
                 entry.subject == *request.proposal.subject()
                     && entry.scope == *request.proposal.scope()
                     && entry.observation_basis.holds_over(request.observation)
+                    && entry
+                        .admits_plan(request.proposal.work(), self.plan)
+                        .is_ok()
             });
         #[derive(Serialize)]
         struct DecisionBasis<'a> {
@@ -463,6 +692,19 @@ pub enum CampaignEngineErrorV1 {
     /// Docket returned a state that is impossible at this boundary.
     #[error("Docket custody/reconciliation response is not applicable")]
     DocketResponse,
+    /// The catalog pins exact plans and no exact plan was presented.
+    #[error("the catalog pins exact plans; the exact executor plan is required")]
+    PlanWitnessRequired,
+    /// The presented plan does not bind this work or this runtime profile.
+    #[error("presented executor plan does not bind the exact work or runtime profile")]
+    PlanWitnessMismatch,
+    /// The exact work is not an owner-enrolled plan of its catalog entry.
+    #[error("exact work is not an owner-admitted plan")]
+    WorkNotAdmitted,
+    /// The fresh terminal observation does not establish the enrolled
+    /// postcondition basis.
+    #[error("terminal observation does not establish the enrolled postcondition basis")]
+    PostconditionNotEstablished,
 }
 
 /// One production-reachable canonical campaign engine.
@@ -672,8 +914,44 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.decide_with_catalog_v2_and_plan(
+            observation,
+            standing,
+            catalog,
+            None,
+            controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
+            now_unix_ms,
+        )
+    }
+
+    /// Same as the v2 path, additionally binding the exact presented
+    /// executor plan for entries that pin `admitted_plans`. A pinned entry
+    /// refuses with a typed error before any external resolution when the
+    /// plan is absent, does not bind the proposal's work and this campaign's
+    /// runtime profile, or is not enrolled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_with_catalog_v2_and_plan<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &ExactWorkCatalogV2,
+        plan: Option<&ExactPlanWitnessV1>,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
         let current = self.store.current()?;
-        let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
+        self.check_proposal_plan(&current, catalog, plan)?;
+        let mut decider = CatalogAdmissibilityDeciderV2::with_plan(catalog, plan)?;
         let successor = GovernedLoopKernelV1::record_admissible(
             &current,
             observation,
@@ -736,6 +1014,51 @@ impl CampaignEngineV1 {
         }
     }
 
+    /// Versioned dispatch that also binds an optional exact presented plan.
+    /// The frozen v1 catalog pins no plans and ignores it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_versioned_with_plan<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &VersionedExactWorkCatalogV1,
+        plan: Option<&ExactPlanWitnessV1>,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(_) => self.decide_versioned(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => self
+                .decide_with_catalog_v2_and_plan(
+                    observation,
+                    standing,
+                    catalog,
+                    plan,
+                    controlling_review,
+                    expected_observation_resolver,
+                    expected_standing_resolver,
+                    max_standing_ttl_ms,
+                    now_unix_ms,
+                ),
+        }
+    }
+
     /// Re-resolves all current premises and durably spends the one AG authorization.
     #[allow(clippy::too_many_arguments)]
     pub fn authorize<O, S>(
@@ -792,8 +1115,44 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
+        self.authorize_with_catalog_v2_and_plan(
+            observation,
+            standing,
+            catalog,
+            None,
+            controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
+            now_unix_ms,
+        )
+    }
+
+    /// Same as the v2 path, additionally binding the exact presented
+    /// executor plan for entries that pin `admitted_plans`. A pinned entry
+    /// refuses with a typed error before any external resolution when the
+    /// plan is absent, does not bind the proposal's work and this campaign's
+    /// runtime profile, or is not enrolled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_with_catalog_v2_and_plan<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &ExactWorkCatalogV2,
+        plan: Option<&ExactPlanWitnessV1>,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
         let current = self.store.current()?;
-        let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
+        self.check_proposal_plan(&current, catalog, plan)?;
+        let mut decider = CatalogAdmissibilityDeciderV2::with_plan(catalog, plan)?;
         let successor = GovernedLoopKernelV1::consume_authorization(
             &current,
             observation,
@@ -853,6 +1212,51 @@ impl CampaignEngineV1 {
                 max_standing_ttl_ms,
                 now_unix_ms,
             ),
+        }
+    }
+
+    /// Versioned dispatch that also binds an optional exact presented plan.
+    /// The frozen v1 catalog pins no plans and ignores it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_versioned_with_plan<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &VersionedExactWorkCatalogV1,
+        plan: Option<&ExactPlanWitnessV1>,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(_) => self.authorize_versioned(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => self
+                .authorize_with_catalog_v2_and_plan(
+                    observation,
+                    standing,
+                    catalog,
+                    plan,
+                    controlling_review,
+                    expected_observation_resolver,
+                    expected_standing_resolver,
+                    max_standing_ttl_ms,
+                    now_unix_ms,
+                ),
         }
     }
 
@@ -1210,6 +1614,98 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         Ok(successor)
+    }
+
+    /// Completes under the pinned catalog. A v2 entry with a
+    /// `postcondition_basis` completes only when the fresh current terminal
+    /// observation satisfies that separate basis; the precondition basis
+    /// never completes it. Without an enrolled postcondition the historical
+    /// completion law is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_with_catalog<O: ObservationResolverV1>(
+        &mut self,
+        observation_ref: ObservationRefV1,
+        subject: &Digest,
+        terminal_witness: TerminalWitnessRefV1,
+        observation: &mut O,
+        expected_observation_resolver: &str,
+        catalog: &VersionedExactWorkCatalogV1,
+        plan: Option<&ExactPlanWitnessV1>,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let postcondition = match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(_) => None,
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => {
+                if let Some(plan) = plan {
+                    self.check_plan_binding(plan, current.state().meta().expected_work())?;
+                }
+                catalog
+                    .completion_entry(current.state().meta().expected_work(), plan)?
+                    .and_then(|entry| entry.postcondition_basis.clone())
+            }
+        };
+        let successor = GovernedLoopKernelV1::complete_from_observation(
+            &current,
+            observation_ref,
+            subject,
+            terminal_witness,
+            observation,
+            expected_observation_resolver,
+            now_unix_ms,
+        )?;
+        if let Some(postcondition) = postcondition {
+            let terminal = successor
+                .completed()
+                .ok_or(CampaignEngineErrorV1::PostconditionNotEstablished)?
+                .terminal_observation();
+            if !postcondition.holds_over(terminal) {
+                return Err(CampaignEngineErrorV1::PostconditionNotEstablished);
+            }
+        }
+        self.store.commit(
+            &current,
+            &successor,
+            CampaignTransitionKindV1::Completed,
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Exact-plan gate for a recorded proposal under a v2 catalog.
+    fn check_proposal_plan(
+        &self,
+        current: &OccurrenceSnapshotV1,
+        catalog: &ExactWorkCatalogV2,
+        plan: Option<&ExactPlanWitnessV1>,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        let Some(proposal) = current.proposal() else {
+            return Ok(());
+        };
+        if let Some(plan) = plan {
+            self.check_plan_binding(plan, proposal.work())?;
+        }
+        match catalog.entries.get(proposal.work_schema()) {
+            Some(entry) => entry.admits_plan(proposal.work(), plan),
+            None => Ok(()),
+        }
+    }
+
+    /// A presented plan must name this campaign's genesis-bound profile and
+    /// be exactly the governed work.
+    fn check_plan_binding(
+        &self,
+        plan: &ExactPlanWitnessV1,
+        work: &Digest,
+    ) -> Result<(), CampaignEngineErrorV1> {
+        let profile = self
+            .store
+            .runtime_profile()?
+            .ok_or(CampaignEngineErrorV1::PlanWitnessMismatch)?;
+        if profile.digest != plan.runtime_profile || plan.work != *work {
+            return Err(CampaignEngineErrorV1::PlanWitnessMismatch);
+        }
+        Ok(())
     }
 
     /// Records one typed refusal without changing the current state.
