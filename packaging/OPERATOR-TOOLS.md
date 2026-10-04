@@ -17,5 +17,7 @@ D-Bus Peer GetMachineId and Properties Get are standard interfaces. This package
 uses no credential-bearing daemon unit; the daemon package retains its >=252
 floor. Source/API and ABI inspection are not a fresh VM effect result.
 
-Packaging does not resolve the current signed-dispatch versus Systemd-plan
-interface or authorize a governed effect.
+The Systemd executor verifies signed Docket custody before executing the exact
+enrolled plan. Installing these inert packages does not enroll an issuer, runtime
+profile, target, work catalog or execution-standing grant. A governed effect
+requires those separate owner-controlled enrollments and current evidence.
