@@ -39,10 +39,7 @@ The live Crow preflight on 2026-08-28 established `KVM-AVAILABLE`:
   `query-kvm` returned `enabled=true,present=true` before a clean QMP quit;
 - unified cgroup v2 exposes `cpu`, `memory`, `pids`, `io`, and `cpuset`
   under systemd 255;
-- Crow's Mellanox identity is NetworkManager profile `crow-mellanox`, UUID
-  `5a0cc298-0f9f-3039-b41b-6d4be111c0f8`, MAC
-  `24:8a:07:f8:1d:91`, currently named `enp4s0`. The interface name is not an
-  identity input.
+- The qualification host uses a pinned physical interface identity. Exact profile, UUID and MAC are retained in the private worker receipt; the interface name alone is not an identity input.
 
 H0/AppArmor and prior TCG-only archaeology are superseded fallback evidence
 and are outside this contract.
