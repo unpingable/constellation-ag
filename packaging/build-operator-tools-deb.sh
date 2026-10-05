@@ -24,15 +24,15 @@ for package in agent-governor-ng-operator-tools agent-governor-ng-systemd-execut
         install -m 0755 "$bin_dir/ag-loopctl" "$bin_dir/ag-standing-resolver" "$bin_dir/ag-operator-ui" "$d/usr/bin/"
         # These binaries use current local process/SQLite boundaries; Git is not
         # a runtime dependency of this selected package.
-        depends='libc6 (>= 2.35)'
+        depends='libc6 (>= 2.35), libgcc-s1'
         description='Agent Governor governed-loop operator tools'
-        install -m 0644 "$root/docs/governed-loop-c1.md" "$d/usr/share/doc/$package/"
+        install -m 0644 "$root/packaging/OPERATOR.md" "$d/usr/share/doc/$package/"
     else
         install -d -m 0755 "$d/usr/libexec/agent-governor-ng"
         install -m 0755 "$bin_dir/ag-effectd" "$d/usr/libexec/agent-governor-ng/"
         # The standalone executor uses interfaces present in systemd 249.
         # Daemon credential units retain their separate >=252 contract.
-        depends='libc6 (>= 2.35), systemd (>= 249)'
+        depends='libc6 (>= 2.35), libgcc-s1, systemd (>= 249)'
         description='Agent Governor target-local systemd effect process adapter'
         install -m 0644 "$root/docs/operator-beta-systemd-dbus-backend-v1.md" "$d/usr/share/doc/$package/"
     fi
