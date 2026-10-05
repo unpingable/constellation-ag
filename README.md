@@ -14,7 +14,7 @@ own narrower scope; they are not installation instructions for this candidate.
 New here? Read the [component guide](docs/public-guide.md) for the supported
 entry points, deployment trust boundary, formal-claim scope, and recovery model.
 
-## Implementation status (2026-08-10)
+## Historical implementation status (2026-08-10)
 
 AG-ng is the canonical durable governor of exact-work occurrences. The
 production-reachable path is `ag-loopctl` -> `CampaignEngineV1` ->
@@ -27,8 +27,7 @@ the generic dispatch/outcome/reconcile transport law is Docket-owned as
 `docket.governed-executor-transport/v1`, and `ag-effectd` implements it
 independently while retaining its sealed plans, journal, and mechanics receipts;
 NQ owns diagnostic evaluation; Nightshift owns recurrence. This implementation
-is qualification-ready development code, not an earned qualification or
-deployment claim. Older vertical documents remain valid only for the narrower
+was qualification-ready development code at that historical date. The current candidate lead and exact scoped release records supersede that earlier qualification status. Older vertical documents remain valid only for the narrower
 surfaces they explicitly name.
 
 Agent Governor NG is a Rust hard successor to the classic Python Agent
