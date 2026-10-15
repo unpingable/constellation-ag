@@ -1,5 +1,12 @@
 //! Shared daemon and CLI implementation for Agent Governor NG.
 
+#[path = "../../../build-support/build_info.rs"]
+pub mod build_info;
+
+#[cfg(test)]
+#[path = "../../../build-support/build_identity_input.rs"]
+mod build_identity_input;
+
 pub mod agd;
 pub mod api;
 pub mod civild_observation;

@@ -4,11 +4,11 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    audit_systemd_effect_store_cut, execute_effect_attempt, execute_systemd_effect_attempt,
-    load_effect_executor_plan_any, reconcile_effect_attempt, reconcile_systemd_effect_attempt,
-    verify_authorized_dispatch_v2, verify_authorized_systemd_dispatch_v2,
-    verify_plan_deployment_v2, AuthorizedEffectDispatchV2, EffectExecutorDispatchV1,
-    LoadedEffectExecutorPlan, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
+    AuthorizedEffectDispatchV2, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1, EffectExecutorDispatchV1,
+    LoadedEffectExecutorPlan, audit_systemd_effect_store_cut, execute_effect_attempt,
+    execute_systemd_effect_attempt, load_effect_executor_plan_any, reconcile_effect_attempt,
+    reconcile_systemd_effect_attempt, verify_authorized_dispatch_v2,
+    verify_authorized_systemd_dispatch_v2, verify_plan_deployment_v2,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
@@ -18,7 +18,8 @@ use serde::de::DeserializeOwned;
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-effectd",
-    version,
+    version = ag_app::build_info::VERSION_STRING,
+    after_help = "Use --build-info as the sole argument for machine-readable build identity.",
     about = "Docket-custodied exact-effect adapter"
 )]
 struct Arguments {
@@ -60,6 +61,9 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    if ag_app::build_info::write_if_requested("ag-effectd")? {
+        return Ok(());
+    }
     let arguments = Arguments::parse();
     match arguments.command {
         Command::PlanId { plan } => {

@@ -7,6 +7,31 @@ source export on the intended distribution; build `ag-effectd` with
 `systemd-dbus`. Use `SOURCE_DATE_EPOCH` from that source commit. Inspect ELF
 interpreter and shared-library/version requirements before declaring compatibility.
 
+Export `AG_SOURCE_COMMIT` as the full lowercase 40-digit source commit and
+`AG_BUILD_IDENTITY` as a unique build label (1..256 printable ASCII bytes without
+spaces) for both compilation and package assembly. The builder must verify that
+the export and locked dependencies actually correspond to that commit; the
+binaries do not infer Git state or verify the declaration. Malformed nonempty
+values fail compilation. Missing values remain explicitly unknown for local
+development and are refused by package assembly.
+
+Build all four tools with those same inputs, for example:
+
+```sh
+export AG_SOURCE_COMMIT=FULL_LOWERCASE_COMMIT AG_BUILD_IDENTITY=UNIQUE_BUILD_LABEL
+cargo build --locked --release -p ag-app -p ag-operator-ui --features ag-app/systemd-dbus \
+  --bin ag-loopctl --bin ag-standing-resolver --bin ag-effectd --bin ag-operator-ui
+bash packaging/build-operator-tools-deb.sh 0.1.0+BUILD_LABEL amd64 target/release OUT_DIR
+```
+
+Replace the uppercase placeholders first. The assembler probes the copied
+staging files, requires matching source/build/version/compiler/target/profile,
+checks the executor's `systemd-dbus` feature, and records the cohort and exact
+executable hashes in each package and its JSON sidecar before writing either
+package. Run `python3 -B -m unittest discover -s packaging -p test_build_identity.py`
+for the package correspondence and refusal fixtures. `ag.build_info.v1` is AG's
+local reporting format, not a cross-component authority protocol.
+
 These packages install no service, configuration, key or authority state. The
 operator tools do not replace the daemon package. The standalone executor
 requires systemd >=249: its Manager GetUnit/RefUnit/GetUnitFileState/StartUnit,

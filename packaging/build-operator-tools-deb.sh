@@ -49,7 +49,15 @@ Description: $description
  and enables or starts no service. Build and publication do not establish
  release promotion or authorize effects.
 CONTROL
+done
+# Check the complete staged cohort before either package can be emitted.
+python3 "$root/packaging/record-build-identity.py" "$stage" "$version" "$arch" \
+    "$stage/build-identity.json"
+for package in agent-governor-ng-operator-tools agent-governor-ng-systemd-executor; do
+    d=$stage/$package
+    install -m 0644 "$stage/build-identity.json" "$d/usr/share/doc/$package/build-identity.json"
     find "$d" -exec touch -h -d "@${SOURCE_DATE_EPOCH:-0}" {} +
     dpkg-deb --root-owner-group --build "$d" "$out_dir/${package}_${version}_${arch}.deb" >/dev/null
+    install -m 0644 "$stage/build-identity.json" "$out_dir/${package}_${version}_${arch}.build-identity.json"
     (cd "$out_dir" && sha256sum "${package}_${version}_${arch}.deb" > "${package}_${version}_${arch}.deb.sha256")
 done
