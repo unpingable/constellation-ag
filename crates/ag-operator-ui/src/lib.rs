@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "../../../build-support/build_info.rs"]
+pub mod build_info;
+
 pub mod investigation;
 pub mod links;
 pub mod model;

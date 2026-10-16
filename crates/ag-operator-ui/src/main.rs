@@ -14,6 +14,8 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-operator-ui",
+    version = ag_operator_ui::build_info::VERSION_STRING,
+    after_help = "Use --build-info as the sole argument for machine-readable build identity.",
     about = "Phosphor: loopback-only, read-only governed-runtime inspector"
 )]
 struct Args {
@@ -59,6 +61,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    if ag_operator_ui::build_info::write_if_requested("ag-operator-ui")? {
+        return Ok(());
+    }
     let args = Args::parse();
     validate_bind_ip(args.bind.ip()).map_err(anyhow::Error::msg)?;
     let reader = if let Some(corpus) = args.demo_corpus {

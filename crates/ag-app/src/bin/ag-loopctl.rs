@@ -47,7 +47,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-loopctl",
-    version,
+    version = ag_app::build_info::VERSION_STRING,
+    after_help = "Use --build-info as the sole argument for machine-readable build identity.",
     about = "Canonical AG exact-occurrence governed-loop controller"
 )]
 struct Arguments {
@@ -455,6 +456,9 @@ struct OperationalSnapshotV1 {
 }
 
 fn main() -> anyhow::Result<()> {
+    if ag_app::build_info::write_if_requested("ag-loopctl")? {
+        return Ok(());
+    }
     let arguments = Arguments::parse();
     let now = now_unix_ms;
     match arguments.command {
