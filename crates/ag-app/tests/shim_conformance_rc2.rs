@@ -6,8 +6,14 @@
 //! `EffectBrokerV1::handle_proposal` path before any effect occurs. The broker is constructed
 //! with a recording effect runner: any bypass of validation would surface as a runner
 //! invocation and be detected here. The positive control shows a conforming request proceeds
-//! to canonicalization; the negative control shows the harness detects an actual runner
-//! invocation. No systemd, pointer, filesystem (outside tempdirs), or network effects.
+//! to canonicalization; the ratification control carries a conforming request through human
+//! ratification and observes exactly one runner invocation, which is what makes the empty log
+//! in the refusal cases a real signal. The negative control shows only that the recording double
+//! records a direct call. No systemd, pointer, filesystem (outside tempdirs), or network effects.
+//!
+//! What the refusal cases establish is the typed response (`Refused` / `Indeterminate` rather
+//! than `Canonicalized`): proposal ingress never invokes the runner for any request, valid or not,
+//! so an empty log during ingress alone would hold even if validation were bypassed.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -15,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_app::api::{
-    AgdRequestV1, ApiResultV1, ArtifactTransferV1, EffectProposalRequestV1,
-    EffectProposalResponseV1, GovernedProposalIngressV1, ProposalIngressProofV1,
+    AgdRequestV1, ApiResultV1, ArtifactTransferV1, EffectAdminRequestV1, EffectAdminResponseV1,
+    EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1,
+    ProposalIngressProofV1,
 };
 use ag_app::config::{EffectTargetConfigV1, EffectdConfigV1};
 use ag_app::effectd::{BrokerEffectRunnerV1, EffectBrokerV1, configured_catalog_identity};
@@ -101,18 +108,29 @@ struct Fixture {
     governor: RpcSignerV1,
     proposer: RpcSignerV1,
     governor_peer: VerifiedRpcPrincipalV1,
+    admin_peer: VerifiedRpcPrincipalV1,
     proposer_chain: PrincipalChainV1,
     authority_domain: AuthorityDomain,
     epoch: Epoch,
 }
 
 fn fixture() -> Fixture {
+    fixture_with_profile(None)
+}
+
+/// `security_profile` overrides the example config's "production" profile. Only the
+/// ratification control uses "development": that profile waives the live authority-activation
+/// receipt that a production effectd obtains at startup, and nothing else on this path.
+fn fixture_with_profile(security_profile: Option<&str>) -> Fixture {
     let directory = TempDir::new().expect("temporary directory");
     let mut config: EffectdConfigV1 = toml::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../config/effectd.example.toml"
     )))
     .expect("effectd example config");
+    if let Some(profile) = security_profile {
+        profile.clone_into(&mut config.security_profile);
+    }
     config.store.database = directory.path().join("effectd.db");
     config.store.object_store = directory.path().join("objects");
     let target_path = directory.path().join("managed.conf");
@@ -134,6 +152,7 @@ fn fixture() -> Fixture {
     };
     let governor = signer("governor");
     let proposer = signer("proposer");
+    let admin = signer("admin");
     config.agd_peer.rpc_key = governor
         .enrollment(30_000)
         .expect("governor enrollment")
@@ -142,6 +161,7 @@ fn fixture() -> Fixture {
         .enrollment(30_000)
         .expect("proposer enrollment")
         .key;
+    config.admin_peer.rpc_key = admin.enrollment(30_000).expect("admin enrollment").key;
 
     let governor_peer = VerifiedRpcPrincipalV1 {
         principal: config.agd_peer.rpc_key.principal.clone(),
@@ -150,6 +170,10 @@ fn fixture() -> Fixture {
     let proposer_peer = VerifiedRpcPrincipalV1 {
         principal: config.proposer_peer.rpc_key.principal.clone(),
         key_id: config.proposer_peer.rpc_key.key_id.clone(),
+    };
+    let admin_peer = VerifiedRpcPrincipalV1 {
+        principal: config.admin_peer.rpc_key.principal.clone(),
+        key_id: config.admin_peer.rpc_key.key_id.clone(),
     };
     let authority_domain =
         AuthorityDomain::parse(&config.authority_domain).expect("authority domain");
@@ -195,6 +219,7 @@ fn fixture() -> Fixture {
         governor,
         proposer,
         governor_peer,
+        admin_peer,
         proposer_chain,
         authority_domain,
         epoch,
@@ -321,6 +346,97 @@ fn positive_control_conforming_signed_request_canonicalizes_without_effect() {
     no_effects_observed(&fx);
 }
 
+/// Ratification control: the same conforming request, inspected and ratified by the enrolled
+/// operator, reaches the effect runner exactly once with the catalog-bound canonical effect.
+/// This proves the recording runner sits on the real execution path, so its empty log in the
+/// refusal cases is evidence rather than a property of ingress. The recording runner performs
+/// no effect and reports Indeterminate, so the target file still does not exist.
+#[test]
+fn ratification_control_reaches_the_runner_exactly_once() {
+    let mut fx = fixture_with_profile(Some("development"));
+    let (digest, transfer) = artifact(b"managed = ratified\n");
+    let intent = fx.intent(
+        "stable-intent-ratified-1",
+        EffectIntentV1::ManagedFilePut {
+            target: TargetId::parse("managed-config").expect("target"),
+            content: digest.clone(),
+        },
+        std::slice::from_ref(&digest),
+    );
+    let submitted = fx.submit_signed(intent, vec![transfer], "submission-ratified-1");
+    let ApiResultV1::Ok {
+        response:
+            EffectProposalResponseV1::Canonicalized {
+                proposal_digest, ..
+            },
+    } = submitted
+    else {
+        panic!("conforming request must canonicalize: {submitted:?}");
+    };
+    assert!(
+        fx.runner_log.lock().expect("invocation log").is_empty(),
+        "canonicalization alone must not invoke the runner"
+    );
+
+    let inspected = fx.broker.handle_admin(
+        EffectAdminRequestV1::InspectProposal {
+            proposal: proposal_digest.clone(),
+        },
+        &fx.admin_peer,
+        &Digest::hash_domain("ag-rc2-shim-conformance/inspection", b"ratified-1"),
+    );
+    let ApiResultV1::Ok {
+        response: EffectAdminResponseV1::Proposal { challenge, .. },
+    } = inspected
+    else {
+        panic!("operator inspection must return a ratification challenge: {inspected:?}");
+    };
+    let ratified = fx.broker.handle_admin(
+        EffectAdminRequestV1::Ratify {
+            proposal: proposal_digest.clone(),
+            challenge,
+        },
+        &fx.admin_peer,
+        &Digest::hash_domain("ag-rc2-shim-conformance/ratification", b"ratified-1"),
+    );
+    assert!(
+        matches!(
+            &ratified,
+            ApiResultV1::Ok {
+                response: EffectAdminResponseV1::ExecutionReceipt { .. }
+            }
+        ),
+        "ratification must execute through the runner: {ratified:?}"
+    );
+
+    let invocations = fx.runner_log.lock().expect("invocation log");
+    assert_eq!(invocations.len(), 1, "exactly one runner invocation");
+    let (proposal, _attempt, effect_index, effect) = &invocations[0];
+    assert_eq!(proposal, &proposal_digest);
+    assert_eq!(*effect_index, 0);
+    let CanonicalEffectV1::ManagedFilePut {
+        target,
+        path,
+        content,
+        ..
+    } = effect
+    else {
+        panic!("runner received another effect family: {effect:?}");
+    };
+    assert_eq!(target.as_str(), "managed-config");
+    assert_eq!(
+        PathBuf::from(path),
+        fx.target_path,
+        "the path comes from the catalog"
+    );
+    assert_eq!(content, &digest);
+    drop(invocations);
+    assert!(
+        !fx.target_path.exists(),
+        "the recording runner performs no effect"
+    );
+}
+
 /// Boundary case 1: an ordinary-shaped signed deployment request naming a target the root-owned
 /// catalog does not admit. The request passes signature and lineage verification and is rejected
 /// before any effect. Note the exact stage: catalog membership is enforced at the broker's
@@ -389,9 +505,9 @@ fn request_exceeding_catalogued_target_authority_is_refused_before_any_effect() 
 }
 
 /// Negative control (deliberately invalid): bypass the broker entirely and invoke the effect
-/// runner directly with the canonical effect the overreach request would have needed. The
-/// harness must observe exactly that invocation — proving the empty-log assertions above are a
-/// real signal (had validation been bypassed, this log would show it).
+/// runner directly with the canonical effect the overreach request would have needed. This
+/// shows only that the recording double records a direct call; that the broker's execution
+/// path reaches it is shown by the ratification control.
 #[test]
 fn negative_control_harness_detects_an_actual_runner_invocation() {
     let directory = TempDir::new().expect("temporary directory");
