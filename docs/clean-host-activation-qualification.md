@@ -1,5 +1,10 @@
 # Clean-host package and activation qualification
 
+Historical qualification contract for the broker service excluded from current
+packages. The supported Docket executor is described in
+[`packaging/OPERATOR-TOOLS.md`](../packaging/OPERATOR-TOOLS.md). The commands and
+receipts here apply to the historical package inputs.
+
 Status: campaign contract and genesis enrollment implementation present; one
 immutable bounded `BLOCKED` receipt exists, but no exact package has passed the
 clean-host matrix. The repository remains not production deployable.

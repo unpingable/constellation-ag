@@ -108,15 +108,20 @@ struct LoadedDaemonConfigsV1 {
     providerd: Option<ProviderdConfigV1>,
 }
 
-/// Inspects configuration, filesystem custody, executable bytes, and effective
-/// systemd properties without loading a signing or provider credential.
+/// Inspects the historical broker configuration, custody, executable bytes,
+/// and effective unit properties without loading a signing or provider credential.
 ///
 /// The effective-unit query is a single fixed invocation of
 /// `/usr/bin/systemctl show`; no configured string can become a command,
 /// property name, or unit argument.
 #[must_use]
 pub fn diagnose_host(paths: &DoctorConfigPathsV1) -> DoctorReportV1 {
-    let mut checks = Vec::new();
+    let mut checks = vec![check(
+        "ag-effectd.lifecycle",
+        "ag-effectd",
+        DoctorCheckStatusV1::Unavailable,
+        "historical broker service is absent from current packages. Docket invokes the shipped ag-effectd adapter per operation",
+    )];
     let configs = LoadedDaemonConfigsV1 {
         agd: load_daemon_config("agd", &paths.agd, AgdConfigV1::validate, &mut checks),
         effectd: load_daemon_config(

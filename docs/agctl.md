@@ -46,8 +46,11 @@ before service start.
 The full commands, publication/recovery rules, and claim limits are in
 `clean-host-activation-qualification.md`.
 
-`doctor` is the other deliberate offline exception to the single-role config
-flag. It
+`doctor` is the offline diagnostic for the historical three-daemon broker
+deployment. The current daemon package excludes that broker service, so its
+lifecycle check reports `unavailable`. Use the
+[Docket adapter package guide](../packaging/OPERATOR-TOOLS.md) for the supported
+executor lifecycle. The retained diagnostic
 does not connect to an authority plane or load any private key. Instead it
 requires all three public daemon configurations explicitly:
 
@@ -99,7 +102,7 @@ health is not exposed to either CLI identity in v1: `ag-providerd` enrolls its
 service caller separately, so adding a convenient CLI route would broaden
 credential-proxy access.
 
-The signed direct effectd Health RPC includes an inspectable
+The historical signed direct effectd Health RPC includes an inspectable
 `EffectdActivationStatusV1`: either the full non-authorizing process receipt or
 a bounded phase/code/detail refusal. The current `agctl health ag-effectd`
 command intentionally emits only the stable `HealthV1` projection, including

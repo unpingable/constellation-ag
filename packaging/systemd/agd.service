@@ -1,8 +1,8 @@
 [Unit]
 Description=Agent Governor NG judgment and session daemon
 Documentation=file:/usr/share/doc/agent-governor-ng/architecture.md
-After=local-fs.target ag-effectd.service ag-providerd.service
-Requires=ag-effectd.service ag-providerd.service
+After=local-fs.target ag-providerd.service
+Requires=ag-providerd.service
 ConditionPathExists=/etc/agent-governor/agd.toml
 ConditionPathIsDirectory=/run/agent-governor/agd
 

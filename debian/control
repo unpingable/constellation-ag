@@ -26,7 +26,8 @@ Depends:
  systemd (>= 252)
 Description: governed batch-agent authority membrane
  Agent Governor NG separates untrusted proposal work, inference credentials,
- judgment state, human ratification, and a closed privileged effect broker.
+ judgment state, and human ratification. Docket uses the separate
+ agent-governor-ng-systemd-executor package for governed systemd attempts.
  .
  This package skeleton does not imply production readiness; consult the
  installed release checklist before enabling any service.

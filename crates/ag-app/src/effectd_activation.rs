@@ -1,4 +1,6 @@
-//! Fresh, non-serializable production readiness for the effect broker.
+//! Readiness evidence for the historical effect-broker deployment.
+//!
+//! Its retained unit checks do not apply to the shipped Docket process adapter.
 //!
 //! A serializable receipt is diagnostic evidence only. The live value is rebuilt on
 //! every daemon start from the enrolled store, current process state, current

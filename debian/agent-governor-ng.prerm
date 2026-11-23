@@ -6,10 +6,16 @@ case "$1" in
         # Never remove the executable and unit payload beneath a still-running
         # authority process. Cross-root package assembly has no live manager.
         if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
-            deb-systemd-invoke stop \
-                agd.service \
-                ag-providerd.service \
-                ag-effectd.service >/dev/null
+            units='agd.service ag-providerd.service'
+            legacy_load=$(systemctl show ag-effectd.service -p LoadState --value)
+            case "$legacy_load" in
+                not-found) ;;
+                '') echo 'cannot determine legacy ag-effectd.service load state' >&2; exit 1 ;;
+                *) units="$units ag-effectd.service" ;;
+            esac
+            # A predecessor may still have the retired broker loaded. Include
+            # it in the stop and always verify its state, even if not found.
+            deb-systemd-invoke stop $units >/dev/null
             for unit in agd.service ag-providerd.service ag-effectd.service; do
                 state=$(systemctl show "$unit" -p ActiveState --value) || {
                     echo "cannot verify stopped state for $unit; refusing removal" >&2

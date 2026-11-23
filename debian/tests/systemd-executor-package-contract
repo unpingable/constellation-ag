@@ -12,7 +12,9 @@ adapter=/usr/libexec/agent-governor-ng/ag-effectd
 [ -x "$adapter" ] || fail "missing executable $adapter"
 [ "$(stat -c '%U:%G:%a' "$adapter")" = "root:root:755" ] ||
     fail "unexpected executable custody for $adapter"
-"$adapter" --help >/dev/null
+for command in plan-id execute reconcile audit-store; do
+    "$adapter" "$command" --help >/dev/null
+done
 
 paths=$(dpkg-query -L "$package")
 printf '%s\n' "$paths" | grep -Fxq "$adapter" ||

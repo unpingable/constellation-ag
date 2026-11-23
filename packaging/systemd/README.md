@@ -1,7 +1,19 @@
 # systemd deployment contract
 
-These files are packaging inputs, not evidence that a host satisfies the
-production contract. `agctl doctor` checks strict daemon configuration,
+The daemon package supplies disabled-by-default `agd.service` and
+`ag-providerd.service`. The separate systemd executor package supplies a
+process adapter invoked by Docket for each exact operation. See
+[`OPERATOR-TOOLS.md`](../OPERATOR-TOOLS.md) for its package and observation contract.
+The legacy `agd` proposal-forwarding RPC still uses its enrolled broker socket.
+Without that separately provisioned peer, forwards can remain pending or be
+refused. The Docket adapter does not receive or forward those proposals.
+
+## Historical effect-broker contract
+
+The retained `ag-effectd.service` file and broker validation below describe
+historical qualification inputs. The daemon package excludes that unit.
+`agctl doctor` marks the historical broker lifecycle unavailable for current
+packages. Its retained diagnostic checks cover strict daemon configuration,
 enrolled store/socket custody, fixed effective unit properties, target-root
 drop-ins, credential-unit bindings, and configured installed executable
 digests. Effectd additionally reconstructs its code-level live process/unit/
@@ -47,12 +59,12 @@ the effective unit after publishing that drop-in and before first start.
 
 ## Readiness and process observation
 
-The current daemons do not call `sd_notify` and do not emit watchdog
+The historical daemon contract does not use `sd_notify` or watchdog
 heartbeats. Their units therefore use `Type=exec` and have no `WatchdogSec=`.
-This reports successful `execve`, not application readiness. Dependents and
-operators must use the existing authenticated `agctl health ag-effectd` path
-and require `ready = true`; a prior doctor report, unit start, or stored
-activation receipt is insufficient.
+This reports successful `execve`, not application readiness. The historical
+broker used the authenticated `agctl health ag-effectd` path to report its
+own readiness and required a fresh live activation. That RPC does not inspect
+the process adapter packaged for Docket.
 
 The stable local-RPC identity is an enrolled Ed25519 key; service private keys
 arrive through the base unit's encrypted `rpc-ed25519-pkcs8` credential. The

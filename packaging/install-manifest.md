@@ -9,15 +9,14 @@ must not enter a package until their named release gates pass.
 | Source | Installed path | Mode/policy |
 | --- | --- | --- |
 | `target/release/agd` | `/usr/bin/agd` | `0755 root:root` |
-| `target/release/ag-effectd` | `/usr/bin/ag-effectd` | `0755 root:root` |
 | `target/release/ag-providerd` | `/usr/bin/ag-providerd` | `0755 root:root` |
 | `target/release/agctl` | `/usr/bin/agctl` | `0755 root:root` |
 | `target/release/ag-backup` | `/usr/bin/ag-backup` | `0755 root:root`, offline coherent-backup verifier/publisher only |
 | `target/release/ag-migrate` | `/usr/bin/ag-migrate` | `0755 root:root`, offline classic retirement/archive verifier only |
-| three daemon unit files | `/usr/lib/systemd/system/` | `0644 root:root`, disabled on pristine install; prior admin enablement is preserved |
+| `agd.service`, `ag-providerd.service` | `/usr/lib/systemd/system/` | `0644 root:root`, disabled on pristine install; prior admin enablement is preserved |
 | `sysusers.d/agent-governor-ng.conf` | `/usr/lib/sysusers.d/` | `0644 root:root` |
 | `tmpfiles.d/agent-governor-ng.conf` | `/usr/lib/tmpfiles.d/` | `0644 root:root` |
-| package-created local unit directory | `/etc/systemd/system/ag-effectd.service.d/` | `0755 root:root`; generated enrollment drop-in destination |
+| retained legacy enrollment directory | `/etc/systemd/system/ag-effectd.service.d/` | `0755 root:root`; preserves the historical offline tooling contract |
 | selected `docs/*.md` listed by the package skeleton, `README.md` | `/usr/share/doc/agent-governor-ng/` | operator and campaign documentation |
 | `packaging/systemd/README.md` | `/usr/share/doc/agent-governor-ng/systemd-deployment.md` | effective-unit deployment contract |
 | `config/*.example.toml` | `/usr/share/doc/agent-governor-ng/examples/` | examples only |
@@ -32,6 +31,12 @@ configuration, mutable store, target definition, authority record, or runtime
 directory. Installing, upgrading, removing, or reinstalling it therefore does
 not itself start, stop, enable, disable, or restart the governed target or any
 AG service. Docket invokes the installed path as a bounded process adapter.
+
+`packaging/systemd/ag-effectd.service` is historical source for broker
+diagnostics and qualification records. The daemon package excludes that unit
+and the old `/usr/bin/ag-effectd` path. Its upgrade and removal checks still
+require an older loaded broker unit to stop and verify the old name has no
+live process before proceeding.
 
 The package does **not** install `/etc/agent-governor/*.toml`, an RPC signing
 key, provider credential, encrypted credential blob, target drop-in file, authority

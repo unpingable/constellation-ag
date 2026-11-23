@@ -28,7 +28,9 @@ Replace the uppercase placeholders first. The assembler probes the copied
 staging files, requires matching source/build/version/compiler/target/profile,
 checks the executor's `systemd-dbus` feature, and records the cohort and exact
 executable hashes in each package and its JSON sidecar before writing either
-package. Run `python3 -B -m unittest discover -s packaging -p test_build_identity.py`
+package. The builder also checks the staged executor's `--help` output for its
+closed adapter commands before emitting either package. Run
+`python3 -B -m unittest discover -s packaging -p test_build_identity.py`
 for the package correspondence and refusal fixtures. `ag.build_info.v1` is AG's
 local reporting format, not a cross-component authority protocol.
 
@@ -46,3 +48,10 @@ The Systemd executor verifies signed Docket custody before executing the exact
 enrolled plan. Installing these inert packages does not enroll an issuer, runtime
 profile, target, work catalog or execution-standing grant. A governed effect
 requires those separate owner-controlled enrollments and current evidence.
+
+Docket's exact request and its retained outcome provide evidence of adapter
+availability for one operation. `ag-effectd plan-id PLAN` can check the sealed
+work identity without requesting an effect. Use independent service
+observations when the question is whether the service recovered. The
+historical `agctl doctor` and `agctl health ag-effectd` broker diagnostics
+cannot establish availability of the per-operation adapter.

@@ -15,6 +15,19 @@ BINARIES = {
     "ag-operator-ui": "agent-governor-ng-operator-tools/usr/bin/ag-operator-ui",
     "ag-effectd": "agent-governor-ng-systemd-executor/usr/libexec/agent-governor-ng/ag-effectd",
 }
+EXECUTOR_COMMANDS = {"plan-id", "execute", "reconcile", "audit-store", "help"}
+
+
+def check_executor_lifecycle(path):
+    output = subprocess.run([str(path), "--help"], check=True,
+                            capture_output=True, text=True, timeout=10)
+    _, separator, command_section = output.stdout.partition("\nCommands:\n")
+    table = command_section.split("\n\n", 1)[0]
+    commands = {line.split()[0] for line in table.splitlines() if line.strip()}
+    if (output.stderr or not separator or commands != EXECUTOR_COMMANDS or
+            "Usage: ag-effectd <COMMAND>" not in output.stdout.splitlines() or
+            "--config" in output.stdout or "--check-config" in output.stdout):
+        raise ValueError("ag-effectd: expected the Docket adapter lifecycle (--help)")
 
 
 def record(binary_dir, package_version, architecture):
@@ -54,8 +67,10 @@ def record(binary_dir, package_version, architecture):
             raise ValueError(f"{name}: missing build-profile flag")
         if type(info.get("systemd_dbus")) is not bool:
             raise ValueError(f"{name}: missing systemd-dbus build-feature flag")
-        if name == "ag-effectd" and not info["systemd_dbus"]:
-            raise ValueError("ag-effectd: systemd-dbus is required for the packaged executor")
+        if name == "ag-effectd":
+            if not info["systemd_dbus"]:
+                raise ValueError("ag-effectd: systemd-dbus is required for the packaged executor")
+            check_executor_lifecycle(path)
         identity = (version, target, rustc, info["debug_assertions"])
         if cohort is not None and identity != cohort:
             raise ValueError(f"{name}: executable cohort has inconsistent build inputs")

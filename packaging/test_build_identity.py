@@ -17,6 +17,20 @@ SPEC = importlib.util.spec_from_file_location(
 identity = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(identity)
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
+EXECUTOR_HELP = """Docket-custodied exact-effect adapter
+
+Usage: ag-effectd <COMMAND>
+
+Commands:
+  plan-id      Print the plan identity
+  execute      Execute the enrolled attempt
+  reconcile    Read retained evidence
+  audit-store  Audit a store cut
+  help         Print this message
+
+Options:
+  -h, --help  Print help
+"""
 
 
 class PackageIdentityTests(unittest.TestCase):
@@ -29,6 +43,7 @@ class PackageIdentityTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.info = {}
+        self.executor_help = EXECUTOR_HELP
         for name in identity.BINARIES:
             self.info[name] = {
                 "schema": "ag.build_info.v1", "component": name, "version": "0.1.0",
@@ -41,6 +56,8 @@ class PackageIdentityTests(unittest.TestCase):
     def write_fixture(self, name, mutate=False):
         # Each executable is a local fixture; it reads no state or enrollment.
         program = "#!/usr/bin/env python3\nimport sys\n"
+        if name == "ag-effectd":
+            program += f"if sys.argv[1:] == ['--help']:\n print({self.executor_help!r}, end='')\n sys.exit(0)\n"
         program += "assert sys.argv[1:] == ['--build-info']\n"
         program += "print(" + repr(json.dumps(self.info[name])) + ")\n"
         if mutate:
@@ -148,6 +165,75 @@ class PackageIdentityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(list(output_dir.glob("*.deb")))
         self.assertFalse(list(output_dir.glob(".stage.*")))
+
+    def test_executor_cli_contract_is_required_before_package_assembly(self):
+        output_dir = self.root / "lifecycle-refused-output"
+        self.executor_help = EXECUTOR_HELP.replace("  reconcile    Read retained evidence\n", "")
+        self.write_fixture("ag-effectd")
+        result = subprocess.run(["bash", str(Path(__file__).with_name("build-operator-tools-deb.sh")),
+                                 "0.1.0+test.1", "amd64", str(self.root), str(output_dir)],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("adapter lifecycle", result.stderr)
+        self.assertFalse(list(output_dir.glob("*.deb")))
+
+    def test_daemon_package_does_not_install_or_require_effectd_service(self):
+        repository = Path(__file__).resolve().parents[1]
+        manifest = (repository / "debian/agent-governor-ng.install").read_text().splitlines()
+        self.assertNotIn("target/release/ag-effectd usr/bin", manifest)
+        self.assertNotIn("packaging/systemd/ag-effectd.service usr/lib/systemd/system", manifest)
+        unit = (repository / "packaging/systemd/agd.service").read_text()
+        self.assertNotIn("ag-effectd.service", unit)
+
+    def test_maintainer_scripts_fence_predecessor_effectd_and_skip_absent_unit(self):
+        repository = Path(__file__).resolve().parents[1]
+        fixture = self.root / "manager-fixture"
+        fixture.mkdir()
+        stop_log = fixture / "stop.log"
+        for name, source in {
+            "systemctl": """#!/bin/sh
+case "$4" in
+    LoadState) printf '%s\\n' "$LEGACY_LOAD" ;;
+    ActiveState)
+        if [ "$2" = ag-effectd.service ]; then printf '%s\\n' "$LEGACY_ACTIVE";
+        else echo inactive; fi ;;
+    MainPID)
+        if [ "$2" = ag-effectd.service ]; then printf '%s\\n' "$LEGACY_PID";
+        else echo 0; fi ;;
+    *) exit 9 ;;
+esac
+""",
+            "deb-systemd-invoke": """#!/bin/sh
+printf '%s\\n' "$*" > "$STOP_LOG"
+for unit; do
+    if [ "$unit" = ag-effectd.service ] && [ "$LEGACY_LOAD" = not-found ]; then
+        exit 9
+    fi
+done
+""",
+        }.items():
+            path = fixture / name
+            path.write_text(source)
+            path.chmod(0o755)
+        for name, action in [("preinst", "upgrade"), ("prerm", "remove")]:
+            script = (repository / f"debian/agent-governor-ng.{name}").read_text()
+            script = script.replace("/run/systemd/system", str(fixture))
+            for load, state, pid, success, stop_legacy in [
+                ("not-found", "inactive", "0", True, False),
+                ("loaded", "inactive", "0", True, True),
+                ("loaded", "active", "41", False, True),
+                ("not-found", "active", "41", False, False),
+            ]:
+                with self.subTest(script=name, load=load, state=state):
+                    env = dict(os.environ, DPKG_ROOT="", PATH=f"{fixture}:{os.defpath}",
+                               STOP_LOG=str(stop_log), LEGACY_LOAD=load,
+                               LEGACY_ACTIVE=state, LEGACY_PID=pid)
+                    result = subprocess.run(["sh", "-c", script, name, action], env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, success, result.stderr)
+                    self.assertEqual("ag-effectd.service" in stop_log.read_text(), stop_legacy)
+                    if not success:
+                        self.assertIn("live authority state", result.stderr)
 
     def test_package_assembly_refuses_an_unknown_build_without_emitting_a_package(self):
         output_dir = self.root / "refused-output"

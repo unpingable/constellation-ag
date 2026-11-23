@@ -1,5 +1,9 @@
 # Deployment contract
 
+> The three-daemon broker deployment below is historical. For the current
+> Docket executor, see [`OPERATOR-TOOLS.md`](../packaging/OPERATOR-TOOLS.md).
+> Its package installs a per-operation adapter and no broker service.
+
 This document governs the existing daemon/effect-plane packaging. The
 canonical `ag-loopctl` governed-loop deployment companion is
 [`governed-loop-deployment-qualification.md`](governed-loop-deployment-qualification.md);

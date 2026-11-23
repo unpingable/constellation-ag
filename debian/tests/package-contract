@@ -6,14 +6,14 @@ fail() {
     exit 1
 }
 
-for binary in agd ag-effectd ag-providerd agctl ag-backup ag-migrate; do
+for binary in agd ag-providerd agctl ag-backup ag-migrate; do
     path="/usr/bin/$binary"
     [ -x "$path" ] || fail "missing executable $path"
     [ "$(stat -c '%U:%G:%a' "$path")" = "root:root:755" ] || \
         fail "unexpected executable custody for $path"
 done
 
-for unit in agd.service ag-effectd.service ag-providerd.service; do
+for unit in agd.service ag-providerd.service; do
     path="/usr/lib/systemd/system/$unit"
     [ -f "$path" ] || fail "missing unit $path"
     [ "$(stat -c '%U:%G:%a' "$path")" = "root:root:644" ] || \
@@ -24,13 +24,18 @@ for unit in agd.service ag-effectd.service ag-providerd.service; do
         fail "$unit is not inactive"
 done
 
-for unit in agd.service ag-effectd.service ag-providerd.service; do
+for unit in agd.service ag-providerd.service; do
     path="/usr/lib/systemd/system/$unit"
     restrict_suid_sgid=$(sed -n '/^RestrictSUIDSGID=/p' "$path")
     [ "$restrict_suid_sgid" = "RestrictSUIDSGID=yes" ] || \
         fail "$unit does not retain the exact SUID/SGID creation restriction"
 done
 
+[ ! -e /usr/bin/ag-effectd ] || fail "duplicate effect adapter was packaged"
+[ ! -e /usr/lib/systemd/system/ag-effectd.service ] || fail "legacy effectd unit was packaged"
+if grep -Fq 'ag-effectd.service' /usr/lib/systemd/system/agd.service; then
+    fail "agd still declares a dependency on the legacy effectd unit"
+fi
 [ ! -e /usr/lib/systemd/system/ag-worker@.service ] || fail "worker unit was packaged"
 [ ! -e /usr/lib/systemd/system/ag-check@.service ] || fail "check unit was packaged"
 [ ! -e /usr/libexec/agent-governor/ag-worker ] || fail "worker helper was packaged"
@@ -124,7 +129,6 @@ for example in agctl.example.toml agctl-proposer.example.toml agd.example.toml \
 done
 
 systemd-analyze verify \
-    /usr/lib/systemd/system/ag-effectd.service \
     /usr/lib/systemd/system/ag-providerd.service \
     /usr/lib/systemd/system/agd.service
 

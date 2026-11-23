@@ -58,7 +58,7 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Audit all three daemon configurations and their effective host deployment.
+    /// Inspect the historical three-daemon deployment inputs.
     Doctor {
         /// Root-owned governor configuration.
         #[arg(long, value_name = "PATH")]
