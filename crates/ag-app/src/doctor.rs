@@ -116,12 +116,7 @@ struct LoadedDaemonConfigsV1 {
 /// property name, or unit argument.
 #[must_use]
 pub fn diagnose_host(paths: &DoctorConfigPathsV1) -> DoctorReportV1 {
-    let mut checks = vec![check(
-        "ag-effectd.lifecycle",
-        "ag-effectd",
-        DoctorCheckStatusV1::Unavailable,
-        "historical broker service is absent from current packages. Docket invokes the shipped ag-effectd adapter per operation",
-    )];
+    let mut checks = Vec::new();
     let configs = LoadedDaemonConfigsV1 {
         agd: load_daemon_config("agd", &paths.agd, AgdConfigV1::validate, &mut checks),
         effectd: load_daemon_config(

@@ -12,8 +12,8 @@ refused. The Docket adapter does not receive or forward those proposals.
 
 The retained `ag-effectd.service` file and broker validation below describe
 historical qualification inputs. The daemon package excludes that unit.
-`agctl doctor` marks the historical broker lifecycle unavailable for current
-packages. Its retained diagnostic checks cover strict daemon configuration,
+`agctl doctor` checks that historical topology. Its retained diagnostic checks
+cover strict daemon configuration,
 enrolled store/socket custody, fixed effective unit properties, target-root
 drop-ins, credential-unit bindings, and configured installed executable
 digests. Effectd additionally reconstructs its code-level live process/unit/

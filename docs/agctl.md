@@ -48,9 +48,9 @@ The full commands, publication/recovery rules, and claim limits are in
 
 `doctor` is the offline diagnostic for the historical three-daemon broker
 deployment. The current daemon package excludes that broker service, so its
-lifecycle check reports `unavailable`. Use the
-[Docket adapter package guide](../packaging/OPERATOR-TOOLS.md) for the supported
-executor lifecycle. The retained diagnostic
+result describes only the three-daemon topology. Use the
+[Docket adapter package guide](../packaging/OPERATOR-TOOLS.md) for adapter
+availability. The retained diagnostic
 does not connect to an authority plane or load any private key. Instead it
 requires all three public daemon configurations explicitly:
 
