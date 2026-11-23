@@ -207,6 +207,22 @@ Authenticated operator intent is separately governed by
 An intervention request is exact input to an existing transition law, never
 authority or a transition by itself.
 
+### Controlling review selection
+
+The optional `controlling_review` in the current C1 runtime profile pins one
+rejected-review basis at genesis. The CLI checks the presented locator and file
+digest against that pin. When a repair cites a review, C1 requires its receipt,
+session, reviewer, history, and canonical finding set to match the pinned
+basis. Detached reviews have no bearing on that selection, regardless of when
+they were recorded. A different locator or digest is refused.
+
+The [September 25 review decision](https://github.com/unpingable/constellation-ag/issues/11#issuecomment-5838766314)
+concerned the earlier protected shared-admission profile. Under that decision,
+an in-window acceptance continues to stand after a subsequent rejection of
+the same plan binding. The C1 gate takes its single controlling basis from the
+runtime profile. It has no ordered verdict list. Any future same-subject
+supersession would require an explicit relationship and its own contract.
+
 ## Crash and recovery law
 
 | Last durable boundary | Meaning after restart | Legal next step |

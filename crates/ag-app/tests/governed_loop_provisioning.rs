@@ -46,6 +46,74 @@ fn value(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn write_rejected_review(path: &Path, receipt: char) {
+    write_jcs(
+        path,
+        &json!({
+            "review_receipt": digest(receipt),
+            "review_session": digest('2'),
+            "reviewer": digest('3'),
+            "history": digest('4'),
+            "findings": [digest('5')]
+        }),
+    );
+}
+
+fn assert_controlling_review_gate(database: &Path, config: &Path) {
+    let command = config.join("boundary-command");
+    let catalog = config.join("catalog.json");
+    let pinned = config.join("controlling-review.json");
+    let earlier = config.join("earlier-review.json");
+    let later = config.join("later-review.json");
+    write_rejected_review(&later, '6');
+    let decide = |review: Option<&Path>, expected: &str| {
+        let mut invocation = args(&[
+            "decide",
+            "--database",
+            &database.display().to_string(),
+            "--catalog",
+            &catalog.display().to_string(),
+            "--observation-resolver",
+            &command.display().to_string(),
+            "--expected-observation-resolver-id",
+            "fixture-observation/v1",
+            "--standing-resolver",
+            &command.display().to_string(),
+            "--expected-standing-resolver-id",
+            "fixture-standing/v1",
+            "--max-standing-ttl-ms",
+            "60000",
+        ]);
+        if let Some(review) = review {
+            invocation.extend(args(&[
+                "--controlling-review",
+                &review.display().to_string(),
+            ]));
+        }
+        let failure = invoke(&invocation);
+        assert!(!failure.status.success());
+        let stderr = String::from_utf8_lossy(&failure.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+    };
+
+    // The exact review passes the deployment gate. With no proposal yet,
+    // the subsequent program-counter check keeps the campaign unadvanced.
+    decide(Some(&pinned), "illegal governed-loop transition");
+    decide(
+        None,
+        "caller substituted the genesis-pinned controlling review",
+    );
+    for detached in [&earlier, &later] {
+        decide(Some(detached), "caller substituted pinned path");
+    }
+
+    let original = fs::read(&pinned).unwrap();
+    fs::copy(later, &pinned).unwrap();
+    decide(Some(&pinned), "pinned file identity changed");
+    fs::write(&pinned, original).unwrap();
+    decide(Some(&pinned), "illegal governed-loop transition");
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -94,6 +162,10 @@ fn profile_seal_reopen_inspect_and_missing_custody_fail_closed() {
     fs::write(&issuer_key, key_bytes).unwrap();
     fs::set_permissions(&issuer_key, fs::Permissions::from_mode(0o600)).unwrap();
 
+    let controlling_review = config.join("controlling-review.json");
+    write_rejected_review(&config.join("earlier-review.json"), '1');
+    write_rejected_review(&controlling_review, '0');
+
     let enrollment = config.join("runtime-profile-enrollment.json");
     write_jcs(
         &enrollment,
@@ -106,7 +178,7 @@ fn profile_seal_reopen_inspect_and_missing_custody_fail_closed() {
             "standing_resolver_id": "fixture-standing/v1",
             "max_standing_ttl_ms": 60000,
             "exact_work_catalog": catalog,
-            "controlling_review": null,
+            "controlling_review": controlling_review,
             "docket": {
                 "schema": "ag.governed-loop.docket-root-enrollment/v1",
                 "docket_program": command,
@@ -175,6 +247,7 @@ fn profile_seal_reopen_inspect_and_missing_custody_fail_closed() {
         &profile.display().to_string(),
     ])));
     assert_eq!(fs::metadata(&database).unwrap().mode() & 0o777, 0o600);
+    assert_controlling_review_gate(&database, &config);
 
     // Each read is a fresh process reopening and replaying the authoritative
     // store. Inspection is a projection and cannot transition the PC.
